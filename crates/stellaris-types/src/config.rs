@@ -106,6 +106,12 @@ pub struct ControlConfig {
     /// Member: one-time token used to request admission.
     #[serde(default)]
     pub join_token: Option<String>,
+    /// Auto-add controller-listed members as peers (default true).
+    #[serde(default = "default_true")]
+    pub discover_members: bool,
+    /// Apply controller snapshot routes (default true).
+    #[serde(default = "default_true")]
+    pub apply_routes: bool,
     /// Controller iroh control UDP port (None = HTTP-only).
     #[serde(default)]
     pub iroh_port: Option<u16>,
@@ -131,6 +137,8 @@ impl Default for ControlConfig {
             members: Vec::new(),
             join_tokens: Vec::new(),
             join_token: None,
+            discover_members: true,
+            apply_routes: true,
             iroh_port: None,
             endpoint_id: None,
             addrs: Vec::new(),
@@ -289,6 +297,10 @@ fn default_controller_threshold() -> usize {
     1
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_manifest_ttl() -> u64 {
     3600
 }
@@ -379,10 +391,6 @@ pub struct StaticRouteConfig {
 pub struct PeersConfig {
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Config {

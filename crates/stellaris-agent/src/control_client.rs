@@ -528,7 +528,9 @@ fn apply_verified_snapshot(
         return None;
     }
     state.set_grants(&snapshot.members);
-    discover_members(state, &snapshot.members, transport);
+    if state.config.control.discover_members {
+        discover_members(state, &snapshot.members, transport);
+    }
     let before = snapshot.routes.len();
     snapshot.routes.retain(|route| {
         route.next_hop == state.node_id
@@ -542,6 +544,9 @@ fn apply_verified_snapshot(
             dropped = before - snapshot.routes.len(),
             "dropped controller routes with unconnected next hop"
         );
+    }
+    if !state.config.control.apply_routes {
+        return Some((snapshot.generation, snapshot.epoch));
     }
     if state.config.routing.prefer_same_zone
         && let Some(local_zone) = state.config.node.zone.as_deref()
