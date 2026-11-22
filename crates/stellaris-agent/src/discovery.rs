@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use stellaris_types::{NodeId, PeerConfig};
@@ -180,6 +180,16 @@ fn start_mdns(state: AgentState, transport: Arc<IrohTransport>) {
             return;
         }
     };
+    if let Some(interface) = &state.config.transport.mdns_interface {
+        if let Err(e) = daemon.disable_interface(IfKind::All) {
+            warn!(error = %e, "disable mDNS interfaces");
+            return;
+        }
+        if let Err(e) = daemon.enable_interface(interface.as_str()) {
+            warn!(error = %e, interface, "enable mDNS interface");
+            return;
+        }
+    }
     if let Err(e) = daemon.register(service) {
         warn!(error = %e, "register mDNS service");
         return;
@@ -191,7 +201,11 @@ fn start_mdns(state: AgentState, transport: Arc<IrohTransport>) {
             return;
         }
     };
-    info!(service = MDNS_SERVICE, "mDNS discovery started");
+    info!(
+        service = MDNS_SERVICE,
+        interface = ?state.config.transport.mdns_interface,
+        "mDNS discovery started"
+    );
     let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         // Keep the daemon alive for the lifetime of the process.

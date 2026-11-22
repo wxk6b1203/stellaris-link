@@ -258,6 +258,9 @@ pub struct TransportConfig {
     /// mDNS UDP port (default 5353; useful for isolated tests).
     #[serde(default)]
     pub mdns_port: Option<u16>,
+    /// Restrict mDNS to one interface name (e.g. eth0/en0).
+    #[serde(default)]
+    pub mdns_interface: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -273,6 +276,7 @@ impl Default for TransportConfig {
             discovery_broadcast: None,
             mdns: false,
             mdns_port: None,
+            mdns_interface: None,
         }
     }
 }
