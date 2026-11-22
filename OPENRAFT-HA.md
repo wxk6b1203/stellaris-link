@@ -444,7 +444,8 @@ three_node_raft_over_http
 限制：
 
 - HTTP RPC 尚未加 controller 间认证/TLS
-- 3 节点 log/state 仍是内存实现
+- 3 节点可通过 `start_http_cluster_on_disk` 落盘并在整体重启后恢复
+- 集群重启测试已验证（固定监听地址）
 - snapshot 传输尚未实现
 - 尚未接入 controller HTTP API
 

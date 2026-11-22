@@ -744,25 +744,62 @@ pub struct HttpCluster {
     pub rafts: Arc<RwLock<HashMap<u64, Raft<TypeConfig, StateMachineStore>>>>,
     pub stores: Vec<StateMachineStore>,
     pub servers: Vec<tokio::task::JoinHandle<()>>,
+    pub addresses: Vec<std::net::SocketAddr>,
 }
 
 pub async fn start_http_cluster(models: Vec<ControllerModel>) -> anyhow::Result<HttpCluster> {
+    start_http_cluster_at(models, None, None).await
+}
+
+pub async fn start_http_cluster_on_disk(
+    models: Vec<ControllerModel>,
+    dirs: Vec<PathBuf>,
+    addresses: Option<Vec<std::net::SocketAddr>>,
+) -> anyhow::Result<HttpCluster> {
+    anyhow::ensure!(models.len() == dirs.len(), "models/dirs length mismatch");
+    start_http_cluster_at(models, Some(dirs), addresses).await
+}
+
+async fn start_http_cluster_at(
+    models: Vec<ControllerModel>,
+    dirs: Option<Vec<PathBuf>>,
+    addresses: Option<Vec<std::net::SocketAddr>>,
+) -> anyhow::Result<HttpCluster> {
     let count = models.len();
+    if let Some(addresses) = &addresses {
+        anyhow::ensure!(addresses.len() == count, "addresses length mismatch");
+    }
     let mut listeners = Vec::with_capacity(count);
-    let mut addresses = Vec::with_capacity(count);
-    for _ in 0..count {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        addresses.push(listener.local_addr()?);
+    let mut actual_addresses = Vec::with_capacity(count);
+    for i in 0..count {
+        let bind = addresses
+            .as_ref()
+            .map(|a| a[i].to_string())
+            .unwrap_or_else(|| "127.0.0.1:0".to_string());
+        let listener = tokio::net::TcpListener::bind(&bind).await?;
+        actual_addresses.push(listener.local_addr()?);
         listeners.push(listener);
     }
     let config = Arc::new(openraft::Config::default().validate()?);
     let rafts = Arc::new(RwLock::new(HashMap::new()));
     let mut stores = Vec::with_capacity(count);
     let mut servers = Vec::with_capacity(count);
+    let mut fresh = Vec::with_capacity(count);
     for (i, model) in models.into_iter().enumerate() {
         let id = i as u64 + 1;
-        let log = Arc::new(LogStore::default());
-        let store = StateMachineStore::new(model, None);
+        let (log, state_path) = if let Some(dirs) = &dirs {
+            let dir = &dirs[i];
+            std::fs::create_dir_all(dir)?;
+            (
+                LogStore::new(Some(dir.join("raft-log.json"))),
+                Some(dir.join("raft-state.json")),
+            )
+        } else {
+            (LogStore::default(), None)
+        };
+        let log = Arc::new(log);
+        fresh.push(log.is_empty().await);
+        let store = StateMachineStore::new(model, state_path);
         let factory = HttpFactory {
             client: reqwest::Client::new(),
         };
@@ -775,17 +812,20 @@ pub async fn start_http_cluster(models: Vec<ControllerModel>) -> anyhow::Result<
             let _ = axum::serve(listener, app).await;
         }));
     }
-    let mut members = BTreeMap::new();
-    for (i, addr) in addresses.iter().enumerate() {
-        members.insert(i as u64 + 1, BasicNode::new(addr.to_string()));
-    }
-    if let Some(first) = rafts.read().await.get(&1).cloned() {
-        first.initialize(members).await?;
+    if fresh.iter().all(|f| *f) {
+        let mut members = BTreeMap::new();
+        for (i, addr) in actual_addresses.iter().enumerate() {
+            members.insert(i as u64 + 1, BasicNode::new(addr.to_string()));
+        }
+        if let Some(first) = rafts.read().await.get(&1).cloned() {
+            first.initialize(members).await?;
+        }
     }
     Ok(HttpCluster {
         rafts,
         stores,
         servers,
+        addresses: actual_addresses,
     })
 }
 
@@ -966,6 +1006,90 @@ mod tests {
         for server in cluster.servers {
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn three_node_http_cluster_recovers_after_restart() {
+        let base =
+            std::env::temp_dir().join(format!("stellaris-raft-cluster-{}", uuid::Uuid::now_v7()));
+        let dirs: Vec<PathBuf> = (0..3).map(|i| base.join(format!("n{i}"))).collect();
+        let models = (0..3)
+            .map(|_| ControllerModel::new(NetworkId::new(), 1))
+            .collect();
+        let first = start_http_cluster_on_disk(models, dirs.clone(), None)
+            .await
+            .unwrap();
+        let addresses = first.addresses.clone();
+        let node = NodeId::new([4u8; 32]);
+        let lsa = stellaris_linkstate::Lsa {
+            origin: node,
+            seq: 1,
+            zone: None,
+            links: vec![],
+            prefixes: vec![stellaris_linkstate::Prefix {
+                prefix: "192.168.98.0/24".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.4".parse().unwrap()),
+            addrs: vec![],
+        };
+        let mut leader = None;
+        for _ in 0..100 {
+            for (id, raft) in first.rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(raft.clone());
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        leader
+            .expect("leader")
+            .client_write(ControllerCommand::ApplyLsa { lsa })
+            .await
+            .unwrap();
+        for store in &first.stores {
+            for _ in 0..50 {
+                if store.model().await.lsas.contains_key(&node) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(store.model().await.lsas.contains_key(&node));
+        }
+        for raft in first.rafts.read().await.values() {
+            let _ = raft.shutdown().await;
+        }
+        for server in first.servers {
+            server.abort();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let models = (0..3)
+            .map(|_| ControllerModel::new(NetworkId::new(), 1))
+            .collect();
+        let second = start_http_cluster_on_disk(models, dirs, Some(addresses))
+            .await
+            .unwrap();
+        for store in &second.stores {
+            for _ in 0..100 {
+                if store.model().await.lsas.contains_key(&node) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(store.model().await.lsas.contains_key(&node));
+        }
+        for raft in second.rafts.read().await.values() {
+            let _ = raft.shutdown().await;
+        }
+        for server in second.servers {
+            server.abort();
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
