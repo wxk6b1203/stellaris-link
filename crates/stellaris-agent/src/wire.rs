@@ -70,6 +70,14 @@ pub struct PacketInfo {
     pub protocol: u8,
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
+    /// Present for IPv4/IPv6 fragments. Non-first fragments have no ports.
+    pub fragment: Option<FragmentInfo>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentInfo {
+    pub offset: u16,
+    pub more: bool,
 }
 
 impl PacketInfo {
@@ -94,7 +102,15 @@ fn parse_v4(packet: &[u8]) -> Option<PacketInfo> {
     let ttl = packet[8];
     let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
     let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let (src_port, dst_port) = ports(packet, ihl, protocol);
+    let frag = u16::from_be_bytes([packet[6], packet[7]]);
+    let offset = (frag & 0x1fff) * 8;
+    let more = frag & 0x2000 != 0;
+    let fragment = (offset > 0 || more).then_some(FragmentInfo { offset, more });
+    let (src_port, dst_port) = if offset == 0 {
+        ports(packet, ihl, protocol)
+    } else {
+        (None, None)
+    };
     Some(PacketInfo {
         src: IpAddr::V4(src),
         dst: IpAddr::V4(dst),
@@ -102,6 +118,7 @@ fn parse_v4(packet: &[u8]) -> Option<PacketInfo> {
         protocol,
         src_port,
         dst_port,
+        fragment,
     })
 }
 
@@ -109,18 +126,51 @@ fn parse_v6(packet: &[u8]) -> Option<PacketInfo> {
     if packet.len() < 40 {
         return None;
     }
-    let protocol = packet[6];
+    let mut next = packet[6];
     let ttl = packet[7];
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?);
-    let (src_port, dst_port) = ports(packet, 40, protocol);
+    let mut offset = 40;
+    let mut fragment = None;
+    let mut ports_protocol = next;
+    while matches!(next, 0 | 43 | 60) {
+        if packet.len() < offset + 2 {
+            return None;
+        }
+        let len = (packet[offset + 1] as usize + 1) * 8;
+        if packet.len() < offset + len {
+            return None;
+        }
+        next = packet[offset];
+        offset += len;
+    }
+    if next == 44 {
+        if packet.len() < offset + 8 {
+            return None;
+        }
+        ports_protocol = packet[offset];
+        let field = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+        let frag_offset = field >> 3;
+        let more = field & 1 != 0;
+        fragment = Some(FragmentInfo {
+            offset: frag_offset * 8,
+            more,
+        });
+        offset += 8;
+    }
+    let (src_port, dst_port) = if fragment.is_none_or(|f| f.offset == 0) {
+        ports(packet, offset, ports_protocol)
+    } else {
+        (None, None)
+    };
     Some(PacketInfo {
         src: IpAddr::V6(src),
         dst: IpAddr::V6(dst),
         ttl,
-        protocol,
+        protocol: ports_protocol,
         src_port,
         dst_port,
+        fragment,
     })
 }
 
@@ -151,8 +201,10 @@ pub fn flow_hash(info: &PacketInfo) -> u32 {
         IpAddr::V6(ip) => write(&ip.octets()),
     }
     write(&[info.protocol]);
-    write(&info.src_port.unwrap_or(0).to_be_bytes());
-    write(&info.dst_port.unwrap_or(0).to_be_bytes());
+    if info.fragment.is_none() {
+        write(&info.src_port.unwrap_or(0).to_be_bytes());
+        write(&info.dst_port.unwrap_or(0).to_be_bytes());
+    }
     hash
 }
 
@@ -427,5 +479,79 @@ mod tests {
         p[62..64].copy_from_slice(&1460u16.to_be_bytes());
         assert!(clamp_tcp_mss(&mut p, 1200));
         assert_eq!(u16::from_be_bytes([p[62], p[63]]), 1140);
+    }
+    #[test]
+    fn parses_ipv4_fragment_offsets() {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x45;
+        p[6..8].copy_from_slice(&0x2000u16.to_be_bytes()); // MF, offset 0
+        p[9] = 6;
+        p[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        p[22..24].copy_from_slice(&80u16.to_be_bytes());
+        let info = PacketInfo::parse(&p).unwrap();
+        assert_eq!(
+            info.fragment,
+            Some(FragmentInfo {
+                offset: 0,
+                more: true
+            })
+        );
+        assert_eq!(info.src_port, Some(1234));
+        p[6..8].copy_from_slice(&185u16.to_be_bytes()); // offset 1480
+        let info = PacketInfo::parse(&p).unwrap();
+        assert_eq!(
+            info.fragment,
+            Some(FragmentInfo {
+                offset: 1480,
+                more: false
+            })
+        );
+        assert_eq!(info.src_port, None);
+    }
+
+    #[test]
+    fn parses_ipv6_fragment_header() {
+        let mut p = vec![0u8; 60];
+        p[0] = 0x60;
+        p[6] = 44;
+        p[40] = 6;
+        p[42..44].copy_from_slice(&0x0001u16.to_be_bytes()); // MF, offset 0
+        p[48..50].copy_from_slice(&1234u16.to_be_bytes());
+        p[50..52].copy_from_slice(&80u16.to_be_bytes());
+        let info = PacketInfo::parse(&p).unwrap();
+        assert_eq!(
+            info.fragment,
+            Some(FragmentInfo {
+                offset: 0,
+                more: true
+            })
+        );
+        assert_eq!(info.src_port, Some(1234));
+        p[42..44].copy_from_slice(&(185u16 << 3).to_be_bytes());
+        let info = PacketInfo::parse(&p).unwrap();
+        assert_eq!(
+            info.fragment,
+            Some(FragmentInfo {
+                offset: 1480,
+                more: false
+            })
+        );
+        assert_eq!(info.src_port, None);
+    }
+    #[test]
+    fn fragments_hash_without_ports() {
+        let mut first = vec![0u8; 40];
+        first[0] = 0x45;
+        first[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        first[9] = 17;
+        first[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        first[22..24].copy_from_slice(&53u16.to_be_bytes());
+        let mut rest = vec![0u8; 40];
+        rest[0] = 0x45;
+        rest[6..8].copy_from_slice(&185u16.to_be_bytes());
+        rest[9] = 17;
+        let a = PacketInfo::parse(&first).unwrap();
+        let b = PacketInfo::parse(&rest).unwrap();
+        assert_eq!(flow_hash(&a), flow_hash(&b));
     }
 }

@@ -390,6 +390,7 @@ sudo BIN=./target/release/stellaris-agent CTRL=./target/release/stellaris-contro
 # OK: IPv6 TUN overlay bidirectional works.
 ```
 - TCP MSS clamp：overlay MTU 1100 时 IPv4 MSS <=1060、IPv6 MSS <=1040
+- IPv4/IPv6 分片解析：非首片不读取伪端口，分片 flow hash 保持一致
 
 ### 21.8 Raft mTLS E2E
 
