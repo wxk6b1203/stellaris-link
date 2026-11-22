@@ -536,6 +536,8 @@ failover snapshot ok
 OK: 3 macvlan controller raft join/LSA/snapshot/failover/partition-recovery works.
 ```
 
+脚本内自动生成 CA/server/client 证书并启用 Raft mTLS。
+
 3 个 controller 容器各自使用真实 LAN IP，通过 macvlan 运行独立进程，
 并验证了旧 leader 断网后重新加入、降为 follower 并通过 `/v1/model` 追平 seq=2。
 验证了非 loopback 地址上的 Raft、join、LSA、snapshot 和 leader 失败切换。

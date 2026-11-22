@@ -333,7 +333,8 @@ PARENT=enp1s0 SUBNET=10.0.10.0/23 GATEWAY=10.0.10.1 \
 IP1=10.0.10.240 IP2=10.0.10.242 IP3=10.0.10.244 IP_CLIENT=10.0.10.245 \
 BIN=./target/release/stellaris-controller \
 ./scripts/test-docker-controller-raft-macvlan.sh
-# OK: 3 macvlan controller raft join/LSA/snapshot/failover works.
+# OK: 3 macvlan controller raft join/LSA/snapshot/failover/partition-recovery works.
+# 脚本自动启用 Raft mTLS
 ```
 
 ```bash

@@ -12,6 +12,18 @@ IPS=("$IP1" "$IP2" "$IP3")
 cleanup(){ docker rm -f ctrl1 ctrl2 ctrl3 ctrl-client >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; rm -rf "$TMP"; }
 trap cleanup EXIT
 SECRET="controller-secret"; RAFT_SECRET="raft-secret"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout "$TMP/ca-key.pem" -out "$TMP/ca.pem" \
+  -subj "/CN=Stellaris Macvlan CA" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout "$TMP/server-key.pem" -out "$TMP/server.csr" \
+  -subj "/CN=stellaris-controller" >/dev/null 2>&1
+cat > "$TMP/server.ext" <<EXT
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth,clientAuth
+subjectAltName=IP:$IP1,IP:$IP2,IP:$IP3
+EXT
+openssl x509 -req -in "$TMP/server.csr" -CA "$TMP/ca.pem" -CAkey "$TMP/ca-key.pem" \
+  -CAcreateserial -days 1 -extfile "$TMP/server.ext" -out "$TMP/server.pem" >/dev/null 2>&1
 NODE="0101010101010101010101010101010101010101010101010101010101010101"
 for i in 0 1 2; do
   mkdir -p "$TMP/n$i/state" "$TMP/n$i/raft"
@@ -35,6 +47,12 @@ raft_id = $((i+1))
 raft_bind = "0.0.0.0:4780$((i+1))"
 raft_secret = "$RAFT_SECRET"
 raft_bootstrap = $BOOT
+raft_tls_cert = "/tls/server.pem"
+raft_tls_key = "/tls/server-key.pem"
+raft_tls_ca = "/tls/ca.pem"
+raft_tls_client_cert = "/tls/server.pem"
+raft_tls_client_key = "/tls/server-key.pem"
+raft_tls_require_client_cert = true
 
 [[control.raft_peers]]
 id = 1
@@ -57,7 +75,7 @@ docker network create -d macvlan --subnet="$SUBNET" --gateway="$GATEWAY" -o pare
 for i in 0 1 2; do
   docker run -d --name "ctrl$((i+1))" --network "$NET" --ip "${IPS[$i]}" \
     -v "$BIN:/stellaris-controller:ro" -v "$TMP/n$i.toml:/config.toml:ro" \
-    -v "$TMP/n$i/state:/state" -v "$TMP/n$i/raft:/raft" nginx:latest \
+    -v "$TMP/n$i/state:/state" -v "$TMP/n$i/raft:/raft" -v "$TMP:/tls:ro" nginx:latest \
     /stellaris-controller --config /config.toml >/dev/null
 done
 docker run -d --name ctrl-client --network "$NET" --ip "$IP_CLIENT" nginx:latest sleep 3600 >/dev/null

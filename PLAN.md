@@ -47,7 +47,7 @@
 - [x] follower 写失败返回 leader hint header。
 - [x] 3 controller 进程 E2E：join/LSA/snapshot + kill leader + 新 leader 继续写入。
 - [x] follower 停机后通过 snapshot 追平。
-- [x] 真实 LAN macvlan 3 controller Raft + leader failover + network partition recovery。
+- [x] 真实 LAN macvlan 3 controller Raft + mTLS + leader failover + partition recovery。
 - [x] Raft internal HTTPS + CA 校验 E2E。
 - [x] snapshot checksum 校验 + Raft 状态 fsync/atomic rename。
 - [x] Raft mTLS（client cert + CA + require）。
