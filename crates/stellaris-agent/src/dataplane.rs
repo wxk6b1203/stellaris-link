@@ -715,6 +715,14 @@ overlay_ip = "fd00::2"
     }
 
     #[test]
+    fn peer_advertised_prefix_is_routable() {
+        let state = state();
+        let p = v4([10, 7, 0, 1], [192, 168, 50, 10], 64);
+        let (next, _) = route_outbound(&state, &p).unwrap();
+        assert_eq!(next, node(2));
+    }
+
+    #[test]
     fn inbound_local_delivers() {
         let state = state();
         let p = v4([10, 7, 0, 2], [10, 7, 0, 1], 64);

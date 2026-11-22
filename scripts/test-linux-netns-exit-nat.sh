@@ -75,10 +75,6 @@ endpoint_id="$B"
 overlay_ip="10.115.0.2"
 advertised=["0.0.0.0/0"]
 addrs=["10.200.0.2:46412"]
-
-[[routes]]
-prefix="192.0.2.2/32"
-via="b"
 TOML
 cat >> "$DIR/b.toml" <<TOML
 [[peers]]

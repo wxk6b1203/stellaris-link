@@ -104,6 +104,25 @@ impl AgentState {
                     "peer",
                 )
                 .with_context(|| format!("seed peer route {}", peer.overlay_ip))?;
+            for advertised in &peer.advertised {
+                let (pref, attrs) = route_zone(&config, peer);
+                routes
+                    .add_static_with_attrs(
+                        *advertised,
+                        via,
+                        None,
+                        Some(pref),
+                        Some(20),
+                        None,
+                        false,
+                        None,
+                        attrs,
+                        "peer-advertised",
+                    )
+                    .with_context(|| {
+                        format!("seed advertised route {advertised} via {}", peer.name)
+                    })?;
+            }
         }
 
         for route in &config.routes {
