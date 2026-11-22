@@ -43,6 +43,7 @@
 - [x] openraft H1 单节点原型：storage/state machine/single voter；支持 raft-log/raft-state 落盘重启恢复。
 - [x] openraft H2 3 节点：进程内 leader 复制/failover + HTTP Raft RPC（共享 secret/snapshot）+ 落盘重启恢复。
 - [x] controller API Raft 写路径（`control.raft_dir`，LSA/join/revoke/ack + snapshot/model）。
+- [x] Raft snapshot 线性化读（`ensure_linearizable(ReadIndex)`）。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。

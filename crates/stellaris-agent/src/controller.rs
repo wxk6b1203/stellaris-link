@@ -30,7 +30,7 @@ use stellaris_types::{
 use uuid::Uuid;
 
 use crate::controller_raft::{StateMachineStore, TypeConfig};
-use openraft::Raft;
+use openraft::{Raft, ReadPolicy};
 
 use crate::controller_model::{ControllerCommand, ControllerModel, MemberRecord};
 
@@ -354,6 +354,15 @@ impl ControllerState {
             Some(store) => self.snapshot_from_model(store.model().await, local),
             None => self.snapshot(local),
         }
+    }
+
+    pub async fn linearize(&self) -> Result<(), String> {
+        if let Some(raft) = &self.raft {
+            raft.ensure_linearizable(ReadPolicy::ReadIndex)
+                .await
+                .map_err(|e| format!("raft linearizable read failed: {e}"))?;
+        }
+        Ok(())
     }
 
     fn snapshot_from_model(&self, model: ControllerModel, local: Option<NodeId>) -> Snapshot {
@@ -1167,6 +1176,9 @@ async fn snapshot(
         }
         None => None,
     };
+    if let Err(e) = state.linearize().await {
+        return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+    }
     Json(state.snapshot_current(local).await).into_response()
 }
 
