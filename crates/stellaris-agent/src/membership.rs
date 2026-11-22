@@ -64,11 +64,12 @@ pub fn inbound_source_allowed(state: &crate::AgentState, peer: NodeId, src: IpAd
     if owns {
         return true;
     }
-    // A transit/gateway member may carry another granted member's source.
-    grant.capabilities.iter().any(|c| c == "transit")
-        && grants.values().any(|g| {
-            g.overlay_ip == Some(src) || g.prefixes.iter().any(|prefix| prefix.contains(&src))
-        })
+    // A forwarding member may carry another granted member's source.
+    // The source must still belong to a valid member grant; `transit` is
+    // reserved for additional gateway/exit policy.
+    grants
+        .values()
+        .any(|g| g.overlay_ip == Some(src) || g.prefixes.iter().any(|prefix| prefix.contains(&src)))
 }
 
 pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa) -> bool {
@@ -381,7 +382,7 @@ overlay_ip = "10.7.0.2"
             Grant {
                 overlay_ip: Some("10.7.0.2".parse().unwrap()),
                 prefixes: vec!["192.168.50.0/24".parse().unwrap()],
-                capabilities: vec!["transit".into()],
+                capabilities: vec!["member".into()],
             },
         );
         assert!(inbound_source_allowed(

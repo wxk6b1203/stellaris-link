@@ -247,7 +247,17 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 一个 controller + 三个 member，验证 controller ACK、snapshot 成员、LSA 路由学习。
 
-### 15. 真正的 TUN overlay（两台机器，需要 root）
+### 15. Controller + 3 TUN 节点（Linux netns）
+
+```bash
+sudo BIN=./target/release/stellaris-agent \
+     CTRL=./target/release/stellaris-controller \
+     ./scripts/test-linux-netns-3node-controller.sh
+```
+
+验证 controller 路由、LSA、TUN transit、双向 0% loss 和 1000B 包。
+
+### 16. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
