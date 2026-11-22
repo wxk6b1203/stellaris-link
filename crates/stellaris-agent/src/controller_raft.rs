@@ -621,10 +621,18 @@ struct RaftHttpState {
     secret: Option<Arc<String>>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct SnapshotRpc {
+    vote: VoteOf<TypeConfig>,
+    meta: SnapshotMetaOf<TypeConfig>,
+    data: Vec<u8>,
+}
+
 fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>) -> Router {
     Router::new()
         .route("/raft/append", post(raft_append))
         .route("/raft/vote", post(raft_vote))
+        .route("/raft/snapshot", post(raft_snapshot))
         .with_state(RaftHttpState {
             raft,
             secret: secret.map(Arc::new),
@@ -639,6 +647,29 @@ fn authorized(state: &RaftHttpState, headers: &axum::http::HeaderMap) -> bool {
         .get(RAFT_SECRET_HEADER)
         .and_then(|value| value.to_str().ok())
         == Some(secret)
+}
+
+async fn raft_snapshot(
+    State(state): State<RaftHttpState>,
+    headers: axum::http::HeaderMap,
+    Json(rpc): Json<SnapshotRpc>,
+) -> Result<Json<openraft::raft::SnapshotResponse<TypeConfig>>, (axum::http::StatusCode, String)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid raft secret".into(),
+        ));
+    }
+    let snapshot = SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
+        meta: rpc.meta,
+        snapshot: Cursor::new(rpc.data),
+    };
+    state
+        .raft
+        .install_full_snapshot(rpc.vote, snapshot)
+        .await
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn raft_append(
@@ -762,8 +793,8 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
 
     async fn full_snapshot(
         &mut self,
-        _vote: VoteOf<TypeConfig>,
-        _snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
+        vote: VoteOf<TypeConfig>,
+        snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
         _cancel: impl std::future::Future<Output = openraft::error::ReplicationClosed>
         + OptionalSend
         + 'static,
@@ -772,12 +803,34 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         openraft::raft::SnapshotResponse<TypeConfig>,
         openraft::error::StreamingError<TypeConfig>,
     > {
-        Err(openraft::error::StreamingError::Unreachable(
-            Unreachable::new(&io::Error::new(
-                io::ErrorKind::Unsupported,
-                "HTTP snapshot transport not implemented yet",
-            )),
-        ))
+        let rpc = SnapshotRpc {
+            vote,
+            meta: snapshot.meta,
+            data: snapshot.snapshot.into_inner(),
+        };
+        let mut request = self
+            .client
+            .post(format!("{}/raft/snapshot", self.base))
+            .json(&rpc);
+        if let Some(secret) = &self.secret {
+            request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| openraft::error::StreamingError::Unreachable(Unreachable::new(&e)))?;
+        if !response.status().is_success() {
+            return Err(openraft::error::StreamingError::Unreachable(
+                Unreachable::new(&io::Error::other(format!(
+                    "raft snapshot status {}",
+                    response.status()
+                ))),
+            ));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| openraft::error::StreamingError::Unreachable(Unreachable::new(&e)))
     }
 }
 
