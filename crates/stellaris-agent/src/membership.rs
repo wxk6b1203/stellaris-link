@@ -171,7 +171,7 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
     }
     let mut bytes = vec![0u8; len];
     recv.read_exact(&mut bytes).await?;
-    Ok(serde_json::from_slice(&bytes).context("parse auth frame")?)
+    serde_json::from_slice(&bytes).context("parse auth frame")
 }
 
 #[cfg(test)]
