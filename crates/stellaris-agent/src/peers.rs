@@ -18,6 +18,8 @@ pub struct PeerState {
     pub connected: bool,
     pub path: Option<String>,
     pub rtt_ms: Option<u64>,
+    /// Path MTU reported by the current transport path, if known.
+    pub mtu: Option<u16>,
     /// Number of selected-path changes observed for this peer.
     pub path_changes: u64,
 }
@@ -47,6 +49,7 @@ impl PeerRegistry {
                     connected: false,
                     path: None,
                     rtt_ms: None,
+                    mtu: None,
                     path_changes: 0,
                 },
             );
@@ -73,7 +76,14 @@ impl PeerRegistry {
         guard.get(node).cloned()
     }
 
-    pub fn mark(&self, node: &NodeId, connected: bool, path: Option<String>, rtt_ms: Option<u64>) {
+    pub fn mark(
+        &self,
+        node: &NodeId,
+        connected: bool,
+        path: Option<String>,
+        rtt_ms: Option<u64>,
+        mtu: Option<u16>,
+    ) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(peer) = guard.get_mut(node) {
             if peer.path != path {
@@ -82,6 +92,7 @@ impl PeerRegistry {
             peer.connected = connected;
             peer.path = path;
             peer.rtt_ms = rtt_ms;
+            peer.mtu = mtu;
         }
     }
 
@@ -125,10 +136,10 @@ overlay_ip = "10.7.0.2"
         let node: NodeId = "0202020202020202020202020202020202020202020202020202020202020202"
             .parse()
             .unwrap();
-        registry.mark(&node, true, Some("direct".into()), Some(5));
-        registry.mark(&node, true, Some("direct".into()), Some(6));
+        registry.mark(&node, true, Some("direct".into()), Some(5), Some(1200));
+        registry.mark(&node, true, Some("direct".into()), Some(6), Some(1200));
         assert_eq!(registry.get(&node).unwrap().path_changes, 1);
-        registry.mark(&node, true, Some("relay".into()), Some(50));
+        registry.mark(&node, true, Some("relay".into()), Some(50), Some(1100));
         assert_eq!(registry.get(&node).unwrap().path_changes, 2);
     }
 }

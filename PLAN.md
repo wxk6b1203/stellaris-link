@@ -66,7 +66,7 @@
 - [x] Raft 持久化失败传播 + 先落盘后 ACK。
 - [x] 分片 ACL：first-fragment verdict cache，缺失首片 fail-closed。
 - [x] Raft 只读磁盘故障测试：写失败不 apply command。
-- [x] peer direct/relay path change 计数与 metric。
+- [x] peer direct/relay path change 计数、path MTU 与 metric。
 - [x] 本地 HTTP relay 上 endpoint 建连测试（relay path）与双 relay failover。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
