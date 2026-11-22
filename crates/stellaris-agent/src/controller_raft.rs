@@ -2054,11 +2054,29 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        leader
-            .expect("leader")
-            .client_write(ControllerCommand::ApplyLsa { lsa })
-            .await
-            .unwrap();
+        let _ = leader.expect("leader");
+        let mut wrote = false;
+        for _ in 0..50 {
+            let mut current = None;
+            for (id, raft) in first.rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    current = Some(raft.clone());
+                    break;
+                }
+            }
+            if let Some(raft) = current {
+                if raft
+                    .client_write(ControllerCommand::ApplyLsa { lsa: lsa.clone() })
+                    .await
+                    .is_ok()
+                {
+                    wrote = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(wrote, "write after leader election");
         for store in &first.stores {
             for _ in 0..50 {
                 if store.model().await.lsas.contains_key(&node) {
