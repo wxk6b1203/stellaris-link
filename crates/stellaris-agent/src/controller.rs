@@ -29,6 +29,9 @@ use stellaris_types::{
 };
 use uuid::Uuid;
 
+use crate::controller_raft::{StateMachineStore, TypeConfig};
+use openraft::Raft;
+
 use crate::controller_model::{ControllerCommand, ControllerModel, MemberRecord};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -64,6 +67,8 @@ pub struct ControllerState {
     strict_membership: bool,
     signing_key: Option<Arc<SigningKey>>,
     signer: Option<NodeId>,
+    raft: Option<Arc<Raft<TypeConfig, StateMachineStore>>>,
+    raft_store: Option<StateMachineStore>,
     leader: Option<NodeId>,
     manifest_ttl: u64,
     pub epoch: u64,
@@ -303,6 +308,8 @@ impl ControllerState {
             strict_membership,
             signing_key: None,
             signer: None,
+            raft: None,
+            raft_store: None,
             leader: config
                 .control
                 .leader_id
@@ -316,6 +323,15 @@ impl ControllerState {
         })
     }
 
+    pub fn set_raft(
+        &mut self,
+        raft: Arc<Raft<TypeConfig, StateMachineStore>>,
+        store: StateMachineStore,
+    ) {
+        self.raft = Some(raft);
+        self.raft_store = Some(store);
+    }
+
     pub fn set_signing_key(&mut self, secret: [u8; 32]) {
         let key = SigningKey::from_bytes(&secret);
         self.signer = Some(NodeId::new(key.verifying_key().to_bytes()));
@@ -324,6 +340,105 @@ impl ControllerState {
 
     pub fn model(&self) -> ControllerModel {
         self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub async fn model_current(&self) -> ControllerModel {
+        match &self.raft_store {
+            Some(store) => store.model().await,
+            None => self.model(),
+        }
+    }
+
+    pub async fn snapshot_current(&self, local: Option<NodeId>) -> Snapshot {
+        match &self.raft_store {
+            Some(store) => self.snapshot_from_model(store.model().await, local),
+            None => self.snapshot(local),
+        }
+    }
+
+    fn snapshot_from_model(&self, model: ControllerModel, local: Option<NodeId>) -> Snapshot {
+        let mut routes = self
+            .routes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(local) = local {
+            routes.extend(model.routes(local));
+        }
+        let members = self.members_from_model(&model);
+        let network_id = self.network.to_string();
+        let generation = model.generation;
+        let epoch = model.epoch;
+        let signature = self.secret.as_deref().map(|secret| {
+            snapshot_signature(secret, &network_id, epoch, generation, &members, &routes)
+        });
+        let ed25519_signature = self.signing_key.as_ref().map(|key| {
+            let bytes = snapshot_payload_bytes(&network_id, epoch, generation, &members, &routes);
+            hex::encode(key.sign(&bytes).to_bytes())
+        });
+        Snapshot {
+            network_id,
+            epoch,
+            generation,
+            members,
+            routes,
+            signer: self.signer.map(|n| n.to_string()),
+            signature,
+            ed25519_signature,
+        }
+    }
+
+    fn members_from_model(&self, model: &ControllerModel) -> Vec<MemberView> {
+        let mut out: Vec<MemberView> = model
+            .lsas
+            .values()
+            .map(|lsa| {
+                let member = model.members.get(&lsa.origin);
+                MemberView {
+                    node_id: lsa.origin.to_string(),
+                    zone: lsa.zone.clone(),
+                    overlay_ip: lsa.overlay_ip,
+                    addrs: lsa.addrs.clone(),
+                    prefixes: lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect(),
+                    allowed_prefixes: member.map(|m| m.prefixes.clone()).unwrap_or_else(|| {
+                        lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect()
+                    }),
+                    capabilities: member.map(|m| m.capabilities.clone()).unwrap_or_default(),
+                    links: lsa.links.iter().map(|l| l.to.to_string()).collect(),
+                    last_seq: lsa.seq,
+                }
+            })
+            .collect();
+        for (node, member) in &model.members {
+            if out.iter().any(|m| m.node_id == node.to_string()) {
+                continue;
+            }
+            out.push(MemberView {
+                node_id: node.to_string(),
+                zone: None,
+                overlay_ip: member.overlay_ip,
+                addrs: Vec::new(),
+                prefixes: Vec::new(),
+                allowed_prefixes: member.prefixes.clone(),
+                capabilities: member.capabilities.clone(),
+                links: Vec::new(),
+                last_seq: 0,
+            });
+        }
+        out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        out
+    }
+
+    async fn apply_lsa_current(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
+        self.authorize_lsa(&lsa)?;
+        if let Some(raft) = &self.raft {
+            raft.client_write(ControllerCommand::ApplyLsa { lsa })
+                .await
+                .map(|_| true)
+                .map_err(|e| (503, format!("raft write failed: {e}")))
+        } else {
+            self.apply_lsa(lsa)
+        }
     }
 
     pub fn manifest(&self) -> MembershipManifest {
@@ -921,14 +1036,14 @@ async fn snapshot(
         }
         None => None,
     };
-    Json(state.snapshot(local)).into_response()
+    Json(state.snapshot_current(local).await).into_response()
 }
 
 async fn model(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
     if !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(state.model()).into_response()
+    Json(state.model_current().await).into_response()
 }
 
 async fn manifest(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
@@ -946,13 +1061,16 @@ async fn apply_lsa(
     if !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.apply_lsa(lsa) {
-        Ok(changed) => Json(json!({
-            "changed": changed,
-            "generation": state.generation.load(Ordering::Relaxed),
-            "lsas": state.link_state.read().unwrap_or_else(|e| e.into_inner()).len(),
-        }))
-        .into_response(),
+    match state.apply_lsa_current(lsa).await {
+        Ok(changed) => {
+            let model = state.model_current().await;
+            Json(json!({
+                "changed": changed,
+                "generation": model.generation,
+                "lsas": model.lsas.len(),
+            }))
+            .into_response()
+        }
         Err((code, message)) => (
             StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
             message,
@@ -1108,6 +1226,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         && state.signer != Some(leader)
     {
         tracing::warn!(%leader, signer = ?state.signer, "controller is not the configured leader; writes will be rejected");
+    }
+    if let Some(raft_dir) = &config.control.raft_dir {
+        let dir = PathBuf::from(raft_dir);
+        std::fs::create_dir_all(&dir)?;
+        let model = ControllerModel::new(state.network, state.epoch);
+        let node = crate::controller_raft::start_single_on_disk(model, &dir).await?;
+        state.set_raft(Arc::new(node.raft), node.store);
+        tracing::info!(dir = %dir.display(), "controller raft state machine enabled (single node)");
     }
     if config.control.iroh_port.is_some() {
         let state = state.clone();
@@ -1333,6 +1459,59 @@ via = "b"
     async fn json(response: axum::response::Response) -> serde_json::Value {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn raft_backed_lsa_write_is_visible_in_snapshot() {
+        let mut state = state();
+        let model = crate::controller_model::ControllerModel::new(state.network, state.epoch);
+        let node = crate::controller_raft::start_single(model).await.unwrap();
+        state.set_raft(std::sync::Arc::new(node.raft), node.store);
+        let app = router(state);
+        let node_id = NodeId::new([7u8; 32]);
+        let lsa = serde_json::json!({
+            "origin": "0707070707070707070707070707070707070707070707070707070707070707",
+            "seq": 1,
+            "zone": null,
+            "links": [],
+            "prefixes": [{"prefix": "192.168.99.0/24", "metric": 0}],
+            "overlay_ip": "10.7.0.7",
+            "addrs": []
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/lsa")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(lsa.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/snapshot?node=0707070707070707070707070707070707070707070707070707070707070707")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json(response).await;
+        assert!(
+            json["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["node_id"] == node_id.to_string())
+        );
     }
 
     #[tokio::test]

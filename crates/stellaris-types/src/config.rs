@@ -94,6 +94,9 @@ pub struct ControlConfig {
     /// Previous shared secrets accepted during rotation.
     #[serde(default)]
     pub previous_secrets: Vec<String>,
+    /// Enable the single-node Raft controller and persist here.
+    #[serde(default)]
+    pub raft_dir: Option<String>,
     /// Membership manifest lifetime in seconds.
     #[serde(default = "default_manifest_ttl")]
     pub manifest_ttl_secs: u64,
@@ -151,6 +154,7 @@ impl Default for ControlConfig {
             epoch: None,
             leader_id: None,
             previous_secrets: Vec::new(),
+            raft_dir: None,
             manifest_ttl_secs: default_manifest_ttl(),
             controller_keys: Vec::new(),
             controller_threshold: 1,
