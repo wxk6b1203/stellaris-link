@@ -350,7 +350,23 @@ cargo build -p stellaris-agent --bin stellaris-controller
 # OK: 3-controller raft TLS join/LSA/snapshot works.
 ```
 
-### 21.6 Public exit + NAT44
+### 21.6 Public exit + NAT44/NAT66
+
+IPv4：
+
+```bash
+sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat.sh
+# OK: public exit + NAT44 works.
+```
+
+IPv6：
+
+```bash
+sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat66.sh
+# OK: public exit + NAT66 works.
+```
+
+### 21.7 Public exit + NAT44
 
 ```bash
 sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat.sh

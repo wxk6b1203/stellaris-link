@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BIN="${BIN:-$(pwd)/target/release/stellaris-agent}"
+DIR="${DIR:-/tmp/stellaris-exit-nat66}"
+rm -rf "$DIR"; mkdir -p "$DIR"
+cleanup(){ kill ${A_PID:-} ${B_PID:-} 2>/dev/null || true; for ns in sa sb sc; do ip netns del $ns 2>/dev/null || true; done; [ "${KEEP:-0}" = 1 ] || rm -rf "$DIR"; }
+trap cleanup EXIT
+for ns in sa sb sc; do ip netns del $ns 2>/dev/null || true; ip netns add $ns; ip netns exec $ns ip link set lo up; ip netns exec $ns sysctl -qw net.ipv6.conf.all.forwarding=1; done
+ip link add va type veth peer name vb1; ip link set va netns sa; ip link set vb1 netns sb
+ip link add vb2 type veth peer name vc; ip link set vb2 netns sb; ip link set vc netns sc
+ip netns exec sa ip addr add 10.200.0.1/24 dev va
+ip netns exec sb ip addr add 10.200.0.2/24 dev vb1
+ip netns exec sb ip addr add 10.201.0.2/24 dev vb2
+ip netns exec sc ip addr add 10.201.0.3/24 dev vc
+ip netns exec sb ip -6 addr add fd00:201::1/64 dev vb2
+ip netns exec sc ip -6 addr add fd00:201::2/64 dev vc
+for nd in 'sa va' 'sb vb1' 'sb vb2' 'sc vc'; do set -- $nd; ip netns exec $1 ip link set $2 up; done
+ip netns exec sb ip -6 route add fd00:201::/64 dev vb2
+cat > "$DIR/a.toml" <<TOML
+[node]
+name="a"
+state_dir="$DIR/a-state"
+overlay_ip="fd00:115::1"
+[network]
+name="exitnat6"
+cidr="fd00:115::/64"
+[network.auth]
+mode="psk"
+secret="exit6-secret"
+[transport]
+relay_urls=[]
+disable_relay=true
+listen_port=46511
+bind_ip="10.200.0.1"
+advertise=["10.200.0.1:46511"]
+[dataplane]
+enabled=true
+tun_name="stellaris0"
+mtu=1280
+[api]
+bind="127.0.0.1:46521"
+TOML
+cat > "$DIR/b.toml" <<TOML
+[node]
+name="b"
+state_dir="$DIR/b-state"
+overlay_ip="fd00:115::2"
+[network]
+name="exitnat6"
+cidr="fd00:115::/64"
+[network.auth]
+mode="psk"
+secret="exit6-secret"
+[transport]
+relay_urls=[]
+disable_relay=true
+listen_port=46512
+bind_ip="10.200.0.2"
+advertise=["10.200.0.2:46512"]
+[dataplane]
+enabled=true
+tun_name="stellaris0"
+mtu=1280
+advertise=["::/0"]
+nat=true
+[api]
+bind="127.0.0.1:46522"
+TOML
+A=$($BIN --config "$DIR/a.toml" --print-id); B=$($BIN --config "$DIR/b.toml" --print-id)
+cat >> "$DIR/a.toml" <<TOML
+[[peers]]
+name="b"
+endpoint_id="$B"
+overlay_ip="fd00:115::2"
+advertised=["::/0"]
+addrs=["10.200.0.2:46512"]
+
+[[routes]]
+prefix="fd00:201::2/128"
+via="b"
+TOML
+cat >> "$DIR/b.toml" <<TOML
+[[peers]]
+name="a"
+endpoint_id="$A"
+overlay_ip="fd00:115::1"
+addrs=["10.200.0.1:46511"]
+TOML
+ip netns exec sa env RUST_LOG=stellaris_agent::dataplane=debug,stellaris_agent::transport=debug "$BIN" --config "$DIR/a.toml" > "$DIR/a.log" 2>&1 & A_PID=$!
+ip netns exec sb env RUST_LOG=stellaris_agent::dataplane=debug,stellaris_agent::gateway=debug,stellaris_agent::transport=debug "$BIN" --config "$DIR/b.toml" > "$DIR/b.log" 2>&1 & B_PID=$!
+sleep 8
+echo '--- routes ---'
+for ns in sa sb sc; do echo "== $ns"; ip netns exec $ns ip -6 route; ip netns exec $ns ip -6 addr show stellaris0 2>&1 || true; done
+echo '--- nat ---'
+ip netns exec sb ip6tables -t nat -S POSTROUTING
+echo '--- ping external via exit ---'
+set +e
+ip netns exec sa ping -6 -c 3 -W 2 fd00:201::2
+PING_RC=$?
+set -e
+echo '--- logs ---'
+for f in "$DIR"/{a,b}.log; do echo "===$f"; grep -E 'inbound|outbound|NAT|nat|forward|dropped|error' "$f" | tail -30; done
+if [ "$PING_RC" = 0 ]; then echo "OK: public exit + NAT66 works."; else echo "FAIL: public exit IPv6 ping failed" >&2; exit 1; fi
