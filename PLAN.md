@@ -40,6 +40,7 @@
 - [x] API token / controller secret 轮换窗口（previous_*）。
 - [x] controller 手动 leader fence：非 leader 拒绝 LSA/join/revoke 写入。
 - [x] openraft H0 确定性 ControllerModel/Command，作为 controller shadow 接入（`/v1/model` + durable command log）。
+- [x] openraft H1 单节点原型：in-memory storage + state machine + single voter。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。

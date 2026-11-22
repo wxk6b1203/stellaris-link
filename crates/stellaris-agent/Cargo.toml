@@ -28,11 +28,13 @@ hex.workspace = true
 hmac.workspace = true
 ipnet.workspace = true
 iroh.workspace = true
+openraft.workspace = true
 mdns-sd.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+futures.workspace = true
 socket2.workspace = true
 sha2.workspace = true
 stellaris-fib = { path = "../stellaris-fib" }

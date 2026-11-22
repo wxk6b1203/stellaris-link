@@ -5,6 +5,7 @@ pub mod control_client;
 pub mod control_wire;
 pub mod controller;
 pub mod controller_model;
+pub mod controller_raft;
 pub mod dataplane;
 pub mod discovery;
 pub mod gateway;

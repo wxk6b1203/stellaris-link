@@ -1,6 +1,6 @@
 # Openraft Controller HA — 详细设计（未实现）
 
-> 状态：设计稿，代码未实现。
+> 状态：H0 确定性模型 + H1 单节点 openraft 原型已实现；3 节点 Raft 尚未实现。
 > 当前实现：单 controller + 多 controller active-active fanout（pre-Raft）+ signed snapshot + epoch/manifest + 持久化 ACK。
 > 目标：把 controller 从“内存状态 + fanout”升级为 **openraft 复制的确定性状态机**，提供 quorum、leader election、快照、成员变更和故障恢复。
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)。
@@ -382,6 +382,28 @@ crates/stellaris-agent/src/controller_model.rs
 - 尚未替换旧 controller 状态，也尚未接入 openraft
 
 这是 Phase 0 的前置模型。
+
+## 8.3 H1：单节点 openraft 原型（已实现）
+
+新增：
+
+```text
+crates/stellaris-agent/src/controller_raft.rs
+```
+
+- `TypeConfig` 使用 `ControllerCommand` / `CommandResult`
+- in-memory `RaftLogStorage`
+- `RaftStateMachine` 直接 apply 到 `ControllerModel`
+- snapshot 序列化 model
+- single-voter `Raft::initialize`
+- `client_write(ApplyLsa)` 测试通过
+
+当前限制：
+
+- log/vote/snapshot 是内存实现，不是生产持久化存储
+- `RaftNetworkV2` 是 placeholder，只用于单节点
+- 尚未接入 HTTP controller
+- 尚未实现 3 controller bootstrap/membership
 
 ## 9. 迁移步骤
 
