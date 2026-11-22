@@ -70,6 +70,8 @@ pub struct MemberView {
     pub overlay_ip: Option<std::net::IpAddr>,
     pub addrs: Vec<SocketAddr>,
     pub prefixes: Vec<String>,
+    pub allowed_prefixes: Vec<String>,
+    pub capabilities: Vec<String>,
     pub links: Vec<String>,
     pub last_seq: u64,
 }
@@ -240,18 +242,45 @@ impl ControllerState {
 
     fn members(&self) -> Vec<MemberView> {
         let db = self.link_state.read().unwrap_or_else(|e| e.into_inner());
+        let grants = self.grants.read().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<MemberView> = db
             .all()
-            .map(|lsa| MemberView {
-                node_id: lsa.origin.to_string(),
-                zone: lsa.zone.clone(),
-                overlay_ip: lsa.overlay_ip,
-                addrs: lsa.addrs.clone(),
-                prefixes: lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect(),
-                links: lsa.links.iter().map(|l| l.to.to_string()).collect(),
-                last_seq: lsa.seq,
+            .map(|lsa| {
+                let grant = grants.get(&lsa.origin);
+                MemberView {
+                    node_id: lsa.origin.to_string(),
+                    zone: lsa.zone.clone(),
+                    overlay_ip: lsa.overlay_ip,
+                    addrs: lsa.addrs.clone(),
+                    prefixes: lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect(),
+                    allowed_prefixes: grant
+                        .map(|g| g.prefixes.iter().map(|p| p.to_string()).collect())
+                        .unwrap_or_else(|| {
+                            lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect()
+                        }),
+                    capabilities: grant.map(|g| g.capabilities.clone()).unwrap_or_default(),
+                    links: lsa.links.iter().map(|l| l.to.to_string()).collect(),
+                    last_seq: lsa.seq,
+                }
             })
             .collect();
+        // Grants may exist before the first LSA; expose them for discovery/auth.
+        for (node, grant) in grants.iter() {
+            if out.iter().any(|m| m.node_id == node.to_string()) {
+                continue;
+            }
+            out.push(MemberView {
+                node_id: node.to_string(),
+                zone: None,
+                overlay_ip: grant.overlay_ip,
+                addrs: Vec::new(),
+                prefixes: Vec::new(),
+                allowed_prefixes: grant.prefixes.iter().map(|p| p.to_string()).collect(),
+                capabilities: grant.capabilities.clone(),
+                links: Vec::new(),
+                last_seq: 0,
+            });
+        }
         out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         out
     }

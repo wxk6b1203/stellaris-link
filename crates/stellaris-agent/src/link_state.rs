@@ -122,6 +122,11 @@ impl Service {
     }
 
     fn publish(&self, lsa: Lsa) {
+        if lsa.origin != self.state.node_id && !crate::membership::lsa_authorized(&self.state, &lsa)
+        {
+            tracing::debug!(origin = %lsa.origin.short(), "unauthorized LSA dropped");
+            return;
+        }
         self.discover(&lsa);
         let changed = {
             let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());

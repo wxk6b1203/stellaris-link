@@ -364,6 +364,7 @@ fn apply_snapshot(
             return None;
         }
     }
+    state.set_grants(&snapshot.members);
     discover_members(state, &snapshot.members, transport);
     if state.config.routing.prefer_same_zone
         && let Some(local_zone) = state.config.node.zone.as_deref()

@@ -3,8 +3,13 @@
 //! PSK mode performs a mutual HMAC challenge-response on a fresh bi-stream
 //! before the connection is admitted to the dataplane or LSA exchange.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
+
 use anyhow::{Context, bail};
 use hmac::{Hmac, Mac};
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use stellaris_types::{NetworkId, NodeId};
@@ -12,6 +17,75 @@ use stellaris_types::{NetworkId, NodeId};
 const CLIENT_DOMAIN: &[u8] = b"stellaris-join-client-v1";
 const SERVER_DOMAIN: &[u8] = b"stellaris-join-server-v1";
 const MAX_FRAME: usize = 4096;
+
+#[derive(Clone, Debug, Default)]
+pub struct Grant {
+    pub overlay_ip: Option<IpAddr>,
+    pub prefixes: Vec<IpNet>,
+    pub capabilities: Vec<String>,
+}
+
+pub type GrantMap = Arc<RwLock<HashMap<NodeId, Grant>>>;
+
+pub fn manifest_grants(members: &[crate::controller::MemberView]) -> HashMap<NodeId, Grant> {
+    members
+        .iter()
+        .filter_map(|member| {
+            let node: NodeId = member.node_id.parse().ok()?;
+            Some((
+                node,
+                Grant {
+                    overlay_ip: member.overlay_ip,
+                    prefixes: member
+                        .allowed_prefixes
+                        .iter()
+                        .filter_map(|p| p.parse().ok())
+                        .collect(),
+                    capabilities: member.capabilities.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa) -> bool {
+    let grants = state.grants.read().unwrap_or_else(|e| e.into_inner());
+    if !grants.is_empty() {
+        let Some(grant) = grants.get(&lsa.origin) else {
+            return false;
+        };
+        if let Some(expected) = grant.overlay_ip
+            && lsa.overlay_ip.is_some_and(|ip| ip != expected)
+        {
+            return false;
+        }
+        for prefix in &lsa.prefixes {
+            let own = grant
+                .overlay_ip
+                .and_then(|ip| IpNet::new(ip, 32).ok())
+                .is_some_and(|p| p == prefix.prefix);
+            if !own && !grant.prefixes.contains(&prefix.prefix) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // No controller manifest: static peers grant their configured prefixes;
+    // unknown/dynamic peers may only advertise their own overlay /32.
+    let Some(peer) = state.peers.get(&lsa.origin) else {
+        return lsa.prefixes.iter().all(|p| {
+            lsa.overlay_ip
+                .is_some_and(|ip| IpNet::new(ip, 32).is_ok_and(|x| x == p.prefix))
+        });
+    };
+    for prefix in &lsa.prefixes {
+        let own = IpNet::new(peer.overlay_ip, 32).is_ok_and(|p| p == prefix.prefix);
+        if !own && !peer.advertised.contains(&prefix.prefix) {
+            return false;
+        }
+    }
+    true
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AuthHello {

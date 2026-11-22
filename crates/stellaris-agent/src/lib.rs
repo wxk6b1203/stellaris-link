@@ -34,6 +34,7 @@ pub struct AgentState {
     pub identity_secret: [u8; 32],
     pub routes: Arc<RouteEngine>,
     pub peers: PeerRegistry,
+    pub grants: membership::GrantMap,
     pub policy: Arc<RwLock<policy::Policy>>,
     pub started_at: Instant,
 }
@@ -140,6 +141,7 @@ impl AgentState {
             identity_secret: identity.secret,
             routes,
             peers,
+            grants: Arc::new(RwLock::new(std::collections::HashMap::new())),
             policy,
             started_at: Instant::now(),
         })
@@ -147,6 +149,11 @@ impl AgentState {
 
     pub fn routes_path(&self) -> PathBuf {
         PathBuf::from(&self.config.node.state_dir).join("routes.json")
+    }
+
+    pub fn set_grants(&self, members: &[controller::MemberView]) {
+        let grants = membership::manifest_grants(members);
+        *self.grants.write().unwrap_or_else(|e| e.into_inner()) = grants;
     }
 
     pub fn policy_path(&self) -> PathBuf {
