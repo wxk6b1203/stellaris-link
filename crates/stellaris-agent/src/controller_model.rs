@@ -4,7 +4,7 @@
 //! existing HTTP controller. The same command log must produce identical
 //! state on every replica; openraft can later drive `apply()`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,11 @@ pub enum ControllerCommand {
         node: NodeId,
         member: MemberRecord,
     },
+    Join {
+        node: NodeId,
+        member: MemberRecord,
+        token: String,
+    },
     RevokeMember {
         node: NodeId,
     },
@@ -58,6 +63,7 @@ pub struct ControllerModel {
     pub lsas: BTreeMap<NodeId, Lsa>,
     pub members: BTreeMap<NodeId, MemberRecord>,
     pub acks: BTreeMap<NodeId, AckRecord>,
+    pub consumed_join_tokens: BTreeSet<String>,
 }
 
 impl ControllerModel {
@@ -69,6 +75,7 @@ impl ControllerModel {
             lsas: BTreeMap::new(),
             members: BTreeMap::new(),
             acks: BTreeMap::new(),
+            consumed_join_tokens: BTreeSet::new(),
         }
     }
 
@@ -112,6 +119,19 @@ impl ControllerModel {
                 }
                 changed
             }
+            ControllerCommand::Join {
+                node,
+                member,
+                token,
+            } => {
+                if self.consumed_join_tokens.contains(&token) {
+                    false
+                } else {
+                    self.consumed_join_tokens.insert(token);
+                    self.members.insert(node, member);
+                    true
+                }
+            }
             ControllerCommand::RevokeMember { node } => {
                 let removed = self.members.remove(&node).is_some();
                 let lsa_removed = self.lsas.remove(&node).is_some();
@@ -152,6 +172,7 @@ impl ControllerModel {
             lsas: Vec<&'a Lsa>,
             members: Vec<(&'a NodeId, &'a MemberRecord)>,
             acks: Vec<(&'a NodeId, &'a AckRecord)>,
+            consumed_join_tokens: Vec<&'a String>,
         }
         let snapshot = Snapshot {
             network: &self.network,
@@ -160,6 +181,7 @@ impl ControllerModel {
             lsas: self.lsas.values().collect(),
             members: self.members.iter().collect(),
             acks: self.acks.iter().collect(),
+            consumed_join_tokens: self.consumed_join_tokens.iter().collect(),
         };
         serde_json::to_vec(&snapshot).unwrap_or_default()
     }

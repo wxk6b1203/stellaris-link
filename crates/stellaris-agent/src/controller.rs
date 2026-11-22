@@ -429,8 +429,51 @@ impl ControllerState {
         out
     }
 
+    async fn authorize_lsa_current(&self, lsa: &Lsa) -> Result<(), (u16, String)> {
+        if !self.strict_membership {
+            return Ok(());
+        }
+        if self.raft.is_none() {
+            return self.authorize_lsa(lsa);
+        }
+        let model = self.model_current().await;
+        let Some(member) = model.members.get(&lsa.origin) else {
+            return Err((403, format!("member {} is not authorized", lsa.origin)));
+        };
+        if let Some(expected) = member.overlay_ip
+            && lsa.overlay_ip != Some(expected)
+        {
+            return Err((403, "LSA overlay_ip does not match member grant".into()));
+        }
+        for prefix in &lsa.prefixes {
+            let own = member
+                .overlay_ip
+                .is_some_and(|ip| ipnet::IpNet::new(ip, 32).is_ok_and(|p| p == prefix.prefix));
+            let allowed = member
+                .prefixes
+                .iter()
+                .filter_map(|p| p.parse::<IpNet>().ok())
+                .any(|p| p == prefix.prefix);
+            if !own && !allowed {
+                return Err((
+                    403,
+                    format!(
+                        "prefix {} is not authorized for {}",
+                        prefix.prefix, lsa.origin
+                    ),
+                ));
+            }
+        }
+        for link in &lsa.links {
+            if !model.members.contains_key(&link.to) {
+                return Err((403, format!("link target {} is not authorized", link.to)));
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_lsa_current(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
-        self.authorize_lsa(&lsa)?;
+        self.authorize_lsa_current(&lsa).await?;
         if let Some(raft) = &self.raft {
             raft.client_write(ControllerCommand::ApplyLsa { lsa })
                 .await
@@ -764,6 +807,94 @@ impl ControllerState {
             }
         }
         Ok(())
+    }
+
+    fn join_member(
+        &self,
+        overlay: std::net::IpAddr,
+        token: &str,
+    ) -> Result<MemberRecord, (u16, String)> {
+        let now = now_epoch();
+        let join = self
+            .join_tokens
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(token)
+            .cloned()
+            .ok_or((403, "invalid or already used join token".to_string()))?;
+        if join.expires_at.is_some_and(|expires| now > expires) {
+            return Err((403, "join token expired".to_string()));
+        }
+        Ok(MemberRecord {
+            overlay_ip: Some(overlay),
+            prefixes: join.prefixes.iter().map(|p| p.to_string()).collect(),
+            capabilities: join.capabilities.clone(),
+        })
+    }
+
+    async fn join_current(
+        &self,
+        node: NodeId,
+        overlay: std::net::IpAddr,
+        token: &str,
+    ) -> Result<(), (u16, String)> {
+        if let Some(raft) = &self.raft {
+            if self
+                .model_current()
+                .await
+                .consumed_join_tokens
+                .contains(token)
+            {
+                return Err((403, "invalid or already used join token".to_string()));
+            }
+            let member = self.join_member(overlay, token)?;
+            raft.client_write(ControllerCommand::Join {
+                node,
+                member,
+                token: token.to_string(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| (503, format!("raft join failed: {e}")))
+        } else {
+            self.join(node, overlay, token)
+        }
+    }
+
+    async fn revoke_current(&self, node: NodeId) -> Result<(), (u16, String)> {
+        if let Some(raft) = &self.raft {
+            raft.client_write(ControllerCommand::RevokeMember { node })
+                .await
+                .map(|_| ())
+                .map_err(|e| (503, format!("raft revoke failed: {e}")))
+        } else {
+            self.revoke(node)
+        }
+    }
+
+    async fn ack_current(
+        &self,
+        node: NodeId,
+        generation: u64,
+        epoch: Option<u64>,
+    ) -> Result<(), (u16, String)> {
+        if let Some(raft) = &self.raft {
+            if let Some(epoch) = epoch
+                && epoch != self.epoch
+            {
+                return Err((409, "controller epoch changed; refetch snapshot".into()));
+            }
+            raft.client_write(ControllerCommand::Ack {
+                node,
+                generation,
+                epoch: self.epoch,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| (503, format!("raft ack failed: {e}")))
+        } else {
+            self.record_ack(node, generation, epoch)
+        }
     }
 
     fn join(
@@ -1106,7 +1237,7 @@ async fn join(
             return (StatusCode::BAD_REQUEST, format!("invalid overlay_ip: {e}")).into_response();
         }
     };
-    match state.join(node, overlay, &req.token) {
+    match state.join_current(node, overlay, &req.token).await {
         Ok(()) => Json(json!({
             "joined": node.to_string(),
             "generation": state.generation.load(Ordering::Relaxed),
@@ -1139,7 +1270,7 @@ async fn revoke(
             return (StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")).into_response();
         }
     };
-    match state.revoke(node) {
+    match state.revoke_current(node).await {
         Ok(()) => Json(json!({
             "revoked": node.to_string(),
             "generation": state.generation.load(Ordering::Relaxed),
@@ -1173,7 +1304,7 @@ async fn ack(
         Ok(node) => node,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
     };
-    match state.record_ack(node, req.generation, req.epoch) {
+    match state.ack_current(node, req.generation, req.epoch).await {
         Ok(()) => Json(json!({"acked": req.generation, "node": node.to_string()})).into_response(),
         Err((code, message)) => (
             StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
@@ -1231,9 +1362,35 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let dir = PathBuf::from(raft_dir);
         std::fs::create_dir_all(&dir)?;
         let model = ControllerModel::new(state.network, state.epoch);
-        let node = crate::controller_raft::start_single_on_disk(model, &dir).await?;
+        let id = config.control.raft_id.unwrap_or(1);
+        let bind: SocketAddr = config
+            .control
+            .raft_bind
+            .as_deref()
+            .unwrap_or("127.0.0.1:0")
+            .parse()
+            .context("control.raft_bind")?;
+        let peers = config
+            .control
+            .raft_peers
+            .iter()
+            .map(|peer| (peer.id, peer.addr.clone()))
+            .collect();
+        let node = crate::controller_raft::start_http_node(
+            model,
+            id,
+            bind,
+            peers,
+            Some(dir.clone()),
+            config.control.raft_secret.clone(),
+            config.control.raft_bootstrap,
+        )
+        .await?;
+        tracing::info!(dir = %dir.display(), id, addr = %node.address, "controller raft enabled");
         state.set_raft(Arc::new(node.raft), node.store);
-        tracing::info!(dir = %dir.display(), "controller raft state machine enabled (single node)");
+        tokio::spawn(async move {
+            let _ = node.server.await;
+        });
     }
     if config.control.iroh_port.is_some() {
         let state = state.clone();
@@ -1459,6 +1616,83 @@ via = "b"
     async fn json(response: axum::response::Response) -> serde_json::Value {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn raft_backed_join_consumes_token_once() {
+        let dir = temp_state_dir();
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+bind = "127.0.0.1:0"
+secret = "s3cret"
+
+[[control.join_tokens]]
+token = "join-once"
+prefixes = ["192.168.101.0/24"]
+"#,
+            dir
+        );
+        let config = Config::from_toml(&toml).unwrap();
+        let mut state = ControllerState::from_config(&config).unwrap();
+        let model = ControllerModel::new(state.network, state.epoch);
+        let node = crate::controller_raft::start_single(model).await.unwrap();
+        state.set_raft(Arc::new(node.raft), node.store);
+        let app = router(state);
+        let body = json!({
+            "node_id": NodeId::new([10u8; 32]).to_string(),
+            "overlay_ip": "10.7.0.10",
+            "token": "join-once"
+        });
+        for expected in [StatusCode::OK, StatusCode::FORBIDDEN] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/join")
+                        .header("x-stellaris-secret", "s3cret")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/lsa")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "origin": NodeId::new([10u8; 32]).to_string(),
+                            "seq": 1,
+                            "zone": null,
+                            "links": [],
+                            "prefixes": [{"prefix": "192.168.101.0/24", "metric": 0}],
+                            "overlay_ip": "10.7.0.10",
+                            "addrs": []
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

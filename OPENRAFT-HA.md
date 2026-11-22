@@ -451,7 +451,9 @@ three_node_raft_over_http
 - controller 支持 `control.raft_dir` 启用单节点 Raft
 - `/v1/lsa` 在 Raft 模式走 `client_write`
 - `/v1/snapshot` / `/v1/model` 从 Raft state machine 生成
-- join/revoke/ack 仍走旧路径
+- join/revoke/ack 在 Raft 模式下也提交 `ControllerCommand`
+- join token 消费集合已进入 `ControllerModel`
+- Raft 模式下 LSA 前缀授权读取 model member grant
 
 ### H1 持久化验证
 

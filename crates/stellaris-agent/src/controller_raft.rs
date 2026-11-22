@@ -834,6 +834,64 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
     }
 }
 
+pub struct HttpRaftNode {
+    pub raft: Raft<TypeConfig, StateMachineStore>,
+    pub store: StateMachineStore,
+    pub server: tokio::task::JoinHandle<()>,
+    pub address: std::net::SocketAddr,
+}
+
+pub async fn start_http_node(
+    model: ControllerModel,
+    id: u64,
+    bind: std::net::SocketAddr,
+    peers: Vec<(u64, String)>,
+    dir: Option<PathBuf>,
+    secret: Option<String>,
+    bootstrap: bool,
+) -> anyhow::Result<HttpRaftNode> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let address = listener.local_addr()?;
+    let (log, state_path) = if let Some(dir) = &dir {
+        std::fs::create_dir_all(dir)?;
+        (
+            LogStore::new(Some(dir.join("raft-log.json"))),
+            Some(dir.join("raft-state.json")),
+        )
+    } else {
+        (LogStore::default(), None)
+    };
+    let log = Arc::new(log);
+    let fresh = log.is_empty().await;
+    let store = StateMachineStore::new(model, state_path);
+    let factory = HttpFactory {
+        client: reqwest::Client::new(),
+        secret: secret.clone().map(Arc::new),
+    };
+    let config = Arc::new(openraft::Config::default().validate()?);
+    let raft = Raft::new(id, config, factory, log, store.clone()).await?;
+    let app = raft_router(raft.clone(), secret);
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    if fresh && bootstrap {
+        let mut members = BTreeMap::new();
+        members.insert(id, BasicNode::new(address.to_string()));
+        for (peer_id, peer_addr) in peers {
+            if peer_id != id {
+                members.insert(peer_id, BasicNode::new(peer_addr));
+            }
+        }
+        raft.initialize(members).await?;
+    }
+    Ok(HttpRaftNode {
+        raft,
+        store,
+        server,
+        address,
+    })
+}
+
 pub struct HttpCluster {
     pub rafts: Arc<RwLock<HashMap<u64, Raft<TypeConfig, StateMachineStore>>>>,
     pub stores: Vec<StateMachineStore>,
@@ -1136,6 +1194,80 @@ mod tests {
         }
         for server in cluster.servers {
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn three_independent_http_raft_nodes_form_cluster() {
+        let mut addrs = Vec::new();
+        for _ in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            drop(listener);
+        }
+        let peers: Vec<(u64, String)> = addrs
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| (i as u64 + 1, addr.to_string()))
+            .collect();
+        let mut nodes = Vec::new();
+        for (i, addr) in addrs.iter().enumerate() {
+            let node = start_http_node(
+                ControllerModel::new(NetworkId::new(), 1),
+                i as u64 + 1,
+                *addr,
+                peers.clone(),
+                None,
+                Some("secret".into()),
+                i == 0,
+            )
+            .await
+            .unwrap();
+            nodes.push(node);
+        }
+        let target = NodeId::new([9u8; 32]);
+        let lsa = stellaris_linkstate::Lsa {
+            origin: target,
+            seq: 1,
+            zone: None,
+            links: vec![],
+            prefixes: vec![stellaris_linkstate::Prefix {
+                prefix: "192.168.100.0/24".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.9".parse().unwrap()),
+            addrs: vec![],
+        };
+        let mut leader = None;
+        for _ in 0..100 {
+            for (i, node) in nodes.iter().enumerate() {
+                if node.raft.current_leader().await == Some(i as u64 + 1) {
+                    leader = Some(node.raft.clone());
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        leader
+            .expect("leader")
+            .client_write(ControllerCommand::ApplyLsa { lsa })
+            .await
+            .unwrap();
+        for node in &nodes {
+            for _ in 0..50 {
+                if node.store.model().await.lsas.contains_key(&target) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(node.store.model().await.lsas.contains_key(&target));
+        }
+        for node in nodes {
+            let _ = node.raft.shutdown().await;
+            node.server.abort();
         }
     }
 

@@ -72,6 +72,12 @@ fn default_role() -> String {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RaftPeerConfig {
+    pub id: u64,
+    pub addr: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlConfig {
     /// Controller base URL for members (MVP: HTTP).
     #[serde(default)]
@@ -94,9 +100,24 @@ pub struct ControlConfig {
     /// Previous shared secrets accepted during rotation.
     #[serde(default)]
     pub previous_secrets: Vec<String>,
-    /// Enable the single-node Raft controller and persist here.
+    /// Enable the Raft controller and persist here.
     #[serde(default)]
     pub raft_dir: Option<String>,
+    /// Raft node id (defaults to 1).
+    #[serde(default)]
+    pub raft_id: Option<u64>,
+    /// Internal Raft HTTP bind address.
+    #[serde(default)]
+    pub raft_bind: Option<String>,
+    /// Other controller Raft nodes: id + HTTP address.
+    #[serde(default)]
+    pub raft_peers: Vec<RaftPeerConfig>,
+    /// Shared secret for internal Raft RPC authentication.
+    #[serde(default)]
+    pub raft_secret: Option<String>,
+    /// Initialize a pristine cluster with the configured peers.
+    #[serde(default)]
+    pub raft_bootstrap: bool,
     /// Membership manifest lifetime in seconds.
     #[serde(default = "default_manifest_ttl")]
     pub manifest_ttl_secs: u64,
@@ -155,6 +176,11 @@ impl Default for ControlConfig {
             leader_id: None,
             previous_secrets: Vec::new(),
             raft_dir: None,
+            raft_id: None,
+            raft_bind: None,
+            raft_peers: Vec::new(),
+            raft_secret: None,
+            raft_bootstrap: false,
             manifest_ttl_secs: default_manifest_ttl(),
             controller_keys: Vec::new(),
             controller_threshold: 1,
