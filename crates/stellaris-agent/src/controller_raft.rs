@@ -1068,29 +1068,41 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         let checksum = hex::encode(Sha256::digest(&data));
         let response =
             if data.len() > 4 * 1024 * 1024 {
-                let mut begin = self
-                    .client
-                    .post(format!("{}/raft/snapshot/begin", self.base))
-                    .json(&serde_json::json!({
-                        "vote": vote,
-                        "meta": snapshot.meta,
-                        "total": data.len(),
-                        "checksum": checksum,
-                    }));
-                if let Some(secret) = &self.secret {
-                    begin = begin.header(RAFT_SECRET_HEADER, secret.as_str());
+                let mut begin_response = None;
+                let mut begin_error = None;
+                for attempt in 0..3 {
+                    let mut request = self
+                        .client
+                        .post(format!("{}/raft/snapshot/begin", self.base))
+                        .json(&serde_json::json!({
+                            "vote": vote,
+                            "meta": snapshot.meta,
+                            "total": data.len(),
+                            "checksum": checksum,
+                        }));
+                    if let Some(secret) = &self.secret {
+                        request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+                    }
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => {
+                            begin_response = Some(response);
+                            break;
+                        }
+                        Ok(response) => {
+                            begin_error = Some(format!("begin status {}", response.status()));
+                        }
+                        Err(e) => begin_error = Some(e.to_string()),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
                 }
-                let begin = begin.send().await.map_err(|e| {
-                    openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
+                let begin = begin_response.ok_or_else(|| {
+                    openraft::error::StreamingError::Unreachable(Unreachable::new(
+                        &io::Error::other(format!(
+                            "raft snapshot begin failed: {}",
+                            begin_error.unwrap_or_default()
+                        )),
+                    ))
                 })?;
-                if !begin.status().is_success() {
-                    return Err(openraft::error::StreamingError::Unreachable(
-                        Unreachable::new(&io::Error::other(format!(
-                            "raft snapshot begin status {}",
-                            begin.status()
-                        ))),
-                    ));
-                }
                 let body: serde_json::Value = begin.json().await.map_err(|e| {
                     openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
                 })?;
