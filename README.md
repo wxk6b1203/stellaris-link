@@ -326,6 +326,16 @@ stellaris-agent --config net-a.toml --config net-b.toml
 
 ### 21.5 3 controller Raft E2E
 
+真实 LAN（Docker macvlan）：
+
+```bash
+PARENT=enp1s0 SUBNET=10.0.10.0/23 GATEWAY=10.0.10.1 \
+IP1=10.0.10.240 IP2=10.0.10.242 IP3=10.0.10.244 IP_CLIENT=10.0.10.245 \
+BIN=./target/release/stellaris-controller \
+./scripts/test-docker-controller-raft-macvlan.sh
+# OK: 3 macvlan controller raft join/LSA/snapshot/failover works.
+```
+
 ```bash
 cargo build -p stellaris-agent --bin stellaris-controller
 ./scripts/test-controller-raft-3node.sh
