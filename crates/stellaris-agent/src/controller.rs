@@ -22,7 +22,7 @@ use ipnet::IpNet;
 use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, endpoint::presets};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use stellaris_linkstate::{LinkStateDb, Lsa};
 use stellaris_types::{
     Config, ControllerMemberConfig, JoinTokenConfig, NetworkId, NodeId, RouteEntry, RouteId,
@@ -341,6 +341,34 @@ impl ControllerState {
 
     pub fn model(&self) -> ControllerModel {
         self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn join_config_hash(&self) -> String {
+        let tokens = self.join_tokens.read().unwrap_or_else(|e| e.into_inner());
+        let mut entries: Vec<String> = tokens
+            .values()
+            .map(|token| {
+                format!(
+                    "{}|{}|{}|{:?}",
+                    token.token,
+                    token
+                        .prefixes
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    token.capabilities.join(","),
+                    token.expires_at
+                )
+            })
+            .collect();
+        entries.sort();
+        let mut hasher = Sha256::new();
+        for entry in entries {
+            hasher.update(entry.as_bytes());
+            hasher.update(b"\n");
+        }
+        hex::encode(hasher.finalize())
     }
 
     pub async fn model_current(&self) -> ControllerModel {
@@ -1161,6 +1189,7 @@ async fn status(State(state): State<ControllerState>, headers: HeaderMap) -> Res
         "routes": state.routes.read().unwrap_or_else(|e| e.into_inner()).len(),
         "acks": state.acks.read().unwrap_or_else(|e| e.into_inner()).len(),
         "leader": state.leader_hint().await,
+        "join_config_hash": state.join_config_hash(),
     }))
     .into_response()
 }

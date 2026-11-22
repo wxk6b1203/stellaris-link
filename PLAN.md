@@ -38,7 +38,7 @@
 - [x] API/controller HTTPS + member CA 校验，TLS 集成测试通过。
 - [x] API 读/写 token 分权（`api.read_token`）。
 - [x] API token / controller secret 轮换窗口（previous_*）。
-- [x] controller 手动 leader fence：非 leader 拒绝 LSA/join/revoke 写入。
+- [x] controller 手动 leader fence：非 leader 拒绝 LSA/join/revoke 写入；`join_config_hash` 可观测。
 - [x] openraft H0 确定性 ControllerModel/Command，作为 controller shadow 接入（`/v1/model` + durable command log）。
 - [x] openraft H1 单节点原型：storage/state machine/single voter；支持 raft-log/raft-state 落盘重启恢复。
 - [x] openraft H2 3 节点：进程内 leader 复制/failover + HTTP Raft RPC（共享 secret/snapshot）+ 落盘重启恢复。
