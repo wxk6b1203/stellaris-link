@@ -249,7 +249,19 @@ BIN=./target/release/stellaris-agent ./scripts/test-docker-mdns.sh
 
 两个 Docker bridge 容器完成 mDNS 发现、iroh 连接、PSK 认证。
 
-### 15. 真实局域网 mDNS 验证
+### 15. macvlan 真实局域网 mDNS
+
+```bash
+PARENT=enp1s0 SUBNET=10.0.10.0/23 GATEWAY=10.0.10.1 \
+IP_A=10.0.10.240 IP_B=10.0.10.242 \
+BIN=./target/release/stellaris-agent \
+./scripts/test-docker-mdns-macvlan.sh
+# OK: macvlan mDNS discovery + PSK works on real LAN.
+```
+
+用两个 macvlan 容器接入物理 LAN，完整验证 mDNS 发现、iroh 连接和 PSK。
+
+### 16. 真实局域网 mDNS 验证
 
 见 [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md)。已在 macOS + bee 同一 /24 上验证：
 - bee agent 发现 macOS mDNS 服务
@@ -257,7 +269,7 @@ BIN=./target/release/stellaris-agent ./scripts/test-docker-mdns.sh
 
 完整双向 agent 连接受 macOS firewall/local-network 权限影响，未宣称通过。
 
-### 16. UDP bootstrap discovery（Linux netns）
+### 17. UDP bootstrap discovery（Linux netns）
 
 ```toml
 [transport]
@@ -272,7 +284,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 发现只产生候选 peer，仍必须通过 PSK/controller 认证。
 
-### 17. Controller + 3 members（本机）
+### 18. Controller + 3 members（本机）
 
 ```bash
 ./scripts/demo-controller-3node.sh
@@ -280,7 +292,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 一个 controller + 三个 member，验证 controller ACK、snapshot 成员、LSA 路由学习。
 
-### 18. Controller + 3 TUN 节点（Linux netns）
+### 19. Controller + 3 TUN 节点（Linux netns）
 
 ```bash
 sudo BIN=./target/release/stellaris-agent \
@@ -312,7 +324,7 @@ stellaris-agent --config net-a.toml --config net-b.toml
 # OK: different network IDs reject the same PSK.
 ```
 
-### 21. API / controller TLS
+### 22. API / controller TLS
 
 ```bash
 ./scripts/test-tls.sh
@@ -336,14 +348,14 @@ tls_ca = "/path/ca.pem"
 
 TLS 只保护 HTTP 控制面；认证仍走 API token / `control.secret`。证书需使用 CA 签发的 server cert，不要把 CA 证书直接当 leaf 使用。
 
-### 22. 多 controller threshold
+### 23. 多 controller threshold
 
 ```bash
 ./scripts/demo-controller-threshold.sh
 # OK: member applied a 2-controller threshold snapshot.
 ```
 
-### 23. 真正的 TUN overlay（两台机器，需要 root）
+### 24. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 

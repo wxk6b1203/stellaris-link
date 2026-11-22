@@ -65,7 +65,7 @@
 | **P1** | ACL/QoS 生产化 | 中高 | 无法定位丢包；队列满静默丢；无 SLA | M | 现有 policy | **完成：queue_depth/counters/byte shaping/审计/每规则命中** |
 | **P1** | RoutePolicy/AZ 高级策略 | 中 | `RoutePolicy` 已执行；无故障域自动 failover | M | 状态机/策略引擎 | **完成：policy engine + AZ region + failover 测试** |
 | **P2** | openraft HA | 高（长期） | 单 controller/ fanout 无 split-brain 保护 | XL | P0 安全 + 确定性状态机 | 设计完成，未实现 |
-| **P2** | mDNS | 中 | 部署便利性 | M | P1 | **完成：`_stellaris._udp.local.`** |
+| **P2** | mDNS | 中 | 部署便利性 | M | P1 | **完成：Docker bridge + macvlan 物理 LAN 验证** |
 | **P2** | 共享 endpoint 多网络 / tracing | 中 | 可观测性和部署增强 | L | P1 | 后续增强 |
 | **P2** | metrics/audit/tracing | 中高 | 线上不可观测、不可审计 | M | 无 | **metrics + ACL audit 已做；tracing 待做** |
 | **P2** | 打包/service/upgrade | 中 | 部署体验差 | M | — | 后期 |

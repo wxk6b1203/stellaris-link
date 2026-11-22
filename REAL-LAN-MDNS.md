@@ -105,6 +105,20 @@ OK: container mDNS discovery + PSK works.
 完整 agent 双向连接受 macOS firewall/local-network 权限阻塞，未在物理 LAN 上验证通过；
 但 Docker bridge 容器已完整通过。
 
+补充：使用 Docker **macvlan** 把两个容器直接接到 bee 的物理 LAN（10.0.10.240 / .242）：
+
+```bash
+PARENT=enp1s0 SUBNET=10.0.10.0/23 GATEWAY=10.0.10.1 IP_A=10.0.10.240 IP_B=10.0.10.242 BIN=./target/release/stellaris-agent ./scripts/test-docker-mdns-macvlan.sh
+```
+
+结果：
+
+```text
+OK: macvlan mDNS discovery + PSK works on real LAN.
+```
+
+这完成了物理 LAN 上的 mDNS 发现 + iroh 连接 + PSK 认证，不需要第二台 Linux 主机。
+
 ## 下一步
 
 1. 在 macOS 上允许 `stellaris-agent` 的本地网络/入站连接
