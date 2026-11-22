@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stellaris Linking</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b1020; --panel:#141b30; --line:#26304d; --text:#e8ecf8; --muted:#8d9ab8; --accent:#6ea8fe; --danger:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; gap:16px; align-items:center; padding:16px 24px; border-bottom:1px solid var(--line); background:#0e1528; position:sticky; top:0; }
+  h1 { font-size:18px; margin:0; letter-spacing:.02em; }
+  h2 { font-size:14px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 8px; }
+  main { padding:20px 24px; display:grid; gap:20px; grid-template-columns: 1fr 1.4fr; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; overflow:auto; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  tr:last-child td { border-bottom:0; }
+  code { color:#b9d4ff; font-size:12px; }
+  button { background:#1d2a49; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); }
+  button.danger { color:var(--danger); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .muted { color:var(--muted); }
+  .pill { border:1px solid var(--line); border-radius:999px; padding:2px 8px; font-size:12px; color:var(--muted); }
+  .ok { color:#5ee0a0; } .bad { color:var(--danger); }
+  #notice, #policy-notice { color:var(--danger); white-space:pre-wrap; }
+  textarea { width:100%; min-height:220px; background:#0e1528; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px; font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  section.policy { grid-column:1 / -1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Stellaris Linking</h1>
+  <span id="node" class="muted">loading…</span>
+  <span id="net" class="pill"></span>
+  <span id="gen" class="pill"></span>
+  <span style="flex:1"></span>
+  <button onclick="setToken()">API token</button>
+  <button onclick="refresh()">Refresh</button>
+</header>
+<main>
+  <section>
+    <h2>Peers <span id="peer-count" class="muted"></span></h2>
+    <table><thead><tr><th>Name</th><th>Overlay IP</th><th>State</th><th>Path</th><th>RTT</th></tr></thead><tbody id="peers"></tbody></table>
+  </section>
+  <section>
+    <h2>Routes</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button onclick="showView('intent')">Intent</button>
+      <button onclick="showView('rib')">RIB</button>
+      <button onclick="showView('fib')">FIB</button>
+      <span style="flex:1"></span>
+      <button onclick="addRoute()">Add route</button>
+      <button onclick="explain()">Explain</button>
+    </div>
+    <div id="notice"></div>
+    <table><thead id="route-head"></thead><tbody id="routes"></tbody></table>
+  </section>
+  <section class="policy">
+    <h2>ACL / QoS policy</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button onclick="loadPolicy()">Reload</button>
+      <button onclick="savePolicy()">Save policy</button>
+      <span class="muted">JSON; persisted to state_dir/policy.json</span>
+    </div>
+    <div id="policy-notice"></div>
+    <textarea id="policy-json" spellcheck="false" placeholder='{"acl":{"default_action":"allow","rules":[]},"qos":{"enabled":false,"classes":[]}}'></textarea>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const token = () => sessionStorage.getItem("stellaris-token") || "";
+const headers = () => token() ? { "Authorization": `Bearer ${token()}` } : {};
+
+function setToken() {
+  const v = prompt("API bearer token (empty to clear)", token());
+  if (v === null) return;
+  if (v.trim()) sessionStorage.setItem("stellaris-token", v.trim());
+  else sessionStorage.removeItem("stellaris-token");
+  refresh();
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { ...headers(), "Content-Type": "application/json" } });
+  const text = await r.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!r.ok) throw new Error(`${r.status}: ${data?.message || text}`);
+  return data;
+}
+
+function cell(row, value, code = false) {
+  const td = document.createElement("td");
+  if (code) { const c = document.createElement("code"); c.textContent = value ?? ""; td.appendChild(c); }
+  else td.textContent = value ?? "";
+  row.appendChild(td);
+}
+
+function button(td, label, fn, danger = false) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  if (danger) b.className = "danger";
+  b.onclick = fn;
+  td.appendChild(b);
+}
+
+async function refresh() {
+  try {
+    const [s, peers] = await Promise.all([api("/v1/status"), api("/v1/peers")]);
+    $("node").textContent = `${s.node_name} · ${s.node_id.slice(0, 12)}… · ${s.role}/${s.control_mode}`;
+    $("net").textContent = s.network_name;
+    $("gen").textContent = `gen ${s.generation}`;
+    $("peer-count").textContent = `(${s.peers.connected}/${s.peers.total} connected)`;
+    const tb = $("peers"); tb.replaceChildren();
+    for (const p of peers) {
+      const tr = document.createElement("tr");
+      cell(tr, p.name); cell(tr, p.overlay_ip, true);
+      const st = document.createElement("td"); st.textContent = p.connected ? "connected" : "down"; st.className = p.connected ? "ok" : "bad"; tr.appendChild(st);
+      cell(tr, p.path || "—"); cell(tr, p.rtt_ms == null ? "—" : `${p.rtt_ms} ms`);
+      tb.appendChild(tr);
+    }
+    await Promise.all([loadRoutes(), loadPolicy()]);
+  } catch (e) {
+    $("notice").textContent = e.message;
+  }
+}
+
+async function loadPolicy() {
+  try {
+    const p = await api("/v1/policy");
+    $("policy-json").value = JSON.stringify(p, null, 2);
+  } catch (e) {
+    $("policy-notice").textContent = e.message;
+  }
+}
+
+async function savePolicy() {
+  try {
+    const p = JSON.parse($("policy-json").value);
+    await api("/v1/policy", { method: "PUT", body: JSON.stringify(p) });
+    $("policy-notice").textContent = "saved";
+    await loadPolicy();
+  } catch (e) {
+    $("policy-notice").textContent = e.message;
+  }
+}
+
+let view = "rib";
+function showView(v) { view = v; loadRoutes(); }
+
+async function loadRoutes() {
+  const data = await api(`/v1/routes?view=${view}`);
+  const head = $("route-head"); head.replaceChildren();
+  const hr = document.createElement("tr");
+  const cols = view === "fib" ? ["Prefix", "Next hops", "Source", ""] : ["Prefix", "Next hop", "AD", "Metric", "Source", ""];
+  for (const c of cols) { const th = document.createElement("th"); th.textContent = c; hr.appendChild(th); }
+  head.appendChild(hr);
+  const tb = $("routes"); tb.replaceChildren();
+  for (const r of data.routes) {
+    const tr = document.createElement("tr");
+    if (view === "fib") {
+      cell(tr, r.prefix, true);
+      cell(tr, r.next_hops.map(h => `${h.node.slice(0,12)}…`).join(", "), true);
+      cell(tr, r.source);
+      const td = document.createElement("td");
+      button(td, "Explain", () => explainPrefix(r.prefix));
+      tr.appendChild(td);
+    } else {
+      cell(tr, r.prefix, true);
+      cell(tr, r.next_hop.slice(0,12) + "…", true);
+      cell(tr, r.admin_distance); cell(tr, r.metric); cell(tr, r.source);
+      const td = document.createElement("td");
+      button(td, "Pin", () => pin(r.prefix, r.next_hop));
+      button(td, "Delete", () => del(r.id), true);
+      tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  }
+}
+
+async function addRoute() {
+  const prefix = prompt("Prefix (e.g. 10.7.0.2/32)");
+  if (!prefix) return;
+  const via = prompt("Next hop node id (hex)");
+  if (!via) return;
+  const metric = Number(prompt("Metric", "10") || "10");
+  try {
+    const out = await api("/v1/routes", { method: "POST", body: JSON.stringify({
+      change: { kind: "upsert_static", prefix, via, admin_distance: null, local_pref: null, metric, weight: null, pin: false, expires_at: null,
+                attrs: { rtt_ms: null, loss_ppm: null, bandwidth_kbps: null, energy_cost: null, region: null, tags: [] } },
+      scope: "local", dry_run: false, reason: "ui"
+    })});
+    $("notice").textContent = `applied generation ${out.generation}`;
+    refresh();
+  } catch (e) { $("notice").textContent = e.message; }
+}
+
+async function pin(prefix, via) {
+  try {
+    await api("/v1/routes/pin", { method: "POST", body: JSON.stringify({ prefix, next_hop: via, ttl_secs: null, dry_run: false }) });
+    refresh();
+  } catch (e) { $("notice").textContent = e.message; }
+}
+
+async function del(id) {
+  if (!confirm("Delete this intent?")) return;
+  try { await api(`/v1/routes/${id}`, { method: "DELETE" }); refresh(); }
+  catch (e) { $("notice").textContent = e.message; }
+}
+
+async function explainPrefix(prefix) {
+  // explain takes a destination; use the network address as a best-effort destination
+  explainDst(prefix.split("/")[0]);
+}
+
+async function explain() {
+  const dst = prompt("Destination IP");
+  if (dst) explainDst(dst);
+}
+
+async function explainDst(dst) {
+  try {
+    const e = await api(`/v1/routes/explain?dst=${encodeURIComponent(dst)}`);
+    const sel = e.selected;
+    $("notice").textContent = sel
+      ? `${dst} → ${sel.next_hop.slice(0,12)}… via ${sel.source}, AD ${sel.admin_distance}, metric ${sel.metric}, ${e.candidates.length} candidate(s)`
+      : `${dst}: no route`;
+  } catch (e) { $("notice").textContent = e.message; }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

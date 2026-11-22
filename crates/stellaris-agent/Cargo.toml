@@ -1,0 +1,50 @@
+[package]
+name = "stellaris-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "stellaris_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stellaris-agent"
+path = "src/bin/stellaris-agent.rs"
+
+[[bin]]
+name = "stellaris-controller"
+path = "src/bin/stellaris-controller.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+ed25519-dalek = "2"
+hex.workspace = true
+hmac.workspace = true
+ipnet.workspace = true
+iroh.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+stellaris-fib = { path = "../stellaris-fib" }
+stellaris-linkstate = { path = "../stellaris-linkstate" }
+stellaris-routing = { path = "../stellaris-routing" }
+stellaris-types = { path = "../stellaris-types" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tun-rs.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
