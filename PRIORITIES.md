@@ -8,18 +8,12 @@
 
 ## 0. 结论
 
-**不建议现在直接开始 openraft HA。**
+**Controller HA 与 P1 数据面生产化基线已完成。**
 
-当前更优先的是：
-
-1. **P0：身份/成员认证与控制面授权**——否则 Raft 只会“高可用地复制未授权写入”。
-2. **P0：真实 3 节点/多主机验证**——bee x86_64 已经能跑；先把数据面、LSA、controller 在真实主机上打穿。
-3. **P1：bootstrap/discovery**——去掉 controller URL/静态 seed 的硬依赖。
-4. **P1：多网络隔离**——这是产品能力，不只是实现细节。
-5. **P1：ACL/QoS 生产化 + 指标**——当前队列深度硬编码、缺少 counters。
-6. **P2：openraft HA**——设计已写，但在安全与真实集群验证之后。
-
-如果业务把“controller 多副本”作为硬性上云门槛，可以提前 openraft，但必须先做 P0 安全，否则没有意义。
+- controller 已迁移到 openraft：3 节点、HTTP Raft、mTLS、snapshot、leader failover、partition recovery、crash recovery、join config 一致性。
+- 真实 LAN 使用 macvlan 3 controller + mTLS 验证。
+- 数据面已覆盖 IPv4/IPv6、NAT44/66、public exit、MSS/MTU、ICMP PTB、fragment ACL、relay failover、per-class queue。
+- 剩余为可选硬化：真实物理三主机、完整 PMTUD 状态机、分片重组、强制 roaming/multipath、磁盘满故障。
 
 ---
 
@@ -42,7 +36,7 @@
 | L3 overlay / TUN | 可用 | IPv4 only；macOS 未回归；无 IPv6 分片 |
 | iroh 传输 | 可用 | 默认公共 relay；无应用层成员认证 |
 | link-state/SPF | 可用 | UDP/mDNS discovery、static seed、controller；无跨区拓扑优化 |
-| controller | 可用 | HTTP/iroh/fanout；无 Raft quorum |
+| controller | 可用 | openraft 3 节点 + HTTP/mTLS + snapshot + failover |
 | ACL | 可用 | 配置/API/UI；无 counters/日志审计 |
 | QoS | 可用 | DSCP + token bucket + 优先级队列；无整形/队列配置 |
 | AZ | 可用 | 同 zone pref + cross-zone penalty；无 policy engine/故障域 |
@@ -64,7 +58,7 @@
 | **P1** | 多网络/多租户隔离 | 高 | 无法一个 agent 接入多个 overlay；产品能力缺失 | L | NetworkId/FIB/TUN | **完成：进程级隔离 + 单进程多 runtime + 凭证隔离测试** |
 | **P1** | ACL/QoS 生产化 | 中高 | 无法定位丢包；队列满静默丢；无 SLA | M | 现有 policy | **完成：queue_depth/counters/byte shaping/审计/每规则命中** |
 | **P1** | RoutePolicy/AZ 高级策略 | 中 | `RoutePolicy` 已执行；无故障域自动 failover | M | 状态机/策略引擎 | **完成：policy engine + AZ region + failover 测试** |
-| **P2** | openraft HA | 高（长期） | 单 controller/ fanout 无 split-brain 保护 | XL | P0 安全 + 确定性状态机 | 设计完成，未实现 |
+| **P2** | openraft HA | 高（长期） | 单 controller/ fanout 无 split-brain 保护 | XL | P0 安全 + 确定性状态机 | **完成：3 节点/mTLS/failover/partition/crash** |
 | **P2** | mDNS | 中 | 部署便利性 | M | P1 | **完成：Docker bridge + macvlan 物理 LAN 验证** |
 | **P2** | 共享 endpoint 多网络 / tracing | 中 | 可观测性和部署增强 | L | P1 | 后续增强 |
 | **P2** | metrics/audit/tracing | 中高 | 线上不可观测、不可审计 | M | 无 | **metrics + ACL audit 已做；tracing 待做** |
