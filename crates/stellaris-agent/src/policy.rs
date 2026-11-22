@@ -49,6 +49,12 @@ impl PolicyFile {
             if class.burst == Some(0) {
                 return Err(format!("qos class {} burst must be > 0", class.name));
             }
+            if class.rate_bps == Some(0) {
+                return Err(format!("qos class {} rate_bps must be > 0", class.name));
+            }
+            if class.burst_bytes == Some(0) {
+                return Err(format!("qos class {} burst_bytes must be > 0", class.name));
+            }
         }
         Ok(())
     }
@@ -66,6 +72,7 @@ pub struct Policy {
     acl_order: Vec<usize>,
     qos_order: Vec<usize>,
     buckets: Vec<Mutex<Bucket>>,
+    byte_buckets: Vec<Mutex<Bucket>>,
 }
 
 impl Policy {
@@ -102,11 +109,26 @@ impl Policy {
                 })
             })
             .collect();
+        let byte_buckets = file
+            .qos
+            .classes
+            .iter()
+            .map(|class| {
+                Mutex::new(Bucket {
+                    tokens: class
+                        .burst_bytes
+                        .unwrap_or_else(|| class.rate_bps.unwrap_or(1))
+                        .max(1) as f64,
+                    last: Instant::now(),
+                })
+            })
+            .collect();
         Self {
             file,
             acl_order,
             qos_order,
             buckets,
+            byte_buckets,
         }
     }
 
@@ -191,6 +213,21 @@ impl Policy {
             }
             bucket.tokens -= 1.0;
         }
+        if let Some(rate) = class.rate_bps {
+            let bytes = packet.len() as f64;
+            let burst = class.burst_bytes.unwrap_or(rate).max(1) as f64;
+            let mut bucket = self.byte_buckets[idx]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let elapsed = now.duration_since(bucket.last).as_secs_f64();
+            bucket.tokens = (bucket.tokens + elapsed * rate as f64).min(burst);
+            bucket.last = now;
+            if bucket.tokens < bytes {
+                return QosVerdict::RateLimited;
+            }
+            bucket.tokens -= bytes;
+        }
         if crate::wire::set_dscp(packet, class.dscp) {
             QosVerdict::Marked(class.dscp)
         } else {
@@ -221,6 +258,35 @@ mod tests {
         p[20..22].copy_from_slice(&1234u16.to_be_bytes());
         p[22..24].copy_from_slice(&443u16.to_be_bytes());
         p
+    }
+
+    #[test]
+    fn qos_byte_shaper_limits_bytes() {
+        let len = https_packet().len();
+        let cfg: QosConfig = toml::from_str(&format!(
+            r#"
+enabled = true
+[[classes]]
+name = "https"
+dscp = 46
+rate_bps = 1
+burst_bytes = {}
+dst_port = 443
+"#,
+            len * 2
+        ))
+        .unwrap();
+        let policy = Policy::from_config(AclConfig::default(), cfg);
+        let info = PacketInfo::parse(&https_packet()).unwrap();
+        for _ in 0..2 {
+            let mut packet = https_packet();
+            assert_eq!(policy.apply_qos(&mut packet, &info), QosVerdict::Marked(46));
+        }
+        let mut packet = https_packet();
+        assert_eq!(
+            policy.apply_qos(&mut packet, &info),
+            QosVerdict::RateLimited
+        );
     }
 
     #[test]

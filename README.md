@@ -11,7 +11,7 @@
 - **HTTP API**：`/v1/status`、`/v1/peers`、`/v1/routes`、`/v1/routes/lookup`、`/v1/routes/explain`、`/v1/routes/pin`、`/v1/routes/drain`、`/v1/routes/reset`、`/v1/routes/{id}`。
 - **controller**：`stellaris-controller` 下发 network-scope 静态路由与 link-state 计算路由；snapshot 带 epoch、member manifest（含 underlay addrs）、HMAC-SHA256 签名；member 校验后应用、自动发现/连接成员、回 ACK（ACK 持久化）；支持 **HTTP**、**iroh control protocol**，以及多 controller **active-active fanout（pre-Raft）**。
 - **Link-state 自动路由**：两种模式：① member 通过 iroh control stream 直接洪泛 LSA，节点本地 SPF；② controller 汇聚 LSA 并按节点计算。LSA 带 underlay `addrs`，节点会自动发现并连接新 peer；link metric 使用当前 RTT（每 5s 刷新 LSA）+ 跨 AZ penalty；LSA 30s 过期；等代价路径生成 ECMP；Ping/Pong heartbeat（2s/7s）自动撤回故障链路。
-- **ACL/QoS**：ACL allow/deny（方向、五元组、peer、zone、优先级）；QoS 按类设置 DSCP + token-bucket rate/burst + egress 优先级队列（`qos.queue_depth` 可配，默认 4096）；`/v1/status` 暴露 ACL/QoS/转发 counters；`/metrics` 提供 Prometheus counters/gauges；ACL 拒绝写 `stellaris_audit` 日志；可通过 `GET/PUT /v1/policy` 动态更新并持久化到 `state_dir/policy.json`；在 TUN 收发包路径执行。
+- **ACL/QoS**：ACL allow/deny（方向、五元组、peer、zone、优先级）；QoS 按类设置 DSCP + 包速率/字节速率 token-bucket（`rate_pps/rate_bps`）+ egress 优先级队列（`qos.queue_depth` 可配，默认 4096）；`/v1/status` 暴露 ACL/QoS/转发 counters；`/metrics` 提供 Prometheus counters/gauges；ACL 拒绝写 `stellaris_audit` 日志；可通过 `GET/PUT /v1/policy` 动态更新并持久化到 `state_dir/policy.json`；在 TUN 收发包路径执行。
 - **AZ 选路**：`zone` 标签 + 同 AZ `local_pref` 加成 + 跨 AZ link penalty（`routing.cross_zone_penalty`），`explain` 可见 zone。
 - **事件驱动 OS 路由**：RouteEngine 通过 `watch` 通知；非 overlay 前缀变更立即 reconcile，30s fallback。
 - **CLI**：`stellaris status`、`peer list`、`route list/lookup/explain/add/delete/pin/unpin/drain/reset`。

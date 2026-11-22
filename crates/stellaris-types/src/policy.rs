@@ -90,6 +90,12 @@ pub struct QosClass {
     /// Optional token-bucket burst size (defaults to rate_pps).
     #[serde(default)]
     pub burst: Option<u32>,
+    /// Optional byte-rate shaper (bytes per second).
+    #[serde(default)]
+    pub rate_bps: Option<u32>,
+    /// Optional byte burst (defaults to rate_bps).
+    #[serde(default)]
+    pub burst_bytes: Option<u32>,
 }
 
 impl AclRule {
