@@ -60,22 +60,45 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn authorize(state: &AgentState, headers: &HeaderMap) -> Result<(), ApiError> {
+fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
+    let value = headers
+        .get(AUTHORIZATION)
+        .ok_or_else(ApiError::unauthorized)?;
+    let value = value.to_str().map_err(|_| ApiError::unauthorized())?;
+    value
+        .strip_prefix("Bearer ")
+        .ok_or_else(ApiError::unauthorized)
+}
+
+fn authorize_write(state: &AgentState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(expected) = state.config.api.token.as_deref() else {
         return Ok(());
     };
-    let Some(value) = headers.get(AUTHORIZATION) else {
-        return Err(ApiError::unauthorized());
-    };
-    let value = value.to_str().map_err(|_| ApiError::unauthorized())?;
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return Err(ApiError::unauthorized());
-    };
-    if token == expected {
+    if bearer(headers)? == expected {
         Ok(())
     } else {
         Err(ApiError::unauthorized())
     }
+}
+
+fn authorize_read(state: &AgentState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = state.config.api.token.as_deref() else {
+        if let Some(read) = state.config.api.read_token.as_deref() {
+            return if bearer(headers)? == read {
+                Ok(())
+            } else {
+                Err(ApiError::unauthorized())
+            };
+        }
+        return Ok(());
+    };
+    if bearer(headers)? == expected {
+        return Ok(());
+    }
+    if state.config.api.read_token.as_deref() == Some(bearer(headers)?) {
+        return Ok(());
+    }
+    Err(ApiError::unauthorized())
 }
 
 pub fn router(state: AgentState) -> Router {
@@ -110,7 +133,7 @@ async fn get_policy(
     State(state): State<AgentState>,
     headers: HeaderMap,
 ) -> Result<Json<PolicyFile>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let file = state
         .policy
         .read()
@@ -124,7 +147,7 @@ async fn put_policy(
     headers: HeaderMap,
     Json(file): Json<PolicyFile>,
 ) -> Result<Json<PolicyFile>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_write(&state, &headers)?;
     file.validate().map_err(ApiError::bad_request)?;
     let policy = Policy::from_file(file.clone());
     let path = state.policy_path();
@@ -159,7 +182,7 @@ async fn status(
     State(state): State<AgentState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     Ok(Json(json!({
         "node_id": state.node_id.to_string(),
         "node_name": state.config.node.name,
@@ -195,7 +218,7 @@ async fn metrics(
     State(state): State<AgentState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let stats = &state.stats;
     let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
     let body = format!(
@@ -237,7 +260,7 @@ async fn peers(
     State(state): State<AgentState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<PeerState>>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     Ok(Json(state.peers.list()))
 }
 
@@ -252,7 +275,7 @@ async fn routes(
     headers: HeaderMap,
     Query(query): Query<RoutesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let view = match query.view.as_deref().unwrap_or("rib") {
         "intent" => RouteView::Intent,
         "rib" => RouteView::Rib,
@@ -291,7 +314,7 @@ async fn lookup(
     headers: HeaderMap,
     Query(query): Query<DstQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let dst = parse_dst(&query)?;
     let entry = state.routes.lookup(dst);
     Ok(Json(json!({
@@ -307,7 +330,7 @@ async fn explain(
     headers: HeaderMap,
     Query(query): Query<DstQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let dst = parse_dst(&query)?;
     Ok(Json(
         serde_json::to_value(state.routes.explain(dst))
@@ -331,7 +354,7 @@ async fn apply(
     headers: HeaderMap,
     Json(req): Json<ApplyRequest>,
 ) -> Result<Json<ApplyResult>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_write(&state, &headers)?;
     if req.scope == Scope::Network {
         return Err(ApiError::bad_request(
             "scope=network requires a controller; MVP supports local scope only",
@@ -352,7 +375,7 @@ async fn delete_route(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApplyResult>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_write(&state, &headers)?;
     let id: RouteId = id
         .parse()
         .map_err(|e| ApiError::bad_request(format!("invalid route id: {e}")))?;
@@ -378,7 +401,7 @@ async fn pin(
     headers: HeaderMap,
     Json(req): Json<PinRequest>,
 ) -> Result<Json<ApplyResult>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_write(&state, &headers)?;
     let prefix: IpNet = req
         .prefix
         .parse()
@@ -409,7 +432,7 @@ async fn unpin(
     headers: HeaderMap,
     Json(req): Json<PrefixRequest>,
 ) -> Result<Json<ApplyResult>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_write(&state, &headers)?;
     let prefix: IpNet = req
         .prefix
         .parse()
@@ -442,7 +465,7 @@ async fn drain(
     headers: HeaderMap,
     Json(req): Json<DrainRequest>,
 ) -> Result<Json<ApplyResult>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_write(&state, &headers)?;
     let node: NodeId = req
         .node
         .parse()
@@ -469,7 +492,7 @@ async fn reset(
     headers: HeaderMap,
     Json(req): Json<ResetRequest>,
 ) -> Result<Json<ApplyResult>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_write(&state, &headers)?;
     let prefix = match req.prefix {
         Some(p) => Some(
             p.parse()
@@ -528,6 +551,32 @@ bind = "127.0.0.1:0"
         AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
     }
 
+    fn state_with_tokens(admin: &str, read: &str) -> AgentState {
+        let dir = std::env::temp_dir().join(format!("stellaris-api-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[api]
+bind = "127.0.0.1:0"
+token = "{}"
+read_token = "{}"
+"#,
+            dir.display(),
+            admin,
+            read
+        );
+        AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
+    }
+
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -548,6 +597,56 @@ bind = "127.0.0.1:0"
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["network_name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn read_token_cannot_mutate() {
+        let app = router(state_with_tokens("admin", "read"));
+        let read_status = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status")
+                    .header("authorization", "Bearer read")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_status.status(), StatusCode::OK);
+
+        let body = serde_json::json!({
+            "acl": {"default_action": "allow", "rules": []},
+            "qos": {"enabled": false, "classes": []}
+        });
+        let read_write = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/v1/policy")
+                    .header("authorization", "Bearer read")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_write.status(), StatusCode::UNAUTHORIZED);
+
+        let admin_write = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/v1/policy")
+                    .header("authorization", "Bearer admin")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_write.status(), StatusCode::OK);
     }
 
     #[tokio::test]

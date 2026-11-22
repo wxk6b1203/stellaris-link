@@ -371,6 +371,9 @@ pub struct ApiConfig {
     pub bind: String,
     #[serde(default)]
     pub token: Option<String>,
+    /// Optional read-only bearer token (mutations still require `token`).
+    #[serde(default)]
+    pub read_token: Option<String>,
     /// HTTPS certificate PEM path (requires tls_key).
     #[serde(default)]
     pub tls_cert: Option<String>,
@@ -384,6 +387,7 @@ impl Default for ApiConfig {
         Self {
             bind: default_api_bind(),
             token: None,
+            read_token: None,
             tls_cert: None,
             tls_key: None,
         }
