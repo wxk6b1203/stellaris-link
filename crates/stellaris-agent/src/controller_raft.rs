@@ -3,7 +3,7 @@
 //! This is H1: storage and state machine are real, the Raft network is a
 //! placeholder that is unused by a single-voter cluster.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Cursor};
 use std::ops::RangeBounds;
@@ -501,10 +501,238 @@ async fn start_single_at(model: ControllerModel, dir: Option<&Path>) -> anyhow::
     Ok(SingleNode { raft, store })
 }
 
+pub struct InProcessFactory {
+    rafts: Arc<RwLock<HashMap<u64, Raft<TypeConfig, StateMachineStore>>>>,
+}
+
+pub struct InProcessNetwork {
+    target: u64,
+    rafts: Arc<RwLock<HashMap<u64, Raft<TypeConfig, StateMachineStore>>>>,
+}
+
+impl RaftNetworkFactory<TypeConfig> for InProcessFactory {
+    type Network = InProcessNetwork;
+
+    async fn new_client(&mut self, target: u64, _node: &BasicNode) -> Self::Network {
+        InProcessNetwork {
+            target,
+            rafts: self.rafts.clone(),
+        }
+    }
+}
+
+impl RaftNetworkV2<TypeConfig> for InProcessNetwork {
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    async fn append_entries(
+        &mut self,
+        rpc: openraft::raft::AppendEntriesRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::AppendResult<TypeConfig>, RPCError<TypeConfig>> {
+        let target = self.rafts.read().await.get(&self.target).cloned();
+        let Some(target) = target else {
+            return unreachable();
+        };
+        target
+            .append_entries(rpc)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: openraft::raft::VoteRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        let target = self.rafts.read().await.get(&self.target).cloned();
+        let Some(target) = target else {
+            return unreachable();
+        };
+        target
+            .vote(rpc)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        vote: VoteOf<TypeConfig>,
+        snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
+        _cancel: impl std::future::Future<Output = openraft::error::ReplicationClosed>
+        + OptionalSend
+        + 'static,
+        _option: RPCOption,
+    ) -> Result<
+        openraft::raft::SnapshotResponse<TypeConfig>,
+        openraft::error::StreamingError<TypeConfig>,
+    > {
+        let target = self.rafts.read().await.get(&self.target).cloned();
+        let Some(target) = target else {
+            return Err(openraft::error::StreamingError::Unreachable(
+                Unreachable::new(&io::Error::new(io::ErrorKind::NotFound, "target missing")),
+            ));
+        };
+        target
+            .install_full_snapshot(vote, snapshot)
+            .await
+            .map_err(|e| openraft::error::StreamingError::Unreachable(Unreachable::new(&e)))
+    }
+}
+
+pub async fn start_cluster(
+    models: Vec<ControllerModel>,
+) -> anyhow::Result<(
+    Arc<RwLock<HashMap<u64, Raft<TypeConfig, StateMachineStore>>>>,
+    Vec<StateMachineStore>,
+)> {
+    let rafts = Arc::new(RwLock::new(HashMap::new()));
+    let config = Arc::new(openraft::Config::default().validate()?);
+    let mut stores = Vec::new();
+    for (i, model) in models.into_iter().enumerate() {
+        let id = i as u64 + 1;
+        let log = Arc::new(LogStore::default());
+        let store = StateMachineStore::new(model, None);
+        let factory = InProcessFactory {
+            rafts: rafts.clone(),
+        };
+        let raft = Raft::new(id, config.clone(), factory, log, store.clone()).await?;
+        stores.push(store);
+        rafts.write().await.insert(id, raft);
+    }
+    let mut members = BTreeMap::new();
+    for id in 1..=stores.len() as u64 {
+        members.insert(id, BasicNode::new(format!("node-{id}")));
+    }
+    if let Some(first) = rafts.read().await.get(&1).cloned() {
+        first.initialize(members).await?;
+    }
+    Ok((rafts, stores))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use stellaris_types::{NetworkId, NodeId};
+
+    #[tokio::test]
+    async fn three_node_raft_commits_to_all_replicas() {
+        let models = (0..3)
+            .map(|_| ControllerModel::new(NetworkId::new(), 1))
+            .collect();
+        let (rafts, stores) = start_cluster(models).await.unwrap();
+        let node = NodeId::new([1u8; 32]);
+        let lsa = stellaris_linkstate::Lsa {
+            origin: node,
+            seq: 1,
+            zone: None,
+            links: vec![],
+            prefixes: vec![stellaris_linkstate::Prefix {
+                prefix: "192.168.95.0/24".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.1".parse().unwrap()),
+            addrs: vec![],
+        };
+        let mut leader = None;
+        for _ in 0..50 {
+            for (id, raft) in rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(raft.clone());
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let leader = leader.expect("leader elected");
+        leader
+            .client_write(ControllerCommand::ApplyLsa { lsa })
+            .await
+            .unwrap();
+        for store in &stores {
+            for _ in 0..50 {
+                if store.model().await.lsas.contains_key(&node) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(store.model().await.lsas.contains_key(&node));
+        }
+        for raft in rafts.read().await.values() {
+            raft.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn three_node_raft_survives_leader_failure() {
+        let models = (0..3)
+            .map(|_| ControllerModel::new(NetworkId::new(), 1))
+            .collect();
+        let (rafts, stores) = start_cluster(models).await.unwrap();
+        let mut leader_id = None;
+        for _ in 0..50 {
+            for (id, raft) in rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader_id = Some(*id);
+                    break;
+                }
+            }
+            if leader_id.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let leader_id = leader_id.expect("leader elected");
+        if let Some(leader) = rafts.read().await.get(&leader_id).cloned() {
+            leader.shutdown().await.unwrap();
+        }
+        let node = NodeId::new([2u8; 32]);
+        let lsa = stellaris_linkstate::Lsa {
+            origin: node,
+            seq: 1,
+            zone: None,
+            links: vec![],
+            prefixes: vec![stellaris_linkstate::Prefix {
+                prefix: "192.168.96.0/24".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.2".parse().unwrap()),
+            addrs: vec![],
+        };
+        let mut new_leader = None;
+        for _ in 0..100 {
+            for (id, raft) in rafts.read().await.iter() {
+                if *id != leader_id && raft.current_leader().await == Some(*id) {
+                    new_leader = Some(raft.clone());
+                    break;
+                }
+            }
+            if new_leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        new_leader
+            .expect("new leader")
+            .client_write(ControllerCommand::ApplyLsa { lsa })
+            .await
+            .unwrap();
+        let applied = stores
+            .iter()
+            .filter(|store| {
+                // The old leader may already be shut down; others must converge.
+                futures::executor::block_on(store.model())
+                    .lsas
+                    .contains_key(&node)
+            })
+            .count();
+        assert!(applied >= 2, "only {applied} replicas applied");
+        for raft in rafts.read().await.values() {
+            let _ = raft.shutdown().await;
+        }
+    }
 
     #[tokio::test]
     async fn single_node_raft_recovers_from_disk() {

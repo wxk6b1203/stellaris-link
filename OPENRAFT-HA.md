@@ -1,6 +1,6 @@
 # Openraft Controller HA — 详细设计（未实现）
 
-> 状态：H0 确定性模型 + H1 单节点 openraft 原型已实现；3 节点 Raft 尚未实现。
+> 状态：H0 确定性模型 + H1 单节点 + H2 进程内 3 节点 Raft/failover 原型已实现；真实网络/HTTP RPC 与 controller 接入尚未完成。
 > 当前实现：单 controller + 多 controller active-active fanout（pre-Raft）+ signed snapshot + epoch/manifest + 持久化 ACK。
 > 目标：把 controller 从“内存状态 + fanout”升级为 **openraft 复制的确定性状态机**，提供 quorum、leader election、快照、成员变更和故障恢复。
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)。
@@ -405,6 +405,34 @@ crates/stellaris-agent/src/controller_raft.rs
 - `RaftNetworkV2` 是 placeholder，只用于单节点
 - 尚未接入 HTTP controller
 - 尚未实现 3 controller bootstrap/membership
+
+### H2：进程内 3 节点 Raft（已实现）
+
+新增：
+
+```rust
+start_cluster(models)
+```
+
+- 3 个 `Raft` 实例
+- in-process `RaftNetworkV2`
+- 三 voter `initialize`
+- leader 选举
+- leader 写入并复制到所有副本
+- leader shutdown 后重新选主并继续写入
+
+测试：
+
+```text
+three_node_raft_commits_to_all_replicas
+three_node_raft_survives_leader_failure
+```
+
+限制：
+
+- Raft RPC 是进程内直接调用，不是 HTTP/iroh
+- 3 节点 log/state 仍是内存实现
+- 尚未接入 controller HTTP API
 
 ### H1 持久化验证
 
