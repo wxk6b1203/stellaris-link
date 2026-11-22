@@ -253,6 +253,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn member_grants_filter_lsa_prefixes() {
+        use stellaris_linkstate::{Link, Lsa, Prefix};
+        use stellaris_types::Config;
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-grant-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[[peers]]
+name = "b"
+endpoint_id = "{}"
+overlay_ip = "10.7.0.2"
+"#,
+            dir.display(),
+            hex::encode([2u8; 32])
+        );
+        let state = crate::AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        let b = NodeId::new([2u8; 32]);
+        state.grants.write().unwrap().insert(
+            b,
+            Grant {
+                overlay_ip: Some("10.7.0.2".parse().unwrap()),
+                prefixes: vec!["192.168.50.0/24".parse().unwrap()],
+                capabilities: vec!["member".into()],
+            },
+        );
+        let own = Lsa {
+            origin: b,
+            seq: 1,
+            zone: None,
+            links: vec![Link {
+                to: NodeId::new([1u8; 32]),
+                metric: 1,
+                zone: None,
+            }],
+            prefixes: vec![
+                Prefix {
+                    prefix: "10.7.0.2/32".parse().unwrap(),
+                    metric: 0,
+                },
+                Prefix {
+                    prefix: "192.168.50.0/24".parse().unwrap(),
+                    metric: 10,
+                },
+            ],
+            overlay_ip: Some("10.7.0.2".parse().unwrap()),
+            addrs: vec![],
+        };
+        assert!(lsa_authorized(&state, &own));
+        let bad = Lsa {
+            prefixes: vec![Prefix {
+                prefix: "0.0.0.0/0".parse().unwrap(),
+                metric: 0,
+            }],
+            ..own.clone()
+        };
+        assert!(!lsa_authorized(&state, &bad));
+        let unknown = Lsa {
+            origin: NodeId::new([3u8; 32]),
+            ..own
+        };
+        assert!(!lsa_authorized(&state, &unknown));
+    }
+
+    #[test]
     fn proofs_are_domain_separated() {
         let network = NetworkId::new();
         let node = NodeId::new([1u8; 32]);
