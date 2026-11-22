@@ -29,7 +29,7 @@
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
 - [ ] 完整 controller（openraft quorum/leader election）、mDNS/广播发现、ACL/QoS 复杂整形/队列配置、多网络、Windows、macOS NAT。
 
-下一阶段：完整 controller（manifest/epoch/openraft HA、iroh protocol）→ 分布式 LSA 洪泛 → ACL/QoS 队列/API → 多网络。
+下一阶段：安全/成员认证 → 真实 3 节点验证 → bootstrap/discovery → 多网络 → openraft HA（见 PRIORITIES.md / OPENRAFT-HA.md）。
 
 ---
 

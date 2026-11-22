@@ -2,7 +2,7 @@
 
 **A fully controllable, Rust-native L3 overlay network with optional control plane, per-node route query, and route adjustment.**
 
-> 状态：**MVP+ 已实现**（2026-11-22）。当前是 static-peer + signed controller（HTTP/iroh）+ 分布式 LSA/SPF；HA/动态邻居发现是下一步。
+> 状态：**MVP+ 已实现**（2026-11-22）。当前是 static-peer + signed controller（HTTP/iroh）+ 分布式 LSA/SPF；**下一步优先级见 [PRIORITIES.md](PRIORITIES.md)**，openraft HA 设计见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。
 
 ## MVP 已实现
@@ -21,7 +21,7 @@
 
 ## 未实现（下一步）
 
-- 完整 controller：openraft queorum/leader election（当前 HTTP/iroh + 多 controller fanout + HMAC + epoch/manifest + 持久化 ACK）。
+- 完整 controller：openraft quorum/leader election（当前 HTTP/iroh + 多 controller fanout + HMAC + epoch/manifest + 持久化 ACK）。
 - 初始 seed 仍来自静态 peer 配置；LSA 会自动发现/连接新 peer，但没有 mDNS/广播发现。
 - ACL/QoS 的真实队列/整形（当前有 API + token-bucket rate limit + DSCP + 优先级队列，队列深度 4096）。
 - 多网络、Windows、低功耗 gateway/leaf、macOS NAT。
@@ -278,6 +278,8 @@ examples/               # 示例 TOML
 | [PROTOCOL.md](PROTOCOL.md) | 控制协议/API/MeshHeader |
 | [PLAN.md](PLAN.md) | 里程碑、Epic、第一 sprint |
 | [ADVANCED-ROUTING.md](ADVANCED-ROUTING.md) | 静态路由、AZ 分段、subnet gateway 设计 |
+| [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
+| [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 详细设计（未实现） |
 | [examples/policy.toml](examples/policy.toml) | ACL/QoS 配置示例 |
 | [scripts/demo-linkstate.sh](scripts/demo-linkstate.sh) | controller-mediated link-state 演示 |
 | [scripts/demo-distributed-linkstate.sh](scripts/demo-distributed-linkstate.sh) | 分布式 LSA/SPF 演示 |
