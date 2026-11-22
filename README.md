@@ -215,7 +215,15 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-tun.sh
 
 在 Linux 上用两个 network namespace + veth 启动两个 agent 和各自的 TUN，做双向 ping 与 1000B 包测试。已在本机 x86_64 Linux 上实测通过。
 
-### 12. 真正的 TUN overlay（两台机器，需要 root）
+### 12. Linux 3 节点 TUN/LSA transit 回归（单机、需要 root）
+
+```bash
+sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-3node.sh
+```
+
+三个 network namespace + 两个 veth，a—b—c；验证 LSA 自动路由、b 的 transit 转发、双向 ping 和 1000B 包。已在 bee x86_64 实测通过。
+
+### 13. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 

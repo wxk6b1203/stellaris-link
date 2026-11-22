@@ -59,7 +59,7 @@
 |---|---|---|---|---|---|---|
 | **P0** | 身份/成员认证 + Hello | 高 | 任意 iroh peer 可注入 LSA/控制帧；共享 secret 泄露即全泄 | M | 无 | **现在做** |
 | **P0** | 控制面授权/前缀 ownership | 高 | 恶意 member 广告任意前缀，劫持流量 | M | Hello | **现在做** |
-| **P0** | 真实 3 节点 TUN/LSA/controller 测试 | 高 | 单机 demo 通过≠真实网络通过；MTU/NAT/防火墙问题 | M | Linux x86 build | **现在做** |
+| **P0** | 真实 3 节点 TUN/LSA/controller 测试 | 高 | 单机 demo 通过≠真实网络通过；MTU/NAT/防火墙问题 | M | Linux x86 build | **TUN/LSA transit 已通过；controller 3 节点待做** |
 | **P1** | bootstrap/discovery（mDNS/广播/seed 列表） | 高 | 部署必须手填 controller URL/peer addrs | M | 无 | 下一步 |
 | **P1** | 多网络/多租户隔离 | 高 | 无法一个 agent 接入多个 overlay；产品能力缺失 | L | NetworkId/FIB/TUN | 下一步 |
 | **P1** | ACL/QoS 生产化（队列深度、counters、审计、整形） | 中高 | 无法定位丢包；队列满静默丢；无 SLA | M | 现有 policy | 下一步 |
