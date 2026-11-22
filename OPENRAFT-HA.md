@@ -462,6 +462,7 @@ three_node_raft_over_http
 - `/v1/lsa` 在 Raft 模式走 `client_write`
 - `/v1/snapshot` / `/v1/model` 从 Raft state machine 生成
 - join/revoke/ack 在 Raft 模式下也提交 `ControllerCommand`
+- `/v1/manifest` 在 Raft 模式下从 Raft model 生成
 - join token 消费集合已进入 `ControllerModel`
 - Raft 模式下 LSA 前缀授权读取 model member grant
 

@@ -576,6 +576,32 @@ impl ControllerState {
         manifest
     }
 
+    pub async fn manifest_current(&self) -> MembershipManifest {
+        match &self.raft_store {
+            Some(store) => self.manifest_from_model(store.model().await),
+            None => self.manifest(),
+        }
+    }
+
+    fn manifest_from_model(&self, model: ControllerModel) -> MembershipManifest {
+        let issued_at = now_epoch();
+        let mut manifest = MembershipManifest {
+            network_id: self.network.to_string(),
+            epoch: model.epoch,
+            generation: model.generation,
+            controller: self.signer.map(|n| n.to_string()),
+            issued_at,
+            expires_at: issued_at.saturating_add(self.manifest_ttl),
+            members: self.members_from_model(&model),
+            signature: None,
+        };
+        if let Some(key) = &self.signing_key {
+            let bytes = manifest_payload_bytes(&manifest);
+            manifest.signature = Some(hex::encode(key.sign(&bytes).to_bytes()));
+        }
+        manifest
+    }
+
     fn ensure_leader(&self) -> Result<(), (u16, String)> {
         match self.leader {
             Some(leader) if self.signer != Some(leader) => {
@@ -1274,7 +1300,7 @@ async fn manifest(State(state): State<ControllerState>, headers: HeaderMap) -> R
     if !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(state.manifest()).into_response()
+    Json(state.manifest_current().await).into_response()
 }
 
 async fn apply_lsa(
@@ -1846,6 +1872,26 @@ prefixes = ["192.168.101.0/24"]
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/manifest")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let manifest = json(response).await;
+        assert!(
+            manifest["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["node_id"] == NodeId::new([10u8; 32]).to_string())
+        );
         let response = app
             .oneshot(
                 axum::http::Request::builder()
