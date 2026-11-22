@@ -18,6 +18,8 @@ pub struct PeerState {
     pub connected: bool,
     pub path: Option<String>,
     pub rtt_ms: Option<u64>,
+    /// Number of selected-path changes observed for this peer.
+    pub path_changes: u64,
 }
 
 #[derive(Clone, Default)]
@@ -45,6 +47,7 @@ impl PeerRegistry {
                     connected: false,
                     path: None,
                     rtt_ms: None,
+                    path_changes: 0,
                 },
             );
         }
@@ -73,6 +76,9 @@ impl PeerRegistry {
     pub fn mark(&self, node: &NodeId, connected: bool, path: Option<String>, rtt_ms: Option<u64>) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(peer) = guard.get_mut(node) {
+            if peer.path != path {
+                peer.path_changes = peer.path_changes.saturating_add(1);
+            }
             peer.connected = connected;
             peer.path = path;
             peer.rtt_ms = rtt_ms;
@@ -87,5 +93,42 @@ impl PeerRegistry {
     pub fn total(&self) -> usize {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         guard.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellaris_types::Config;
+
+    #[test]
+    fn path_changes_count_selected_path_switches() {
+        let dir = std::env::temp_dir().join(format!("stellaris-peers-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[[peers]]
+name = "b"
+endpoint_id = "0202020202020202020202020202020202020202020202020202020202020202"
+overlay_ip = "10.7.0.2"
+"#,
+            dir.display()
+        );
+        let registry = PeerRegistry::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let node: NodeId = "0202020202020202020202020202020202020202020202020202020202020202"
+            .parse()
+            .unwrap();
+        registry.mark(&node, true, Some("direct".into()), Some(5));
+        registry.mark(&node, true, Some("direct".into()), Some(6));
+        assert_eq!(registry.get(&node).unwrap().path_changes, 1);
+        registry.mark(&node, true, Some("relay".into()), Some(50));
+        assert_eq!(registry.get(&node).unwrap().path_changes, 2);
     }
 }

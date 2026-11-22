@@ -206,6 +206,7 @@ impl IrohTransport {
             connected: false,
             path: None,
             rtt_ms: None,
+            path_changes: 0,
         });
         let transport = self.clone();
         let tx = self.inbound_tx.clone();

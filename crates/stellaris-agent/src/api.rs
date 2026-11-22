@@ -236,7 +236,9 @@ stellaris_forwarded_total {}\n\
 stellaris_fib_routes {}\n\
 # TYPE stellaris_peers gauge\n\
 stellaris_peers_total {}\n\
-stellaris_peers_connected {}\n",
+stellaris_peers_connected {}\n\
+# TYPE stellaris_peer_path_changes_total counter\n\
+stellaris_peer_path_changes_total {}\n",
         load(&stats.acl_denied),
         load(&stats.qos_rate_limited),
         load(&stats.queue_dropped),
@@ -245,6 +247,12 @@ stellaris_peers_connected {}\n",
         state.routes.fib_view().len(),
         state.peers.total(),
         state.peers.connected_count(),
+        state
+            .peers
+            .list()
+            .iter()
+            .map(|peer| peer.path_changes)
+            .sum::<u64>(),
     );
     Ok((
         [(
