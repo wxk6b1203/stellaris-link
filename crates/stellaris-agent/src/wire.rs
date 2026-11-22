@@ -207,6 +207,102 @@ fn recompute_ipv4_checksum(packet: &mut [u8]) {
     packet[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
 }
 
+/// Clamp the TCP MSS option to the overlay MTU. Returns true if modified.
+pub fn clamp_tcp_mss(packet: &mut [u8], mtu: u16) -> bool {
+    match packet.first().map(|b| b >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            if ihl < 20 || packet.len() < ihl + 20 || packet[9] != 6 {
+                return false;
+            }
+            let max = mtu.saturating_sub(40);
+            clamp_tcp(packet, ihl, max, true)
+        }
+        Some(6) if packet.len() >= 60 => {
+            if packet[6] != 6 {
+                return false;
+            }
+            let max = mtu.saturating_sub(60);
+            clamp_tcp(packet, 40, max, false)
+        }
+        _ => false,
+    }
+}
+
+fn clamp_tcp(packet: &mut [u8], offset: usize, max_mss: u16, v4: bool) -> bool {
+    if packet.len() < offset + 20 {
+        return false;
+    }
+    let data_offset = (packet[offset + 12] >> 4) as usize * 4;
+    if data_offset < 20 || packet.len() < offset + data_offset {
+        return false;
+    }
+    let mut pos = offset + 20;
+    let end = offset + data_offset;
+    let mut mss_pos = None;
+    while pos < end {
+        let kind = packet[pos];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            pos += 1;
+            continue;
+        }
+        if pos + 1 >= end {
+            break;
+        }
+        let len = packet[pos + 1] as usize;
+        if len < 2 || pos + len > end {
+            break;
+        }
+        if kind == 2 && len == 4 {
+            mss_pos = Some(pos + 2);
+            break;
+        }
+        pos += len;
+    }
+    let Some(mss_pos) = mss_pos else {
+        return false;
+    };
+    let mss = u16::from_be_bytes([packet[mss_pos], packet[mss_pos + 1]]);
+    if mss <= max_mss {
+        return false;
+    }
+    packet[mss_pos..mss_pos + 2].copy_from_slice(&max_mss.to_be_bytes());
+    packet[offset + 16] = 0;
+    packet[offset + 17] = 0;
+    let tcp_len = packet.len() - offset;
+    let mut sum = 0u32;
+    if v4 {
+        for chunk in packet[12..20].chunks(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        sum += 6;
+        sum += tcp_len as u32;
+    } else {
+        for chunk in packet[8..40].chunks(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        sum += (tcp_len as u32) >> 16;
+        sum += (tcp_len as u32) & 0xffff;
+        sum += 6;
+    }
+    let mut i = offset;
+    while i + 1 < packet.len() {
+        sum += u16::from_be_bytes([packet[i], packet[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < packet.len() {
+        sum += u16::from_be_bytes([packet[i], 0]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    packet[offset + 16..offset + 18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    true
+}
+
 /// Decrement IPv4 TTL / IPv6 hop limit in place. Returns false if it would reach 0.
 pub fn decrement_ttl(packet: &mut [u8]) -> bool {
     match packet.first().map(|b| b >> 4) {
@@ -301,5 +397,35 @@ mod tests {
         v6[0] = 0x60;
         assert!(set_dscp(&mut v6, 46));
         assert_eq!(dscp(&v6), Some(46));
+    }
+    #[test]
+    fn clamps_ipv4_tcp_mss() {
+        let mut p = vec![0u8; 44];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&44u16.to_be_bytes());
+        p[9] = 6;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        p[20 + 12] = 6 << 4;
+        p[40] = 2;
+        p[41] = 4;
+        p[42..44].copy_from_slice(&1460u16.to_be_bytes());
+        assert!(clamp_tcp_mss(&mut p, 1200));
+        assert_eq!(u16::from_be_bytes([p[42], p[43]]), 1160);
+        assert!(!clamp_tcp_mss(&mut p, 1200));
+    }
+
+    #[test]
+    fn clamps_ipv6_tcp_mss() {
+        let mut p = vec![0u8; 64];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&24u16.to_be_bytes());
+        p[6] = 6;
+        p[40 + 12] = 6 << 4;
+        p[60] = 2;
+        p[61] = 4;
+        p[62..64].copy_from_slice(&1460u16.to_be_bytes());
+        assert!(clamp_tcp_mss(&mut p, 1200));
+        assert_eq!(u16::from_be_bytes([p[62], p[63]]), 1140);
     }
 }

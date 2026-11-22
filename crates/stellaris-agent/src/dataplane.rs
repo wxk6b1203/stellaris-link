@@ -418,10 +418,12 @@ fn route_outbound_priority(
         return None;
     }
     let priority = policy.qos_priority(&info);
+    let mut packet = packet.to_vec();
+    wire::clamp_tcp_mss(&mut packet, state.config.dataplane.mtu.min(1100));
     let header = MeshHeader::new(state.network, 64, flow_hash(&info));
     let mut frame = Vec::with_capacity(HEADER_LEN + packet.len());
     frame.extend_from_slice(&header.encode());
-    frame.extend_from_slice(packet);
+    frame.extend_from_slice(&packet);
     if policy.apply_qos(&mut frame[HEADER_LEN..], &info) == QosVerdict::RateLimited {
         crate::stats::Stats::inc(&state.stats.qos_rate_limited);
         return None;
@@ -515,6 +517,7 @@ pub fn decide_inbound(
 
     if is_local || is_gateway {
         let mut delivered = payload.to_vec();
+        wire::clamp_tcp_mss(&mut delivered, state.config.dataplane.mtu.min(1100));
         if policy.apply_qos(&mut delivered, &info) == QosVerdict::RateLimited {
             crate::stats::Stats::inc(&state.stats.qos_rate_limited);
             return InboundAction::Drop("qos rate limit");
@@ -524,6 +527,7 @@ pub fn decide_inbound(
 
     // Transit: decrement TTL and forward if a route exists.
     let mut forwarded = payload.to_vec();
+    wire::clamp_tcp_mss(&mut forwarded, state.config.dataplane.mtu.min(1100));
     if !decrement_ttl(&mut forwarded) {
         return InboundAction::Drop("ttl expired");
     }
