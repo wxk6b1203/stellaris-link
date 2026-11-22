@@ -654,6 +654,7 @@ const RAFT_SECRET_HEADER: &str = "x-stellaris-raft-secret";
 struct SnapshotAssemblies(Arc<std::sync::Mutex<HashMap<String, PendingSnapshot>>>);
 
 struct PendingSnapshot {
+    created: std::time::Instant,
     vote: VoteOf<TypeConfig>,
     meta: SnapshotMetaOf<TypeConfig>,
     total: usize,
@@ -693,6 +694,7 @@ fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>
         .route("/raft/snapshot/begin", post(raft_snapshot_begin))
         .route("/raft/snapshot/chunk", post(raft_snapshot_chunk))
         .route("/raft/snapshot/finish", post(raft_snapshot_finish))
+        .route("/raft/snapshot/abort", post(raft_snapshot_abort))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(RaftHttpState {
             raft,
@@ -731,6 +733,8 @@ async fn raft_snapshot_begin(
     let id = Uuid::now_v7().to_string();
     {
         let mut assemblies = state.assemblies.0.lock().unwrap_or_else(|e| e.into_inner());
+        assemblies
+            .retain(|_, pending| pending.created.elapsed() < std::time::Duration::from_secs(60));
         if assemblies.len() >= 8 {
             return Err((
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -740,6 +744,7 @@ async fn raft_snapshot_begin(
         assemblies.insert(
             id.clone(),
             PendingSnapshot {
+                created: std::time::Instant::now(),
                 vote: req.vote,
                 meta: req.meta,
                 total: req.total,
@@ -777,6 +782,16 @@ async fn raft_snapshot_chunk(
             "missing/invalid offset".into(),
         ))?;
     let mut assemblies = state.assemblies.0.lock().unwrap_or_else(|e| e.into_inner());
+    if assemblies
+        .get(id)
+        .is_some_and(|pending| pending.created.elapsed() >= std::time::Duration::from_secs(60))
+    {
+        assemblies.remove(id);
+        return Err((
+            axum::http::StatusCode::GONE,
+            "snapshot transfer expired".into(),
+        ));
+    }
     let Some(pending) = assemblies.get_mut(id) else {
         return Err((axum::http::StatusCode::NOT_FOUND, "unknown transfer".into()));
     };
@@ -811,6 +826,31 @@ async fn raft_snapshot_chunk(
         pending.data.extend_from_slice(&body);
     }
     Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+async fn raft_snapshot_abort(
+    State(state): State<RaftHttpState>,
+    headers: HeaderMap,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid raft secret".into(),
+        ));
+    }
+    let Some(id) = headers.get("x-raft-transfer").and_then(|v| v.to_str().ok()) else {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing transfer id".into(),
+        ));
+    };
+    state
+        .assemblies
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 async fn raft_snapshot_finish(
@@ -1614,6 +1654,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        // A transfer can be aborted and then no longer finished.
+        let response = client
+            .post(format!("http://{}/raft/snapshot/begin", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .json(&begin)
+            .send()
+            .await
+            .unwrap();
+        let id = response.json::<serde_json::Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = client
+            .post(format!("http://{}/raft/snapshot/abort", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let response = client
+            .post(format!("http://{}/raft/snapshot/finish", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         let _ = node.raft.shutdown().await;
         node.server.abort();
     }
