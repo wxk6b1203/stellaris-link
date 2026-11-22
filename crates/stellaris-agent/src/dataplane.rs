@@ -441,6 +441,13 @@ pub fn decide_inbound(
     let Some(info) = PacketInfo::parse(payload) else {
         return InboundAction::Drop("unparsable payload");
     };
+    debug!(
+        from = %from.short(),
+        src = %info.src,
+        dst = %info.dst,
+        bytes = payload.len(),
+        "inbound mesh packet"
+    );
 
     let Some(peer) = state.peers.get(&from) else {
         return InboundAction::Drop("unknown peer");
