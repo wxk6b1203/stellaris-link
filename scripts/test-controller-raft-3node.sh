@@ -84,7 +84,7 @@ SNAP=$(curl -fsS -H "x-stellaris-secret: $SECRET" "http://127.0.0.1:4790$L/v1/sn
 echo "$SNAP" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("snapshot ok")'
 # kill leader and wait for a new one
 LEADER_PID=${PIDS[$((L-1))]}
-kill "$LEADER_PID"
+kill -9 "$LEADER_PID"
 for _ in $(seq 1 100); do
   for i in 1 2 3; do
     [[ "$i" == "$L" ]] && continue
@@ -106,4 +106,22 @@ curl -fsS -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' \
 sleep 1
 SNAP2=$(curl -fsS -H "x-stellaris-secret: $SECRET" "http://127.0.0.1:4790$NL/v1/snapshot?node=$NODE")
 echo "$SNAP2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("failover snapshot ok")'
-echo "OK: 3-controller raft join/LSA/snapshot/failover works."
+# restart the crashed leader and require it to catch up as a follower
+RUST_LOG=info "$BIN" --config "$TMP/n$L.toml" >>"$TMP/n$L.log" 2>&1 &
+PIDS[$((L-1))]=$!
+for _ in $(seq 1 100); do
+  if status "$L" >/dev/null 2>&1; then
+    OLD_LEADER=$(status "$L" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("leader") or "")')
+    [[ "$OLD_LEADER" == "$NL" ]] && break
+  fi
+  sleep 0.1
+done
+[[ "${OLD_LEADER:-}" == "$NL" ]] || { echo "FAIL: restarted leader did not rejoin" >&2; tail -30 "$TMP/n$L.log"; exit 1; }
+for _ in $(seq 1 100); do
+  SEQ=$(curl -fsS -H "x-stellaris-secret: $SECRET" "http://127.0.0.1:4790$L/v1/model" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("lsas",{}).get("0101010101010101010101010101010101010101010101010101010101010101",{}).get("seq",0))' 2>/dev/null || echo 0)
+  [[ "$SEQ" == "2" ]] && break
+  sleep 0.1
+done
+[[ "$SEQ" == "2" ]] || { echo "FAIL: restarted leader did not catch up (seq=$SEQ)" >&2; exit 1; }
+echo "crash recovery ok"
+echo "OK: 3-controller raft join/LSA/snapshot/failover/crash-recovery works."

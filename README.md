@@ -339,7 +339,7 @@ BIN=./target/release/stellaris-controller \
 ```bash
 cargo build -p stellaris-agent --bin stellaris-controller
 ./scripts/test-controller-raft-3node.sh
-# OK: 3-controller raft join/LSA/snapshot/failover works.
+# OK: 3-controller raft join/LSA/snapshot/failover/crash-recovery works.
 ```
 
 ### 21.6 Raft TLS E2E

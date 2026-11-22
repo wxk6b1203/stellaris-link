@@ -506,8 +506,12 @@ leader=1
 snapshot ok
 new leader=3
 failover snapshot ok
-OK: 3-controller raft join/LSA/snapshot/failover works.
+crash recovery ok
+OK: 3-controller raft join/LSA/snapshot/failover/crash-recovery works.
 ```
+
+额外验证：`kill -9` leader 后重启原 leader，进程从落盘 Raft log/state 恢复，
+识别新 leader、降为 follower，并通过 `/v1/model` 追平 seq=2。
 
 ## 8.5 真实 LAN 3 controller macvlan
 
