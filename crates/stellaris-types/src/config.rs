@@ -6,7 +6,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
-use crate::id::NetworkId;
+use crate::id::{NetworkId, NodeId};
 use crate::policy::{AclConfig, QosConfig};
 use crate::route::RibMode;
 
@@ -105,6 +105,31 @@ pub struct NetworkConfig {
     pub cidr: IpNet,
     #[serde(default)]
     pub id: Option<NetworkId>,
+    #[serde(default)]
+    pub auth: NetworkAuthConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// No membership authentication (development only).
+    #[default]
+    None,
+    /// Shared network secret with mutual HMAC challenge-response.
+    Psk,
+    /// Controller-signed membership manifest (design; not implemented yet).
+    Controller,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NetworkAuthConfig {
+    #[serde(default)]
+    pub mode: AuthMode,
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Optional allowed peer NodeIds; empty means any holder of the PSK.
+    #[serde(default)]
+    pub allowed_nodes: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -297,6 +322,24 @@ impl Config {
         if self.network.name.trim().is_empty() {
             return Err(ConfigError::Invalid(
                 "network.name must not be empty".into(),
+            ));
+        }
+        if self.network.auth.mode == AuthMode::Psk
+            && self
+                .network
+                .auth
+                .secret
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        {
+            return Err(ConfigError::Invalid(
+                "network.auth.secret is required when auth.mode = psk".into(),
+            ));
+        }
+        if self.network.auth.mode == AuthMode::Controller {
+            return Err(ConfigError::Invalid(
+                "network.auth.mode = controller is not implemented yet".into(),
             ));
         }
         if self.dataplane.mtu < 576 {

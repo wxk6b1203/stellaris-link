@@ -8,6 +8,7 @@ pub mod dataplane;
 pub mod gateway;
 pub mod identity;
 pub mod link_state;
+pub mod membership;
 pub mod peers;
 pub mod policy;
 pub mod transport;

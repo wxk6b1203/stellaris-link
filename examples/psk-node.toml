@@ -1,0 +1,21 @@
+[node]
+name = "psk-node"
+state_dir = "./state/psk-node"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "psk"
+secret = "change-me-to-a-long-random-secret"
+# 可选：只允许这些 NodeId 连接；空=任何持有 PSK 的节点
+allowed_nodes = []
+
+[transport]
+listen_port = 41001
+advertise = ["192.0.2.10:41001"]
+
+[api]
+bind = "127.0.0.1:7777"

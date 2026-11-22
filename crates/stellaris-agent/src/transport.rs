@@ -10,7 +10,7 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
     endpoint::presets,
 };
-use stellaris_types::{Config, NetworkId, NodeId, PeerConfig};
+use stellaris_types::{AuthMode, Config, NetworkId, NodeId, PeerConfig};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -37,7 +37,9 @@ pub enum ControlEvent {
 
 pub struct IrohTransport {
     endpoint: Endpoint,
+    config: Arc<Config>,
     network: NetworkId,
+    local: NodeId,
     peers: PeerRegistry,
     inbound_tx: mpsc::Sender<InboundPacket>,
     control_tx: Option<mpsc::Sender<ControlEvent>>,
@@ -80,11 +82,14 @@ impl IrohTransport {
             endpoint.online().await;
         }
         let me = endpoint.id();
+        let local = NodeId::new(*me.as_bytes());
         info!(endpoint = %me, addr = ?endpoint.addr(), "iroh endpoint ready");
 
         let transport = Arc::new(Self {
             endpoint: endpoint.clone(),
+            config: config.clone(),
             network,
+            local,
             peers: peers.clone(),
             inbound_tx: inbound_tx.clone(),
             control_tx: control_tx.clone(),
@@ -96,6 +101,7 @@ impl IrohTransport {
             let transport = transport.clone();
             let accept_tx = inbound_tx.clone();
             let control_tx = control_tx.clone();
+            let accept_config = config.clone();
             tokio::spawn(async move {
                 loop {
                     let Some(incoming) = transport.endpoint.accept().await else {
@@ -117,6 +123,25 @@ impl IrohTransport {
                     };
                     let remote = conn.remote_id();
                     let node = NodeId::new(*remote.as_bytes());
+                    if accept_config.network.auth.mode == AuthMode::Psk {
+                        let secret = accept_config.network.auth.secret.as_deref().unwrap_or("");
+                        let auth = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            crate::membership::authenticate_server(
+                                &conn,
+                                transport.network,
+                                transport.local,
+                                secret,
+                                &accept_config.network.auth.allowed_nodes,
+                            ),
+                        )
+                        .await;
+                        if !matches!(auth, Ok(Ok(_))) {
+                            warn!(peer = %node.short(), "membership authentication failed");
+                            conn.close(2u8.into(), b"auth failed");
+                            continue;
+                        }
+                    }
                     info!(peer = %node.short(), "inbound iroh connection");
                     transport.insert_conn(node, conn.clone());
                     if let Some(tx) = &control_tx {
@@ -317,6 +342,32 @@ async fn connect_loop(
     loop {
         match transport.endpoint.connect(addr.clone(), DATA_ALPN).await {
             Ok(conn) => {
+                if transport.config.network.auth.mode == AuthMode::Psk {
+                    let secret = transport
+                        .config
+                        .network
+                        .auth
+                        .secret
+                        .as_deref()
+                        .unwrap_or("");
+                    let auth = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        crate::membership::authenticate_client(
+                            &conn,
+                            transport.network,
+                            transport.local,
+                            node,
+                            secret,
+                        ),
+                    )
+                    .await;
+                    if !matches!(auth, Ok(Ok(()))) {
+                        warn!(peer = %peer.name, "membership authentication failed");
+                        conn.close(2u8.into(), b"auth failed");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
                 info!(peer = %peer.name, "outbound iroh connected");
                 transport.insert_conn(node, conn.clone());
                 if let Some(tx) = &control_tx {

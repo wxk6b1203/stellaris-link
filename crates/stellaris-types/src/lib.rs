@@ -7,8 +7,8 @@ pub mod policy;
 pub mod route;
 
 pub use config::{
-    ApiConfig, Config, ControlConfig, DataplaneConfig, NetworkConfig, NodeConfig, PeerConfig,
-    RoutingConfig, StaticRouteConfig, TransportConfig,
+    ApiConfig, AuthMode, Config, ControlConfig, DataplaneConfig, NetworkAuthConfig, NetworkConfig,
+    NodeConfig, PeerConfig, RoutingConfig, StaticRouteConfig, TransportConfig,
 };
 pub use error::{ConfigError, NodeIdParseError};
 pub use id::{NetworkId, NodeId, RouteId};
