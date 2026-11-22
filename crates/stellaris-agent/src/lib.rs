@@ -5,6 +5,7 @@ pub mod control_client;
 pub mod control_wire;
 pub mod controller;
 pub mod dataplane;
+pub mod discovery;
 pub mod gateway;
 pub mod identity;
 pub mod link_state;
@@ -186,8 +187,10 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     let control_configured = state.config.control.url.is_some()
         || !state.config.control.urls.is_empty()
         || state.config.control.endpoint_id.is_some();
-    let want_transport =
-        state.config.dataplane.enabled || !state.config.peers.is_empty() || control_configured;
+    let want_transport = state.config.dataplane.enabled
+        || !state.config.peers.is_empty()
+        || control_configured
+        || state.config.transport.discovery_port.is_some();
     let mut transport_handle = None;
     if want_transport {
         let transport = transport::IrohTransport::start(
@@ -200,6 +203,7 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
         )
         .await?;
         transport_handle = Some(transport.clone());
+        discovery::start(state.clone(), transport.clone());
         if let Some(rx) = control_rx {
             let state = state.clone();
             let transport = transport.clone();

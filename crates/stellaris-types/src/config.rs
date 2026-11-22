@@ -210,6 +210,12 @@ pub struct TransportConfig {
     /// Underlay addresses advertised via LSA for auto-discovery.
     #[serde(default)]
     pub advertise: Vec<SocketAddr>,
+    /// UDP broadcast bootstrap discovery port (None = disabled).
+    #[serde(default)]
+    pub discovery_port: Option<u16>,
+    /// Optional directed broadcast target (e.g. 192.168.1.255:47000).
+    #[serde(default)]
+    pub discovery_broadcast: Option<SocketAddr>,
 }
 
 impl Default for TransportConfig {
@@ -220,6 +226,8 @@ impl Default for TransportConfig {
             disable_relay: false,
             listen_port: None,
             advertise: Vec::new(),
+            discovery_port: None,
+            discovery_broadcast: None,
         }
     }
 }

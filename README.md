@@ -224,7 +224,22 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-3node.sh
 
 三个 network namespace + 两个 veth，a—b—c；验证 LSA 自动路由、b 的 transit 转发、双向 ping 和 1000B 包。已在 bee x86_64 实测通过。
 
-### 13. Controller + 3 members（本机）
+### 13. UDP bootstrap discovery（Linux netns）
+
+```toml
+[transport]
+discovery_port = 47000
+discovery_broadcast = "192.168.1.255:47000" # 可选；默认 255.255.255.255
+```
+
+```bash
+sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.sh
+# OK: UDP broadcast discovery + PSK works.
+```
+
+发现只产生候选 peer，仍必须通过 PSK/controller 认证。
+
+### 14. Controller + 3 members（本机）
 
 ```bash
 ./scripts/demo-controller-3node.sh
@@ -232,7 +247,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-3node.sh
 
 一个 controller + 三个 member，验证 controller ACK、snapshot 成员、LSA 路由学习。
 
-### 14. 真正的 TUN overlay（两台机器，需要 root）
+### 15. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
