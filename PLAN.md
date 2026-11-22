@@ -62,7 +62,7 @@
 - [x] IPv4/IPv6 分片解析与稳定 flow hash。
 - [x] 超大包 ICMPv4 Fragmentation Needed / ICMPv6 Packet Too Big。
 - [x] per-priority egress queue depth/byte cap + queue drop counter。
-- [x] Raft 大 snapshot 分块上传（2 MiB chunk，512 MiB 上限；offset/idempotent retry；>4 MiB 装配测试）。
+- [x] Raft 大 snapshot 分块上传（2 MiB chunk，512 MiB 上限；offset/idempotent retry；mock 500 重试测试；>4 MiB 装配测试）。
 - [x] Raft 持久化失败传播 + 先落盘后 ACK。
 - [x] 分片 ACL：first-fragment verdict cache，缺失首片 fail-closed。
 - [x] peer direct/relay path change 计数与 metric。

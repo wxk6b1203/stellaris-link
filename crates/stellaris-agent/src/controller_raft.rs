@@ -2064,15 +2064,14 @@ mod tests {
                     break;
                 }
             }
-            if let Some(raft) = current {
-                if raft
+            if let Some(raft) = current
+                && raft
                     .client_write(ControllerCommand::ApplyLsa { lsa: lsa.clone() })
                     .await
                     .is_ok()
-                {
-                    wrote = true;
-                    break;
-                }
+            {
+                wrote = true;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -2116,6 +2115,65 @@ mod tests {
             server.abort();
         }
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_snapshot_client_retries_failed_chunk() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        async fn begin() -> Json<serde_json::Value> {
+            Json(serde_json::json!({"id": "mock"}))
+        }
+        async fn chunk(
+            State(calls): State<StdArc<AtomicUsize>>,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> axum::http::StatusCode {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                axum::http::StatusCode::ACCEPTED
+            }
+        }
+        async fn finish() -> Json<openraft::raft::SnapshotResponse<TypeConfig>> {
+            Json(openraft::raft::SnapshotResponse::new(openraft::Vote::new(
+                0u64, 0u64,
+            )))
+        }
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/raft/snapshot/begin", post(begin))
+            .route("/raft/snapshot/chunk", post(chunk))
+            .route("/raft/snapshot/finish", post(finish))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut network = HttpNetwork {
+            client: reqwest::Client::new(),
+            base: format!("http://{addr}"),
+            secret: None,
+        };
+        let snapshot = SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
+            meta: SnapshotMetaOf::<TypeConfig> {
+                last_log_id: None,
+                last_membership: StoredMembershipOf::<TypeConfig>::default(),
+            },
+            snapshot: Cursor::new(vec![7u8; 5 * 1024 * 1024]),
+        };
+        network
+            .full_snapshot(
+                VoteOf::<TypeConfig>::new(0, 0),
+                snapshot,
+                std::future::pending::<openraft::error::ReplicationClosed>(),
+                RPCOption::new(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+        assert!(calls.load(Ordering::Relaxed) >= 2);
+        server.abort();
     }
 
     #[tokio::test]
