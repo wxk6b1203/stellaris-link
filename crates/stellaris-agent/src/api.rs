@@ -70,11 +70,16 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
         .ok_or_else(ApiError::unauthorized)
 }
 
+fn token_allowed(state: &AgentState, token: &str) -> bool {
+    state.config.api.token.as_deref() == Some(token)
+        || state.config.api.previous_tokens.iter().any(|t| t == token)
+}
+
 fn authorize_write(state: &AgentState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(expected) = state.config.api.token.as_deref() else {
+    if state.config.api.token.is_none() && state.config.api.previous_tokens.is_empty() {
         return Ok(());
-    };
-    if bearer(headers)? == expected {
+    }
+    if token_allowed(state, bearer(headers)?) {
         Ok(())
     } else {
         Err(ApiError::unauthorized())
@@ -82,20 +87,14 @@ fn authorize_write(state: &AgentState, headers: &HeaderMap) -> Result<(), ApiErr
 }
 
 fn authorize_read(state: &AgentState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(expected) = state.config.api.token.as_deref() else {
-        if let Some(read) = state.config.api.read_token.as_deref() {
-            return if bearer(headers)? == read {
-                Ok(())
-            } else {
-                Err(ApiError::unauthorized())
-            };
-        }
-        return Ok(());
-    };
-    if bearer(headers)? == expected {
+    if state.config.api.token.is_none()
+        && state.config.api.previous_tokens.is_empty()
+        && state.config.api.read_token.is_none()
+    {
         return Ok(());
     }
-    if state.config.api.read_token.as_deref() == Some(bearer(headers)?) {
+    let token = bearer(headers)?;
+    if token_allowed(state, token) || state.config.api.read_token.as_deref() == Some(token) {
         return Ok(());
     }
     Err(ApiError::unauthorized())
@@ -577,6 +576,30 @@ read_token = "{}"
         AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
     }
 
+    fn state_with_rotation() -> AgentState {
+        let dir = std::env::temp_dir().join(format!("stellaris-api-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[api]
+bind = "127.0.0.1:0"
+token = "new"
+previous_tokens = ["old"]
+"#,
+            dir.display()
+        );
+        AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
+    }
+
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -597,6 +620,22 @@ read_token = "{}"
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["network_name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn previous_api_token_is_accepted() {
+        let app = router(state_with_rotation());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status")
+                    .header("authorization", "Bearer old")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

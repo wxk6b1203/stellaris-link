@@ -88,6 +88,9 @@ pub struct ControlConfig {
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
+    /// Previous shared secrets accepted during rotation.
+    #[serde(default)]
+    pub previous_secrets: Vec<String>,
     /// Membership manifest lifetime in seconds.
     #[serde(default = "default_manifest_ttl")]
     pub manifest_ttl_secs: u64,
@@ -143,6 +146,7 @@ impl Default for ControlConfig {
             bind: None,
             secret: None,
             epoch: None,
+            previous_secrets: Vec::new(),
             manifest_ttl_secs: default_manifest_ttl(),
             controller_keys: Vec::new(),
             controller_threshold: 1,
@@ -374,6 +378,9 @@ pub struct ApiConfig {
     /// Optional read-only bearer token (mutations still require `token`).
     #[serde(default)]
     pub read_token: Option<String>,
+    /// Previous admin tokens accepted during rotation.
+    #[serde(default)]
+    pub previous_tokens: Vec<String>,
     /// HTTPS certificate PEM path (requires tls_key).
     #[serde(default)]
     pub tls_cert: Option<String>,
@@ -388,6 +395,7 @@ impl Default for ApiConfig {
             bind: default_api_bind(),
             token: None,
             read_token: None,
+            previous_tokens: Vec::new(),
             tls_cert: None,
             tls_key: None,
         }

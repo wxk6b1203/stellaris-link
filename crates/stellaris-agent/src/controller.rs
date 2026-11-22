@@ -53,6 +53,7 @@ pub struct ControllerState {
     acks_path: PathBuf,
     members_path: PathBuf,
     lsas_path: PathBuf,
+    previous_secrets: Vec<String>,
     grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenConfig>>>,
     consumed_join_tokens: Arc<RwLock<HashSet<String>>>,
@@ -272,6 +273,7 @@ impl ControllerState {
             acks_path,
             members_path,
             lsas_path,
+            previous_secrets: config.control.previous_secrets.clone(),
             grants: Arc::new(RwLock::new(grants)),
             join_tokens: Arc::new(RwLock::new(join_tokens)),
             consumed_join_tokens: Arc::new(RwLock::new(consumed)),
@@ -614,10 +616,11 @@ impl ControllerState {
     }
 
     pub fn authorized_secret(&self, provided: Option<&str>) -> bool {
-        match self.secret.as_deref() {
-            Some(expected) => provided == Some(expected),
-            None => true,
-        }
+        let Some(provided) = provided else {
+            return self.secret.is_none() && self.previous_secrets.is_empty();
+        };
+        self.secret.as_deref() == Some(provided)
+            || self.previous_secrets.iter().any(|s| s == provided)
     }
 
     fn record_ack(
@@ -1646,6 +1649,32 @@ epoch = 1
                 .iter()
                 .any(|m| m.node_id == node.to_string())
         );
+    }
+
+    #[test]
+    fn previous_controller_secret_is_accepted() {
+        let dir = temp_state_dir();
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "new"
+previous_secrets = ["old"]
+"#,
+            dir
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        assert!(state.authorized_secret(Some("old")));
+        assert!(state.authorized_secret(Some("new")));
+        assert!(!state.authorized_secret(Some("bad")));
     }
 
     #[test]
