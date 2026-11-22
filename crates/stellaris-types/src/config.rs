@@ -399,6 +399,14 @@ impl Config {
                 "network.name must not be empty".into(),
             ));
         }
+        if let Some(overlay) = self.node.overlay_ip
+            && !self.network.cidr.contains(&overlay)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "node.overlay_ip {overlay} is outside network.cidr {}",
+                self.network.cidr
+            )));
+        }
         if self.network.auth.mode == AuthMode::Psk
             && self
                 .network
@@ -573,5 +581,43 @@ impl Config {
 
     pub fn peer_by_endpoint(&self, endpoint_id: &str) -> Option<&PeerConfig> {
         self.peers.iter().find(|p| p.endpoint_id == endpoint_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_ip_must_be_inside_network_cidr() {
+        let toml = r#"
+[node]
+name = "a"
+overlay_ip = "10.9.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+"#;
+        assert!(Config::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn explicit_network_id_is_supported() {
+        let toml = r#"
+[node]
+name = "a"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+id = "11111111-1111-4111-8111-111111111111"
+cidr = "10.7.0.0/16"
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(
+            config.network.id.unwrap().to_string(),
+            "11111111-1111-4111-8111-111111111111"
+        );
     }
 }

@@ -298,6 +298,7 @@ examples/               # 示例 TOML
 | [ADVANCED-ROUTING.md](ADVANCED-ROUTING.md) | 静态路由、AZ 分段、subnet gateway 设计 |
 | [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
 | [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) | 入网、成员授权、前缀授权设计 |
+| [MULTI-NETWORK.md](MULTI-NETWORK.md) | 多网络隔离与单进程多网络设计 |
 | [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 详细设计（未实现） |
 | [examples/policy.toml](examples/policy.toml) | ACL/QoS 配置示例 |
 | [scripts/demo-linkstate.sh](scripts/demo-linkstate.sh) | controller-mediated link-state 演示 |
