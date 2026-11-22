@@ -468,6 +468,139 @@ bind = "127.0.0.1:0"
         Config::from_toml(&toml).unwrap()
     }
 
+    fn config_multi(
+        name: &str,
+        state: &std::path::Path,
+        relays: &[String],
+        overlay: &str,
+    ) -> Config {
+        let relay_list = relays
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml = format!(
+            r#"
+[node]
+name = "{name}"
+state_dir = "{}"
+overlay_ip = "{overlay}"
+[network]
+name = "relay-failover-test"
+cidr = "10.8.0.0/16"
+[transport]
+disable_relay = false
+relay_urls = [{relay_list}]
+[api]
+bind = "127.0.0.1:0"
+"#,
+            state.display()
+        );
+        Config::from_toml(&toml).unwrap()
+    }
+
+    async fn start_relay() -> (iroh_relay::server::Server, String) {
+        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+        relay.key_cache_capacity = Some(1024);
+        let mut server_config = ServerConfig::default();
+        server_config.relay = Some(relay);
+        let server = Server::spawn(server_config).await.unwrap();
+        let url = format!("http://{}", server.http_addr().unwrap());
+        (server, url)
+    }
+
+    #[tokio::test]
+    async fn endpoint_fails_over_between_http_relays() {
+        let (relay1, url1) = start_relay().await;
+        let (relay2, url2) = start_relay().await;
+        let base =
+            std::env::temp_dir().join(format!("stellaris-relay-fo-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let config_a = config_multi(
+            "a",
+            &base.join("a"),
+            &[url1.clone(), url2.clone()],
+            "10.8.0.1",
+        );
+        let config_b = config_multi(
+            "b",
+            &base.join("b"),
+            &[url1.clone(), url2.clone()],
+            "10.8.0.2",
+        );
+        let network = NetworkId::new();
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let (tx_b, _rx_b) = mpsc::channel(64);
+        let a = IrohTransport::start(
+            Arc::new(config_a.clone()),
+            network,
+            [11u8; 32],
+            PeerRegistry::from_config(&config_a).unwrap(),
+            tx_a,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = IrohTransport::start(
+            Arc::new(config_b.clone()),
+            network,
+            [12u8; 32],
+            PeerRegistry::from_config(&config_b).unwrap(),
+            tx_b,
+            None,
+        )
+        .await
+        .unwrap();
+        let a_id = NodeId::new(*a.endpoint_id().as_bytes());
+        let b_id = NodeId::new(*b.endpoint_id().as_bytes());
+        a.add_peer(
+            PeerConfig {
+                name: "b".into(),
+                endpoint_id: b_id.to_string(),
+                overlay_ip: "10.8.0.2".parse().unwrap(),
+                addrs: vec![],
+                relay_url: Some(url1.clone()),
+                advertised: vec![],
+                zone: None,
+            },
+            true,
+        );
+        b.add_peer(
+            PeerConfig {
+                name: "a".into(),
+                endpoint_id: a_id.to_string(),
+                overlay_ip: "10.8.0.1".parse().unwrap(),
+                addrs: vec![],
+                relay_url: Some(url1.clone()),
+                advertised: vec![],
+                zone: None,
+            },
+            true,
+        );
+        for _ in 0..100 {
+            if a.peers.get(&b_id).is_some_and(|p| p.connected) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(a.peers.get(&b_id).is_some_and(|p| p.connected));
+        drop(relay1);
+        for _ in 0..150 {
+            if a.peers.get(&b_id).is_some_and(|p| p.connected) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            a.peers.get(&b_id).is_some_and(|p| p.connected),
+            "connection did not fail over to the second relay"
+        );
+        drop(relay2);
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[tokio::test]
     async fn endpoint_connects_over_http_relay() {
         let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
