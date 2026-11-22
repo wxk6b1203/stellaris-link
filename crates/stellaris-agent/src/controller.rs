@@ -116,6 +116,25 @@ pub fn manifest_payload_bytes(manifest: &MembershipManifest) -> Vec<u8> {
 }
 
 #[derive(Serialize)]
+struct ManifestAgreement<'a> {
+    network_id: &'a str,
+    epoch: u64,
+    generation: u64,
+    members: &'a [MemberView],
+}
+
+/// Controller-independent manifest content used for multi-controller threshold.
+pub fn manifest_agreement_bytes(manifest: &MembershipManifest) -> Vec<u8> {
+    let payload = ManifestAgreement {
+        network_id: &manifest.network_id,
+        epoch: manifest.epoch,
+        generation: manifest.generation,
+        members: &manifest.members,
+    };
+    serde_json::to_vec(&payload).unwrap_or_default()
+}
+
+#[derive(Serialize)]
 struct SnapshotPayload<'a> {
     network_id: &'a str,
     epoch: u64,
@@ -1429,6 +1448,18 @@ prefixes = ["192.168.50.0/24"]
         let payload = manifest_payload_bytes(&manifest);
         verify_ed25519(signer, &payload, manifest.signature.as_deref().unwrap()).unwrap();
         assert!(manifest.expires_at > manifest.issued_at);
+    }
+
+    #[test]
+    fn manifest_agreement_ignores_controller_identity() {
+        let mut a = state();
+        a.set_signing_key([1u8; 32]);
+        let mut b = state();
+        b.set_signing_key([2u8; 32]);
+        let ma = a.manifest();
+        let mb = b.manifest();
+        assert_ne!(ma.controller, mb.controller);
+        assert_eq!(manifest_agreement_bytes(&ma), manifest_agreement_bytes(&mb));
     }
 
     #[test]

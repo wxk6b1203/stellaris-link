@@ -277,7 +277,11 @@ async fn try_manifest(
     state: &AgentState,
     secret: Option<&str>,
 ) -> bool {
-    let mut best: Option<crate::controller::MembershipManifest> = None;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut verified: Vec<(crate::controller::MembershipManifest, NodeId)> = Vec::new();
     for base in bases {
         let mut request = client.get(format!("{base}/v1/manifest"));
         if let Some(secret) = secret {
@@ -290,14 +294,8 @@ async fn try_manifest(
                     .await
                 {
                     Ok(manifest) => {
-                        if best
-                            .as_ref()
-                            .map(|b| {
-                                (manifest.epoch, manifest.generation) > (b.epoch, b.generation)
-                            })
-                            .unwrap_or(true)
-                        {
-                            best = Some(manifest);
+                        if let Some(controller) = verify_manifest(state, &manifest, now) {
+                            verified.push((manifest, controller));
                         }
                     }
                     Err(e) => tracing::warn!(base, error = %e, "invalid manifest"),
@@ -307,25 +305,67 @@ async fn try_manifest(
             Err(e) => tracing::debug!(base, error = %e, "manifest unreachable"),
         }
     }
-    let Some(manifest) = best else {
-        return false;
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if manifest.expires_at <= now {
-        tracing::warn!("controller manifest expired");
+    if verified.is_empty() {
         return false;
     }
-    let Some(controller) = manifest
-        .controller
-        .as_deref()
-        .and_then(|s| s.parse::<NodeId>().ok())
-    else {
-        tracing::warn!("manifest has no controller id");
+    let threshold = state.config.control.controller_threshold.max(1);
+    let selected = if threshold <= 1 {
+        verified
+            .into_iter()
+            .max_by_key(|(m, _)| (m.epoch, m.generation))
+            .map(|(m, _)| m)
+    } else {
+        let mut groups: HashMap<
+            [u8; 32],
+            (crate::controller::MembershipManifest, HashSet<NodeId>),
+        > = HashMap::new();
+        for (manifest, controller) in verified {
+            let bytes = crate::controller::manifest_agreement_bytes(&manifest);
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let hash: [u8; 32] = hasher.finalize().into();
+            groups
+                .entry(hash)
+                .or_insert_with(|| (manifest.clone(), HashSet::new()))
+                .1
+                .insert(controller);
+        }
+        groups
+            .into_values()
+            .filter(|(_, signers)| signers.len() >= threshold)
+            .map(|(manifest, _)| manifest)
+            .max_by_key(|m| (m.epoch, m.generation))
+    };
+    let Some(manifest) = selected else {
+        tracing::warn!("not enough distinct controller manifest signatures");
         return false;
     };
+    state.set_grants(&manifest.members);
+    tracing::debug!(
+        generation = manifest.generation,
+        members = manifest.members.len(),
+        "applied signed membership manifest"
+    );
+    true
+}
+
+fn verify_manifest(
+    state: &AgentState,
+    manifest: &crate::controller::MembershipManifest,
+    now: u64,
+) -> Option<NodeId> {
+    if manifest.network_id != state.network.to_string() {
+        tracing::warn!("manifest network mismatch");
+        return None;
+    }
+    if manifest.expires_at <= now {
+        tracing::warn!("controller manifest expired");
+        return None;
+    }
+    let controller = manifest
+        .controller
+        .as_deref()
+        .and_then(|s| s.parse::<NodeId>().ok())?;
     if !state
         .config
         .control
@@ -334,24 +374,12 @@ async fn try_manifest(
         .any(|key| key == &controller.to_string())
     {
         tracing::warn!(%controller, "untrusted manifest controller");
-        return false;
+        return None;
     }
-    let Some(signature) = manifest.signature.as_deref() else {
-        tracing::warn!("manifest is unsigned");
-        return false;
-    };
-    let payload = crate::controller::manifest_payload_bytes(&manifest);
-    if let Err(e) = crate::controller::verify_ed25519(controller, &payload, signature) {
-        tracing::warn!(error = %e, "manifest signature invalid");
-        return false;
-    }
-    state.set_grants(&manifest.members);
-    tracing::debug!(
-        generation = manifest.generation,
-        members = manifest.members.len(),
-        "applied signed membership manifest"
-    );
-    true
+    let signature = manifest.signature.as_deref()?;
+    let payload = crate::controller::manifest_payload_bytes(manifest);
+    crate::controller::verify_ed25519(controller, &payload, signature).ok()?;
+    Some(controller)
 }
 
 async fn try_join(
