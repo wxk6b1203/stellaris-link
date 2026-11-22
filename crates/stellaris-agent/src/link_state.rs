@@ -255,7 +255,8 @@ async fn peer_task(
                 if last_pong.lock().await.elapsed() > PEER_TIMEOUT {
                     warn!(peer = %node.short(), "link-state peer heartbeat timeout");
                     service.on_down(node);
-                    conn.close(1u8.into(), b"heartbeat timeout");
+                    // Never close the shared transport connection here: it also
+                    // carries dataplane datagrams. Just stop this control peer task.
                     break;
                 }
                 ping_seq = ping_seq.wrapping_add(1);
