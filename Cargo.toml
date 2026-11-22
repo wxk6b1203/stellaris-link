@@ -28,6 +28,8 @@ hex = "0.4"
 hmac = "0.12"
 ipnet = { version = "2", features = ["serde"] }
 iroh = "1.5"
+openraft = { version = "0.10", features = ["serde"] }
+openraft-memstore = "0.10"
 mdns-sd = "0.22"
 prefix-trie = "0.10"
 rand = "0.9"

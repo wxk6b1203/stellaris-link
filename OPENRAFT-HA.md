@@ -377,6 +377,8 @@ crates/stellaris-agent/src/controller_model.rs
 
 - LSA/join/revoke/ack 会同步更新 model
 - `GET /v1/model` 可查看 shadow 状态
+- 命令以 JSONL 追加到 `state_dir/controller-commands.jsonl`
+- 重启时按命令日志重放 model
 - 尚未替换旧 controller 状态，也尚未接入 openraft
 
 这是 Phase 0 的前置模型。

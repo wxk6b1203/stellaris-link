@@ -55,6 +55,7 @@ pub struct ControllerState {
     acks_path: PathBuf,
     members_path: PathBuf,
     lsas_path: PathBuf,
+    commands_path: PathBuf,
     previous_secrets: Vec<String>,
     grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
     model: Arc<RwLock<ControllerModel>>,
@@ -233,6 +234,7 @@ impl ControllerState {
         let acks_path = state_dir.join("controller-acks.json");
         let members_path = state_dir.join("controller-members.json");
         let lsas_path = state_dir.join("controller-lsas.json");
+        let commands_path = state_dir.join("controller-commands.jsonl");
         let acks = load_acks(&acks_path);
         let persisted = load_members(&members_path);
         let persisted_lsas = load_lsas(&lsas_path);
@@ -269,6 +271,10 @@ impl ControllerState {
             || !grants.is_empty()
             || !consumed.is_empty();
         let mut model = ControllerModel::new(network, epoch);
+        let replay = load_commands(&commands_path);
+        for command in replay {
+            model.apply(command);
+        }
         for (node, grant) in &grants {
             model.apply(ControllerCommand::UpsertMember {
                 node: *node,
@@ -288,6 +294,7 @@ impl ControllerState {
             acks_path,
             members_path,
             lsas_path,
+            commands_path,
             previous_secrets: config.control.previous_secrets.clone(),
             grants: Arc::new(RwLock::new(grants)),
             model: Arc::new(RwLock::new(model)),
@@ -413,10 +420,12 @@ impl ControllerState {
                 .copied()
                 .collect();
             for origin in expired {
-                model.apply(ControllerCommand::ExpireLsa {
+                let command = ControllerCommand::ExpireLsa {
                     origin,
                     up_to_seq: u64::MAX,
-                });
+                };
+                self.append_command(command.clone());
+                model.apply(command);
             }
             drop(model);
             self.persist_lsas();
@@ -480,6 +489,35 @@ impl ControllerState {
             if let Err(e) = std::fs::write(&self.acks_path, bytes) {
                 tracing::warn!(error = %e, "persist controller acknowledgements");
             }
+        }
+    }
+
+    fn append_command(&self, command: ControllerCommand) {
+        let bytes = match serde_json::to_vec(&command) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize controller command");
+                return;
+            }
+        };
+        if let Some(parent) = self.commands_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, "create controller command dir");
+            return;
+        }
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.commands_path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(&bytes)?;
+                file.write_all(b"\n")?;
+                file.sync_data()
+            });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "append controller command");
         }
     }
 
@@ -566,6 +604,9 @@ impl ControllerState {
             .apply(lsa);
         if changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
+            self.append_command(ControllerCommand::ApplyLsa {
+                lsa: model_lsa.clone(),
+            });
             self.model
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -672,6 +713,7 @@ impl ControllerState {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(node);
+        self.append_command(ControllerCommand::RevokeMember { node });
         self.model
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -719,14 +761,16 @@ impl ControllerState {
             *current = generation;
         }
         drop(acks);
+        let command = ControllerCommand::Ack {
+            node,
+            generation,
+            epoch: self.epoch,
+        };
+        self.append_command(command.clone());
         self.model
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .apply(ControllerCommand::Ack {
-                node,
-                generation,
-                epoch: self.epoch,
-            });
+            .apply(command);
         self.persist_acks();
         Ok(())
     }
@@ -746,6 +790,22 @@ fn now_epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(1)
+}
+
+fn load_commands(path: &std::path::Path) -> Vec<ControllerCommand> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json::from_str(line) {
+            Ok(command) => Some(command),
+            Err(e) => {
+                tracing::warn!(error = %e, "skip invalid controller command");
+                None
+            }
+        })
+        .collect()
 }
 
 fn load_lsas(path: &std::path::Path) -> PersistedLsas {
@@ -1700,6 +1760,60 @@ expires_at = 1
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn command_log_replays_deterministic_model() {
+        let dir = temp_state_dir();
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+
+[[control.join_tokens]]
+token = "join"
+prefixes = ["192.168.92.0/24"]
+"#,
+            dir
+        );
+        let config = Config::from_toml(&toml).unwrap();
+        let state = ControllerState::from_config(&config).unwrap();
+        let node = NodeId::new([1u8; 32]);
+        state
+            .join(node, "10.7.0.1".parse().unwrap(), "join")
+            .unwrap();
+        state
+            .apply_lsa(Lsa {
+                origin: node,
+                seq: 1,
+                zone: None,
+                links: vec![],
+                prefixes: vec![stellaris_linkstate::Prefix {
+                    prefix: "192.168.92.0/24".parse().unwrap(),
+                    metric: 0,
+                }],
+                overlay_ip: Some("10.7.0.1".parse().unwrap()),
+                addrs: vec![],
+            })
+            .unwrap();
+        state.record_ack(node, 3, Some(state.epoch)).unwrap();
+        let before = state.model().snapshot_bytes();
+        drop(state);
+
+        let restarted = ControllerState::from_config(&config).unwrap();
+        let after = restarted.model().snapshot_bytes();
+        assert_eq!(before, after);
+        assert!(restarted.model().lsas.contains_key(&node));
+        assert!(restarted.model().members.contains_key(&node));
     }
 
     #[test]
