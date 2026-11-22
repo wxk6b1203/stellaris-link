@@ -357,6 +357,7 @@ IPv4：
 ```bash
 sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat.sh
 # OK: public exit + NAT44 works.
+# NAT mapping consistent
 ```
 
 IPv6：
@@ -371,6 +372,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat66.
 ```bash
 sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat.sh
 # OK: public exit + NAT44 works.
+# NAT mapping consistent
 ```
 
 A 通过 exit B 访问 192.0.2.2；B 安装 MASQUERADE 并转发。

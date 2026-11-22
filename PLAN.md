@@ -56,7 +56,7 @@
 - [x] TCP MSS clamp（IPv4/IPv6）。
 - [x] IPv6 TUN netns 双向转发（fd00:115::/64，含 1000B ping）。
 - [x] IPv6 forwarding + NAT66 gateway rule。
-- [x] public exit + NAT44 netns 端到端（A -> exit B -> 192.0.2.2）。
+- [x] public exit + NAT44 netns 端到端（A -> exit B -> 192.0.2.2），NAT UDP 映射稳定。
 - [x] public exit + NAT66 netns 端到端（fd00:201::2）。
 - [x] peer `advertised` 自动安装路由，public exit 无手写 route。
 - [x] IPv4/IPv6 分片解析与稳定 flow hash。
