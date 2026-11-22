@@ -1,0 +1,12 @@
+[package]
+name = "stellaris-linkstate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ipnet.workspace = true
+serde.workspace = true
+stellaris-types = { path = "../stellaris-types" }
+thiserror.workspace = true
