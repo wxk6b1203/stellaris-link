@@ -1,0 +1,31 @@
+[node]
+name = "policy-node"
+state_dir = "./state/policy-node"
+overlay_ip = "10.7.0.1"
+zone = "az-a"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[routing]
+link_state = true
+
+# Deny a prefix regardless of source.
+[[routing.policies]]
+id = "deny-test"
+priority = 1
+[routing.policies.match_]
+prefix = "203.0.113.0/24"
+[routing.policies.action]
+kind = "deny"
+
+# Prefer routes learned from az-a.
+[[routing.policies]]
+id = "prefer-az-a"
+priority = 10
+[routing.policies.match_]
+region = "az-a"
+[routing.policies.action]
+kind = "set_local_pref"
+value = 500

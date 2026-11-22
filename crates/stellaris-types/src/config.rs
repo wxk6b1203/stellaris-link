@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ConfigError;
 use crate::id::{NetworkId, NodeId};
 use crate::policy::{AclConfig, QosConfig};
-use crate::route::RibMode;
+use crate::route::{RibMode, RoutePolicy};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -231,6 +231,9 @@ pub struct RoutingConfig {
     /// Enable peer-to-peer LSA exchange over iroh control streams.
     #[serde(default)]
     pub link_state: bool,
+    /// Route policy rules applied to the RIB before FIB compilation.
+    #[serde(default)]
+    pub policies: Vec<RoutePolicy>,
     /// Extra metric for links that cross availability zones.
     #[serde(default = "default_cross_zone_penalty")]
     pub cross_zone_penalty: u32,
@@ -244,6 +247,7 @@ impl Default for RoutingConfig {
             ecmp_max: 8,
             prefer_same_zone: true,
             link_state: false,
+            policies: Vec::new(),
             cross_zone_penalty: default_cross_zone_penalty(),
         }
     }

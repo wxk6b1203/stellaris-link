@@ -48,6 +48,7 @@ fn route_zone(config: &Config, peer: &PeerConfig) -> (u32, RouteAttributes) {
         && config.node.zone == peer.zone;
     let attrs = RouteAttributes {
         zone: peer.zone.clone(),
+        region: peer.zone.clone(),
         ..Default::default()
     };
     (if same_zone { 100 } else { 0 }, attrs)
@@ -123,6 +124,10 @@ impl AgentState {
                 )
                 .with_context(|| format!("seed route {}", route.prefix))?;
         }
+
+        routes
+            .set_policies(config.routing.policies.clone())
+            .context("apply route policies")?;
 
         let peers = PeerRegistry::from_config(&config)?;
         let policy_path = state_dir.join("policy.json");

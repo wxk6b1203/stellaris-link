@@ -146,6 +146,7 @@ impl ControllerState {
             let via: NodeId = peer.endpoint_id.parse().context("peer endpoint_id")?;
             let mut entry = make_route(network, route.prefix, via, 10, 1);
             entry.attrs.zone = peer.zone.clone();
+            entry.attrs.region = peer.zone.clone();
             routes.push(entry);
         }
         let state_dir = PathBuf::from(&config.node.state_dir);

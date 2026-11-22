@@ -281,6 +281,7 @@ impl LinkStateDb {
                     route.metric = path.metric.saturating_add(prefix.metric);
                     route.attrs = RouteAttributes {
                         zone: lsa.zone.clone(),
+                        region: lsa.zone.clone(),
                         ..Default::default()
                     };
                     out.push(route);

@@ -11,8 +11,8 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use stellaris_fib::{Fib, FibEntry};
 use stellaris_types::{
-    NetworkId, NodeId, PathHint, RouteAttributes, RouteChange, RouteEntry, RouteId, RouteSource,
-    RouteState, Scope, UpsertStatic,
+    Action, Match, NetworkId, NodeId, PathHint, RouteAttributes, RouteChange, RouteEntry, RouteId,
+    RoutePolicy, RouteSource, RouteState, Scope, UpsertStatic,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -92,18 +92,20 @@ pub enum RouteView {
 struct Inner {
     intents: Vec<IntentRecord>,
     routes: Vec<RouteEntry>,
+    policies: Vec<RoutePolicy>,
 }
 
 impl Inner {
     fn rebuild_routes(&mut self, now: time::OffsetDateTime) {
         self.intents
             .retain(|i| i.entry.expires_at.map(|t| t > now).unwrap_or(true));
-        self.routes = self
+        let routes: Vec<RouteEntry> = self
             .intents
             .iter()
             .filter(|i| i.entry.is_active_at(now))
             .map(|i| i.entry.clone())
             .collect();
+        self.routes = apply_policies(routes, &self.policies);
     }
 
     fn rebuild_fib(
@@ -141,6 +143,7 @@ impl RouteEngine {
             inner: RwLock::new(Inner {
                 intents: Vec::new(),
                 routes: Vec::new(),
+                policies: Vec::new(),
             }),
             fib: ArcSwap::from(fib),
             changed: watch::channel(generation).0,
@@ -150,6 +153,18 @@ impl RouteEngine {
     /// Subscribe to generation changes for event-driven reconciliation.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
+    }
+
+    pub fn set_policies(&self, policies: Vec<RoutePolicy>) -> Result<u64, RoutingError> {
+        let now = time::OffsetDateTime::now_utc();
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard.policies = policies;
+        let generation = self.generation() + 1;
+        let fib = guard.rebuild_fib(self.ecmp_max, generation, now);
+        self.generation.store(generation, Ordering::Relaxed);
+        self.fib.store(fib);
+        let _ = self.changed.send(generation);
+        Ok(generation)
     }
 
     pub fn generation(&self) -> u64 {
@@ -238,6 +253,7 @@ impl RouteEngine {
         let mut candidate = Inner {
             intents: guard.intents.clone(),
             routes: Vec::new(),
+            policies: guard.policies.clone(),
         };
         let generation = self.generation() + 1;
         let warnings = apply_change(
@@ -660,6 +676,68 @@ fn apply_change(
     Ok(warnings)
 }
 
+fn apply_policies(routes: Vec<RouteEntry>, policies: &[RoutePolicy]) -> Vec<RouteEntry> {
+    if policies.is_empty() {
+        return routes;
+    }
+    let mut ordered: Vec<&RoutePolicy> = policies.iter().collect();
+    ordered.sort_by_key(|p| p.priority);
+    let mut out = Vec::with_capacity(routes.len());
+    for mut route in routes {
+        let mut denied = false;
+        for policy in &ordered {
+            if !policy_matches(&policy.match_, &route) {
+                continue;
+            }
+            match &policy.action {
+                Action::Deny => {
+                    denied = true;
+                    break;
+                }
+                Action::Accept => break,
+                Action::SetAdminDistance { value } => route.admin_distance = *value,
+                Action::SetLocalPref { value } => route.local_pref = *value,
+                Action::SetMetric { value } => route.metric = *value,
+                Action::SetPathHint { .. } => {}
+                Action::SetWeight { value } => route.weight = *value,
+            }
+        }
+        if !denied {
+            out.push(route);
+        }
+    }
+    out
+}
+
+fn policy_matches(m: &Match, route: &RouteEntry) -> bool {
+    if let Some(prefix) = m.prefix
+        && prefix != route.prefix
+    {
+        return false;
+    }
+    if let Some(peer) = m.peer
+        && peer != route.next_hop
+    {
+        return false;
+    }
+    if let Some(tag) = &m.tag
+        && !route.attrs.tags.iter().any(|t| t == tag)
+    {
+        return false;
+    }
+    if let Some(source) = m.source
+        && source != route.source
+    {
+        return false;
+    }
+    if let Some(region) = &m.region
+        && route.attrs.region.as_deref() != Some(region.as_str())
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +864,38 @@ mod tests {
         assert!(rx.has_changed().unwrap());
         let generation = *rx.borrow_and_update();
         assert_eq!(generation, e.generation());
+    }
+
+    #[test]
+    fn route_policy_can_deny_and_set_local_pref() {
+        let e = engine();
+        let prefix: IpNet = "10.0.0.0/16".parse().unwrap();
+        e.add_static(prefix, peer(2), None, Some(10), None, false, None, "static")
+            .unwrap();
+        e.set_policies(vec![RoutePolicy {
+            id: "deny".into(),
+            priority: 1,
+            match_: Match {
+                prefix: Some(prefix),
+                ..Default::default()
+            },
+            action: Action::Deny,
+        }])
+        .unwrap();
+        assert!(e.lookup("10.0.0.1".parse().unwrap()).is_none());
+
+        e.set_policies(vec![RoutePolicy {
+            id: "pref".into(),
+            priority: 1,
+            match_: Match {
+                prefix: Some(prefix),
+                ..Default::default()
+            },
+            action: Action::SetLocalPref { value: 999 },
+        }])
+        .unwrap();
+        let entry = e.lookup("10.0.0.1".parse().unwrap()).unwrap();
+        assert_eq!(entry.next_hops.len(), 1);
     }
 
     #[test]
