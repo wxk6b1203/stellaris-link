@@ -373,7 +373,13 @@ crates/stellaris-agent/src/controller_model.rs
 - stale LSA/lower epoch 被忽略
 - revoke 清理
 
-它还没有接入 HTTP controller 和 openraft；是 Phase 0 的前置模型。
+它已经作为 **shadow model** 接入 HTTP controller：
+
+- LSA/join/revoke/ack 会同步更新 model
+- `GET /v1/model` 可查看 shadow 状态
+- 尚未替换旧 controller 状态，也尚未接入 openraft
+
+这是 Phase 0 的前置模型。
 
 ## 9. 迁移步骤
 

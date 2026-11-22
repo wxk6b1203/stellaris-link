@@ -29,6 +29,8 @@ use stellaris_types::{
 };
 use uuid::Uuid;
 
+use crate::controller_model::{ControllerCommand, ControllerModel, MemberRecord};
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedMembers {
     #[serde(default)]
@@ -55,6 +57,7 @@ pub struct ControllerState {
     lsas_path: PathBuf,
     previous_secrets: Vec<String>,
     grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
+    model: Arc<RwLock<ControllerModel>>,
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenConfig>>>,
     consumed_join_tokens: Arc<RwLock<HashSet<String>>>,
     strict_membership: bool,
@@ -265,6 +268,17 @@ impl ControllerState {
             || !config.control.join_tokens.is_empty()
             || !grants.is_empty()
             || !consumed.is_empty();
+        let mut model = ControllerModel::new(network, epoch);
+        for (node, grant) in &grants {
+            model.apply(ControllerCommand::UpsertMember {
+                node: *node,
+                member: MemberRecord {
+                    overlay_ip: grant.overlay_ip,
+                    prefixes: grant.prefixes.iter().map(|p| p.to_string()).collect(),
+                    capabilities: grant.capabilities.clone(),
+                },
+            });
+        }
         Ok(Self {
             network,
             secret: config.control.secret.clone(),
@@ -276,6 +290,7 @@ impl ControllerState {
             lsas_path,
             previous_secrets: config.control.previous_secrets.clone(),
             grants: Arc::new(RwLock::new(grants)),
+            model: Arc::new(RwLock::new(model)),
             join_tokens: Arc::new(RwLock::new(join_tokens)),
             consumed_join_tokens: Arc::new(RwLock::new(consumed)),
             strict_membership,
@@ -298,6 +313,10 @@ impl ControllerState {
         let key = SigningKey::from_bytes(&secret);
         self.signer = Some(NodeId::new(key.verifying_key().to_bytes()));
         self.signing_key = Some(Arc::new(key));
+    }
+
+    pub fn model(&self) -> ControllerModel {
+        self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn manifest(&self) -> MembershipManifest {
@@ -379,6 +398,27 @@ impl ControllerState {
             .expire(std::time::Duration::from_secs(30));
         if removed > 0 {
             self.generation.fetch_add(1, Ordering::Relaxed);
+            let live: HashSet<NodeId> = self
+                .link_state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .all()
+                .map(|lsa| lsa.origin)
+                .collect();
+            let mut model = self.model.write().unwrap_or_else(|e| e.into_inner());
+            let expired: Vec<NodeId> = model
+                .lsas
+                .keys()
+                .filter(|node| !live.contains(node))
+                .copied()
+                .collect();
+            for origin in expired {
+                model.apply(ControllerCommand::ExpireLsa {
+                    origin,
+                    up_to_seq: u64::MAX,
+                });
+            }
+            drop(model);
             self.persist_lsas();
         }
     }
@@ -518,6 +558,7 @@ impl ControllerState {
     fn apply_lsa(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
         self.ensure_leader()?;
         self.authorize_lsa(&lsa)?;
+        let model_lsa = lsa.clone();
         let changed = self
             .link_state
             .write()
@@ -525,6 +566,10 @@ impl ControllerState {
             .apply(lsa);
         if changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
+            self.model
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .apply(ControllerCommand::ApplyLsa { lsa: model_lsa });
             self.persist_lsas();
         }
         Ok(changed)
@@ -590,13 +635,23 @@ impl ControllerState {
         let grant = ControllerMemberConfig {
             node_id: node.to_string(),
             overlay_ip: Some(overlay),
-            prefixes: join.prefixes,
-            capabilities: join.capabilities,
+            prefixes: join.prefixes.clone(),
+            capabilities: join.capabilities.clone(),
         };
         self.grants
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(node, grant);
+        self.model.write().unwrap_or_else(|e| e.into_inner()).apply(
+            ControllerCommand::UpsertMember {
+                node,
+                member: MemberRecord {
+                    overlay_ip: Some(overlay),
+                    prefixes: join.prefixes.iter().map(|p| p.to_string()).collect(),
+                    capabilities: join.capabilities.clone(),
+                },
+            },
+        );
         self.persist_members();
         self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -617,6 +672,10 @@ impl ControllerState {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(node);
+        self.model
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(ControllerCommand::RevokeMember { node });
         self.persist_lsas();
         self.acks
             .write()
@@ -660,6 +719,14 @@ impl ControllerState {
             *current = generation;
         }
         drop(acks);
+        self.model
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(ControllerCommand::Ack {
+                node,
+                generation,
+                epoch: self.epoch,
+            });
         self.persist_acks();
         Ok(())
     }
@@ -754,6 +821,7 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/lsa", post(apply_lsa))
         .route("/v1/join", post(join))
         .route("/v1/manifest", get(manifest))
+        .route("/v1/model", get(model))
         .route("/v1/revoke", post(revoke))
         .route("/v1/ack", post(ack))
         .with_state(state)
@@ -794,6 +862,13 @@ async fn snapshot(
         None => None,
     };
     Json(state.snapshot(local)).into_response()
+}
+
+async fn model(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
+    if !state.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(state.model()).into_response()
 }
 
 async fn manifest(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
@@ -1745,6 +1820,29 @@ token = "join"
                 .join(NodeId::new([3u8; 32]), "10.7.0.3".parse().unwrap(), "join")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn model_shadow_tracks_lsa() {
+        let state = state();
+        let node = NodeId::new([1u8; 32]);
+        state
+            .apply_lsa(Lsa {
+                origin: node,
+                seq: 1,
+                zone: None,
+                links: vec![],
+                prefixes: vec![stellaris_linkstate::Prefix {
+                    prefix: "192.168.91.0/24".parse().unwrap(),
+                    metric: 0,
+                }],
+                overlay_ip: Some("10.7.0.1".parse().unwrap()),
+                addrs: vec![],
+            })
+            .unwrap();
+        let model = state.model();
+        assert!(model.lsas.contains_key(&node));
+        assert!(model.generation >= 2);
     }
 
     #[test]
