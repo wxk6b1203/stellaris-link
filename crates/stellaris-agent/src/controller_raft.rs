@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Cursor};
 use std::ops::RangeBounds;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
@@ -37,21 +38,87 @@ pub struct CommandResult {
     pub epoch: u64,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedLog {
+    log: BTreeMap<u64, String>,
+    vote: Option<VoteOf<TypeConfig>>,
+    last_purged: Option<LogIdOf<TypeConfig>>,
+    committed: Option<LogIdOf<TypeConfig>>,
+}
+
 pub struct LogStore {
     log: RwLock<BTreeMap<u64, Vec<u8>>>,
     vote: RwLock<Option<VoteOf<TypeConfig>>>,
     last_purged: RwLock<Option<LogIdOf<TypeConfig>>>,
     committed: RwLock<Option<LogIdOf<TypeConfig>>>,
+    path: Option<PathBuf>,
 }
 
 impl Default for LogStore {
     fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl LogStore {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        let persisted = path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<PersistedLog>(&bytes).ok())
+            .unwrap_or_default();
         Self {
-            log: RwLock::new(BTreeMap::new()),
-            vote: RwLock::new(None),
-            last_purged: RwLock::new(None),
-            committed: RwLock::new(None),
+            log: RwLock::new(
+                persisted
+                    .log
+                    .into_iter()
+                    .map(|(index, bytes)| (index, bytes.into_bytes()))
+                    .collect(),
+            ),
+            vote: RwLock::new(persisted.vote),
+            last_purged: RwLock::new(persisted.last_purged),
+            committed: RwLock::new(persisted.committed),
+            path,
         }
+    }
+
+    async fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let persisted = PersistedLog {
+            log: self
+                .log
+                .read()
+                .await
+                .iter()
+                .map(|(index, bytes)| (*index, String::from_utf8_lossy(bytes).into_owned()))
+                .collect(),
+            vote: *self.vote.read().await,
+            last_purged: *self.last_purged.read().await,
+            committed: *self.committed.read().await,
+        };
+        let bytes = match serde_json::to_vec(&persisted) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize raft log");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, "create raft log dir");
+            return;
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+            tracing::warn!(error = %e, "persist raft log");
+        }
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.log.read().await.is_empty()
     }
 }
 
@@ -103,6 +170,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
 
     async fn save_vote(&mut self, vote: &VoteOf<TypeConfig>) -> Result<(), io::Error> {
         *self.vote.write().await = Some(*vote);
+        self.persist().await;
         Ok(())
     }
 
@@ -111,6 +179,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
         committed: Option<LogIdOf<TypeConfig>>,
     ) -> Result<(), io::Error> {
         *self.committed.write().await = committed;
+        self.persist().await;
         Ok(())
     }
 
@@ -132,6 +201,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
             log.insert(entry.index(), bytes);
         }
         drop(log);
+        self.persist().await;
         callback.io_completed(Ok(()));
         Ok(())
     }
@@ -146,6 +216,8 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
         for key in keys {
             log.remove(&key);
         }
+        drop(log);
+        self.persist().await;
         Ok(())
     }
 
@@ -156,6 +228,8 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
         for key in keys {
             log.remove(&key);
         }
+        drop(log);
+        self.persist().await;
         Ok(())
     }
 }
@@ -166,8 +240,10 @@ type SnapshotState = (SnapshotMetaOf<TypeConfig>, Vec<u8>);
 pub struct StateMachineStore {
     inner: Arc<RwLock<StateMachineData>>,
     snapshot: Arc<RwLock<Option<SnapshotState>>>,
+    path: Option<PathBuf>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct StateMachineData {
     model: ControllerModel,
     last_applied: Option<LogIdOf<TypeConfig>>,
@@ -175,14 +251,47 @@ struct StateMachineData {
 }
 
 impl StateMachineStore {
-    pub fn new(model: ControllerModel) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(StateMachineData {
+    pub fn new(model: ControllerModel, path: Option<PathBuf>) -> Self {
+        let data = path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<StateMachineData>(&bytes).ok())
+            .unwrap_or_else(|| StateMachineData {
                 model,
                 last_applied: None,
                 last_membership: StoredMembershipOf::<TypeConfig>::default(),
-            })),
+            });
+        Self {
+            inner: Arc::new(RwLock::new(data)),
             snapshot: Arc::new(RwLock::new(None)),
+            path,
+        }
+    }
+
+    async fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let data = {
+            let inner = self.inner.read().await;
+            serde_json::to_vec(&*inner)
+        };
+        let bytes = match data {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize controller raft state");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, "create raft state dir");
+            return;
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+            tracing::warn!(error = %e, "persist controller raft state");
         }
     }
 
@@ -258,6 +367,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 responder.send(response);
             }
         }
+        self.persist().await;
         Ok(())
     }
 
@@ -282,6 +392,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         inner.last_membership = meta.last_membership.clone();
         drop(inner);
         *self.snapshot.write().await = Some((meta.clone(), snapshot.into_inner()));
+        self.persist().await;
         Ok(())
     }
 
@@ -365,13 +476,28 @@ pub struct SingleNode {
 }
 
 pub async fn start_single(model: ControllerModel) -> anyhow::Result<SingleNode> {
+    start_single_at(model, None).await
+}
+
+pub async fn start_single_on_disk(
+    model: ControllerModel,
+    dir: &Path,
+) -> anyhow::Result<SingleNode> {
+    std::fs::create_dir_all(dir)?;
+    start_single_at(model, Some(dir)).await
+}
+
+async fn start_single_at(model: ControllerModel, dir: Option<&Path>) -> anyhow::Result<SingleNode> {
     let config = Arc::new(openraft::Config::default().validate()?);
-    let log = Arc::new(LogStore::default());
-    let store = StateMachineStore::new(model);
+    let log = Arc::new(LogStore::new(dir.map(|d| d.join("raft-log.json"))));
+    let fresh = log.is_empty().await;
+    let store = StateMachineStore::new(model, dir.map(|d| d.join("raft-state.json")));
     let raft = Raft::new(1, config, NetworkFactory, log, store.clone()).await?;
-    let mut members = BTreeMap::new();
-    members.insert(1u64, BasicNode::new("single"));
-    raft.initialize(members).await?;
+    if fresh {
+        let mut members = BTreeMap::new();
+        members.insert(1u64, BasicNode::new("single"));
+        raft.initialize(members).await?;
+    }
     Ok(SingleNode { raft, store })
 }
 
@@ -379,6 +505,44 @@ pub async fn start_single(model: ControllerModel) -> anyhow::Result<SingleNode> 
 mod tests {
     use super::*;
     use stellaris_types::{NetworkId, NodeId};
+
+    #[tokio::test]
+    async fn single_node_raft_recovers_from_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-raft-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node_id = NodeId::new([1u8; 32]);
+        let lsa = stellaris_linkstate::Lsa {
+            origin: node_id,
+            seq: 1,
+            zone: None,
+            links: vec![],
+            prefixes: vec![stellaris_linkstate::Prefix {
+                prefix: "192.168.94.0/24".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.1".parse().unwrap()),
+            addrs: vec![],
+        };
+        let first = start_single_on_disk(ControllerModel::new(NetworkId::new(), 1), &dir)
+            .await
+            .unwrap();
+        first
+            .raft
+            .client_write(ControllerCommand::ApplyLsa { lsa })
+            .await
+            .unwrap();
+        assert!(first.store.model().await.lsas.contains_key(&node_id));
+        first.raft.shutdown().await.unwrap();
+        drop(first);
+
+        let second = start_single_on_disk(ControllerModel::new(NetworkId::new(), 1), &dir)
+            .await
+            .unwrap();
+        assert!(second.store.model().await.lsas.contains_key(&node_id));
+        second.raft.shutdown().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn single_node_raft_applies_command() {

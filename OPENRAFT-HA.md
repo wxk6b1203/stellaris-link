@@ -400,10 +400,30 @@ crates/stellaris-agent/src/controller_raft.rs
 
 当前限制：
 
-- log/vote/snapshot 是内存实现，不是生产持久化存储
+- log/vote/state 可落盘到 `raft-log.json` / `raft-state.json`（单节点测试通过）
+- snapshot 数据仍主要从 state machine 重建；生产级 snapshot 文件/校验待做
 - `RaftNetworkV2` 是 placeholder，只用于单节点
 - 尚未接入 HTTP controller
 - 尚未实现 3 controller bootstrap/membership
+
+### H1 持久化验证
+
+新增：
+
+```rust
+start_single_on_disk(model, dir)
+```
+
+测试：
+
+```text
+single_node_raft_recovers_from_disk
+```
+
+- 写入 LSA
+- shutdown
+- 同目录重启
+- state machine 从磁盘恢复 LSA
 
 ## 9. 迁移步骤
 
