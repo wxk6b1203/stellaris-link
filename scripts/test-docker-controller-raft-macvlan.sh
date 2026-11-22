@@ -88,7 +88,7 @@ PY
 req -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' -d "$LSA" "http://${IPS[$((L-1))]}:4790$L/v1/lsa" >/dev/null
 sleep 1
 req -H "x-stellaris-secret: $SECRET" "http://${IPS[$((L-1))]}:4790$L/v1/snapshot?node=$NODE" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("snapshot ok")'
-docker rm -f "ctrl$L" >/dev/null
+docker network disconnect "$NET" "ctrl$L" >/dev/null
 for _ in $(seq 1 100); do
   for i in 1 2 3; do
     [[ "$i" == "$L" ]] && continue
@@ -108,4 +108,21 @@ PY
 req -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' -d "$LSA2" "http://${IPS[$((NL-1))]}:4790$NL/v1/lsa" >/dev/null
 sleep 1
 req -H "x-stellaris-secret: $SECRET" "http://${IPS[$((NL-1))]}:4790$NL/v1/snapshot?node=$NODE" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("failover snapshot ok")'
-echo "OK: 3 macvlan controller raft join/LSA/snapshot/failover works."
+# reconnect the old leader, then verify it rejoined as a follower and caught up.
+docker network connect --ip "${IPS[$((L-1))]}" "$NET" "ctrl$L"
+for _ in $(seq 1 100); do
+  if status "${IPS[$((L-1))]}" "$L" >/dev/null 2>&1; then
+    OLD_LEADER=$(status "${IPS[$((L-1))]}" "$L" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("leader") or "")')
+    [[ "$OLD_LEADER" == "$NL" ]] && break
+  fi
+  sleep 0.2
+done
+[[ "${OLD_LEADER:-}" == "$NL" ]] || { echo "FAIL: old leader did not rejoin (leader=${OLD_LEADER:-none})" >&2; exit 1; }
+for _ in $(seq 1 100); do
+  SEQ=$(req -H "x-stellaris-secret: $SECRET" "http://${IPS[$((L-1))]}:4790$L/v1/model" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("lsas",{}).get("0101010101010101010101010101010101010101010101010101010101010101",{}).get("seq",0))' 2>/dev/null || echo 0)
+  [[ "$SEQ" == "2" ]] && break
+  sleep 0.2
+done
+[[ "$SEQ" == "2" ]] || { echo "FAIL: old leader did not catch up seq=2 (seq=$SEQ)" >&2; exit 1; }
+echo "partition recovery ok"
+echo "OK: 3 macvlan controller raft join/LSA/snapshot/failover/partition-recovery works."
