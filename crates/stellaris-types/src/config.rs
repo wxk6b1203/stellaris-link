@@ -210,6 +210,10 @@ pub struct TransportConfig {
     /// Underlay addresses advertised via LSA for auto-discovery.
     #[serde(default)]
     pub advertise: Vec<SocketAddr>,
+    /// Bind iroh UDP to this underlay IP (None = 0.0.0.0).
+    /// Set this to avoid iroh using the TUN/overlay address as a direct path.
+    #[serde(default)]
+    pub bind_ip: Option<IpAddr>,
     /// UDP broadcast bootstrap discovery port (None = disabled).
     #[serde(default)]
     pub discovery_port: Option<u16>,
@@ -226,6 +230,7 @@ impl Default for TransportConfig {
             disable_relay: false,
             listen_port: None,
             advertise: Vec::new(),
+            bind_ip: None,
             discovery_port: None,
             discovery_broadcast: None,
         }

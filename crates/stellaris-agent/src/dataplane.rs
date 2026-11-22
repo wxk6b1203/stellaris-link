@@ -300,13 +300,17 @@ async fn egress_worker(
                     }
                 } else {
                     while let Some(frame) = queue.pop() {
-                        let _ = transport.send(frame.next, frame.frame).await;
+                        if let Err(e) = transport.send(frame.next, frame.frame).await {
+                    debug!(peer = %frame.next.short(), error = %e, "egress send failed");
+                }
                     }
                     break;
                 }
             }
             Some(frame) = async { queue.pop() } => {
-                let _ = transport.send(frame.next, frame.frame).await;
+                if let Err(e) = transport.send(frame.next, frame.frame).await {
+                    debug!(peer = %frame.next.short(), error = %e, "egress send failed");
+                }
             }
         }
     }

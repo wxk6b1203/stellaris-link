@@ -44,6 +44,7 @@ pub struct IrohTransport {
     inbound_tx: mpsc::Sender<InboundPacket>,
     control_tx: Option<mpsc::Sender<ControlEvent>>,
     conns: Arc<RwLock<HashMap<NodeId, iroh::endpoint::Connection>>>,
+    conn_ids: Arc<RwLock<HashMap<NodeId, usize>>>,
 }
 
 impl IrohTransport {
@@ -60,7 +61,11 @@ impl IrohTransport {
             .secret_key(secret)
             .alpns(vec![DATA_ALPN.to_vec()]);
         if let Some(port) = config.transport.listen_port {
-            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+            let ip = config
+                .transport
+                .bind_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            let addr = std::net::SocketAddr::new(ip, port);
             builder = builder
                 .bind_addr(addr)
                 .with_context(|| format!("bind_addr {addr}"))?;
@@ -94,6 +99,7 @@ impl IrohTransport {
             inbound_tx: inbound_tx.clone(),
             control_tx: control_tx.clone(),
             conns: Arc::new(RwLock::new(HashMap::new())),
+            conn_ids: Arc::new(RwLock::new(HashMap::new())),
         });
 
         // Accept loop: authenticated iroh connection -> peer reader.
@@ -238,13 +244,34 @@ impl IrohTransport {
     }
 
     fn insert_conn(&self, node: NodeId, conn: iroh::endpoint::Connection) {
-        let mut guard = self.conns.write().unwrap_or_else(|e| e.into_inner());
-        guard.insert(node, conn);
+        let stable_id = conn.stable_id();
+        self.conns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(node, conn);
+        self.conn_ids
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(node, stable_id);
     }
 
-    fn remove_conn(&self, node: &NodeId) {
-        let mut guard = self.conns.write().unwrap_or_else(|e| e.into_inner());
-        guard.remove(node);
+    fn remove_conn_if(&self, node: NodeId, stable_id: usize) {
+        let current = self
+            .conn_ids
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .copied();
+        if current == Some(stable_id) {
+            self.conns
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&node);
+            self.conn_ids
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&node);
+        }
     }
 }
 
@@ -393,8 +420,9 @@ async fn connect_loop(
                         let _ = tx.send(ControlEvent::Down { node }).await;
                     }
                 });
+                let stable_id = conn.stable_id();
                 conn.closed().await;
-                transport.remove_conn(&node);
+                transport.remove_conn_if(node, stable_id);
                 transport.peers.mark(&node, false, None, None);
                 if let Some(tx) = &control_tx {
                     let _ = tx.send(ControlEvent::Down { node }).await;
