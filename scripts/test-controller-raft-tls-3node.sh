@@ -14,7 +14,7 @@ openssl req -newkey rsa:2048 -nodes -keyout "$TMP/server-key.pem" -out "$TMP/ser
 cat > "$TMP/server.ext" <<'EXT'
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
+extendedKeyUsage=serverAuth,clientAuth
 subjectAltName=IP:127.0.0.1,DNS:localhost
 EXT
 openssl x509 -req -in "$TMP/server.csr" -CA "$TMP/ca.pem" -CAkey "$TMP/ca-key.pem" \
@@ -46,6 +46,9 @@ raft_bootstrap = $BOOT
 raft_tls_cert = "$TMP/server.pem"
 raft_tls_key = "$TMP/server-key.pem"
 raft_tls_ca = "$TMP/ca.pem"
+raft_tls_client_cert = "$TMP/server.pem"
+raft_tls_client_key = "$TMP/server-key.pem"
+raft_tls_require_client_cert = true
 
 [[control.raft_peers]]
 id = 1

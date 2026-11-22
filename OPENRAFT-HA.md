@@ -546,6 +546,7 @@ cargo build -p stellaris-agent --bin stellaris-controller
 - 3 controller 进程
 - HTTPS Raft `/raft/append` / `/raft/vote` / `/raft/snapshot`
 - CA 校验
+- mTLS client certificate
 - shared secret
 - join/LSA/snapshot
 

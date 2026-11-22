@@ -129,6 +129,14 @@ pub struct ControlConfig {
     /// Development only: accept invalid Raft peer certificates.
     #[serde(default)]
     pub raft_tls_insecure: bool,
+    /// Client certificate/key for Raft mTLS.
+    #[serde(default)]
+    pub raft_tls_client_cert: Option<String>,
+    #[serde(default)]
+    pub raft_tls_client_key: Option<String>,
+    /// Require client certificates on the Raft HTTPS server.
+    #[serde(default)]
+    pub raft_tls_require_client_cert: bool,
     /// Membership manifest lifetime in seconds.
     #[serde(default = "default_manifest_ttl")]
     pub manifest_ttl_secs: u64,
@@ -196,6 +204,9 @@ impl Default for ControlConfig {
             raft_tls_key: None,
             raft_tls_ca: None,
             raft_tls_insecure: false,
+            raft_tls_client_cert: None,
+            raft_tls_client_key: None,
+            raft_tls_require_client_cert: false,
             manifest_ttl_secs: default_manifest_ttl(),
             controller_keys: Vec::new(),
             controller_threshold: 1,

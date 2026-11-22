@@ -1407,6 +1407,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 key: PathBuf::from(key),
                 ca: config.control.raft_tls_ca.clone().map(PathBuf::from),
                 insecure: config.control.raft_tls_insecure,
+                client_cert: config
+                    .control
+                    .raft_tls_client_cert
+                    .clone()
+                    .map(PathBuf::from),
+                client_key: config
+                    .control
+                    .raft_tls_client_key
+                    .clone()
+                    .map(PathBuf::from),
+                require_client_cert: config.control.raft_tls_require_client_cert,
             });
         let node = if let Some(tls) = tls {
             crate::controller_raft::start_http_node_tls(

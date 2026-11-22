@@ -49,6 +49,9 @@ pub struct RaftTlsConfig {
     pub key: PathBuf,
     pub ca: Option<PathBuf>,
     pub insecure: bool,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+    pub require_client_cert: bool,
 }
 
 fn http_client(tls: Option<&RaftTlsConfig>) -> anyhow::Result<reqwest::Client> {
@@ -59,6 +62,11 @@ fn http_client(tls: Option<&RaftTlsConfig>) -> anyhow::Result<reqwest::Client> {
         } else if let Some(ca) = &tls.ca {
             let pem = std::fs::read(ca)?;
             builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
+        }
+        if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
+            let mut identity = std::fs::read(cert)?;
+            identity.extend_from_slice(&std::fs::read(key)?);
+            builder = builder.identity(reqwest::Identity::from_pem(&identity)?);
         }
     }
     Ok(builder.build()?)
@@ -976,6 +984,41 @@ pub async fn start_http_node_with_snapshot_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn raft_server_config(
+    tls: &RaftTlsConfig,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    if !tls.require_client_cert {
+        return Ok(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key).await?,
+        );
+    }
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::BufReader;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(&tls.cert)?))
+            .collect::<Result<_, _>>()?;
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut BufReader::new(std::fs::File::open(&tls.key)?))?
+            .ok_or_else(|| anyhow::anyhow!("no private key in {}", tls.key.display()))?;
+    let ca = tls
+        .ca
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("mTLS requires raft_tls_ca"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(ca)?)) {
+        roots.add(cert?)?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+    let server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?;
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(server_config),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn start_http_node_at(
     model: ControllerModel,
     id: u64,
@@ -1010,8 +1053,7 @@ async fn start_http_node_at(
     let raft = Raft::new(id, config, factory, log, store.clone()).await?;
     let app = raft_router(raft.clone(), secret);
     let server = if let Some(tls) = tls {
-        let config =
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key).await?;
+        let config = raft_server_config(&tls).await?;
         let listener = listener.into_std()?;
         tokio::spawn(async move {
             if let Ok(server) = axum_server::from_tcp_rustls(listener, config) {
