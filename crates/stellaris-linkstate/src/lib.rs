@@ -181,6 +181,12 @@ impl LinkStateDb {
             return HashMap::new();
         };
         let mut out = HashMap::new();
+        let mut neighbor_dists: HashMap<NodeId, HashMap<NodeId, u32>> = HashMap::new();
+        for link in &local_lsa.links {
+            neighbor_dists
+                .entry(link.to)
+                .or_insert_with(|| self.distances(link.to));
+        }
         for (dest, metric) in &dist {
             if *dest == local {
                 continue;
@@ -188,10 +194,10 @@ impl LinkStateDb {
             let mut vias = HashSet::new();
             for link in &local_lsa.links {
                 let direct = link.to == *dest && link.metric == *metric;
-                let via_neighbor = link.metric < *metric
-                    && dist
-                        .get(&link.to)
-                        .is_some_and(|d| d.saturating_add(link.metric) == *metric);
+                let via_neighbor = neighbor_dists
+                    .get(&link.to)
+                    .and_then(|d| d.get(dest))
+                    .is_some_and(|d| link.metric.saturating_add(*d) == *metric);
                 if direct || via_neighbor {
                     vias.insert(link.to);
                 }
@@ -380,6 +386,26 @@ mod tests {
     }
 
     #[test]
+    fn route_fails_over_when_primary_path_withdraws() {
+        let mut db = LinkStateDb::new();
+        db.apply(lsa(1, 1, &[(2, 1), (3, 2)], &[]));
+        db.apply(lsa(2, 1, &[(1, 1), (4, 1)], &[]));
+        db.apply(lsa(3, 1, &[(1, 2), (4, 1)], &[]));
+        db.apply(lsa(4, 1, &[(2, 1), (3, 1)], &["192.168.50.0/24"]));
+        let primary = db.compute_routes(node(1), net());
+        assert_eq!(primary[0].next_hop, node(2));
+
+        // Withdraw B's links; D remains reachable via C.
+        db.apply(lsa(2, 2, &[], &[]));
+        let failover = db.compute_routes(node(1), net());
+        let route = failover
+            .iter()
+            .find(|r| r.prefix.to_string() == "192.168.50.0/24")
+            .unwrap();
+        assert_eq!(route.next_hop, node(3));
+    }
+
+    #[test]
     fn expired_lsa_is_removed() {
         let mut db = LinkStateDb::new();
         db.apply(lsa(1, 1, &[(2, 1)], &["10.0.0.1/32"]));
@@ -399,7 +425,7 @@ mod tests {
     fn equal_cost_paths_are_ecmp() {
         let mut db = LinkStateDb::new();
         db.apply(lsa(1, 1, &[(2, 1), (3, 2)], &[]));
-        db.apply(lsa(2, 1, &[(1, 1), (3, 2)], &[]));
+        db.apply(lsa(2, 1, &[(1, 1), (3, 1)], &[]));
         db.apply(lsa(3, 1, &[(1, 2), (2, 2)], &["10.0.0.3/32"]));
         let paths = db.shortest_paths_ecmp(node(1));
         let hops = paths.get(&node(3)).unwrap();
