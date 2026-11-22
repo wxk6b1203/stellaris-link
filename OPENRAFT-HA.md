@@ -454,7 +454,8 @@ three_node_raft_over_http
 - raft log/state 使用 fsync + atomic rename
 - 大 snapshot 分块上传：`/raft/snapshot/begin` + `/chunk` + `/finish`（单块 2 MiB）
 - 已用 >4 MiB snapshot 覆盖 begin/chunk/finish 装配路径
-- 断点恢复仍未测试
+- chunk 带 offset，重复/重叠 chunk 幂等；断点续传可重试
+- 断点恢复的完整客户端测试仍未做
 - controller 支持 `control.raft_dir` 启用单节点 Raft
 - `/v1/lsa` 在 Raft 模式走 `client_write`
 - `/v1/snapshot` / `/v1/model` 从 Raft state machine 生成

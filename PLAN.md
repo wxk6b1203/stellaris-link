@@ -62,7 +62,7 @@
 - [x] IPv4/IPv6 分片解析与稳定 flow hash。
 - [x] 超大包 ICMPv4 Fragmentation Needed / ICMPv6 Packet Too Big。
 - [x] per-priority egress queue depth + queue drop counter。
-- [x] Raft 大 snapshot 分块上传（2 MiB chunk，512 MiB 上限；>4 MiB 装配测试）。
+- [x] Raft 大 snapshot 分块上传（2 MiB chunk，512 MiB 上限；offset/idempotent retry；>4 MiB 装配测试）。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。

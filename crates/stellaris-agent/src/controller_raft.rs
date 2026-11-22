@@ -787,17 +787,48 @@ async fn raft_snapshot_chunk(
             "missing transfer id".into(),
         ));
     };
+    let offset = headers
+        .get("x-raft-offset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .ok_or((
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing/invalid offset".into(),
+        ))?;
     let mut assemblies = state.assemblies.0.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pending) = assemblies.get_mut(id) else {
         return Err((axum::http::StatusCode::NOT_FOUND, "unknown transfer".into()));
     };
-    if pending.data.len() + body.len() > pending.total {
+    if offset > pending.data.len() {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "gap in snapshot transfer".into(),
+        ));
+    }
+    if offset + body.len() > pending.total {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "snapshot overflow".into(),
         ));
     }
-    pending.data.extend_from_slice(&body);
+    if offset + body.len() <= pending.data.len() {
+        if pending.data[offset..offset + body.len()] != body[..] {
+            return Err((axum::http::StatusCode::CONFLICT, "chunk mismatch".into()));
+        }
+        return Ok(axum::http::StatusCode::ACCEPTED);
+    }
+    if offset < pending.data.len() {
+        let overlap = pending.data.len() - offset;
+        if pending.data[offset..] != body[..overlap] {
+            return Err((
+                axum::http::StatusCode::CONFLICT,
+                "chunk overlap mismatch".into(),
+            ));
+        }
+        pending.data.extend_from_slice(&body[overlap..]);
+    } else {
+        pending.data.extend_from_slice(&body);
+    }
     Ok(axum::http::StatusCode::ACCEPTED)
 }
 
@@ -1547,6 +1578,18 @@ mod tests {
             .post(format!("http://{}/raft/snapshot/chunk", node.address))
             .header(RAFT_SECRET_HEADER, "secret")
             .header("x-raft-transfer", &id)
+            .header("x-raft-offset", "0")
+            .body(vec![1, 2, 3, 4, 5])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        // Retrying the same offset is idempotent.
+        let response = client
+            .post(format!("http://{}/raft/snapshot/chunk", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .header("x-raft-offset", "0")
             .body(vec![1, 2, 3, 4, 5])
             .send()
             .await
@@ -1623,11 +1666,12 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        for chunk in data.chunks(2 * 1024 * 1024) {
+        for (offset, chunk) in data.chunks(2 * 1024 * 1024).enumerate() {
             let response = client
                 .post(format!("http://{}/raft/snapshot/chunk", node.address))
                 .header(RAFT_SECRET_HEADER, "secret")
                 .header("x-raft-transfer", &id)
+                .header("x-raft-offset", (offset * 2 * 1024 * 1024).to_string())
                 .body(chunk.to_vec())
                 .send()
                 .await
