@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use ipnet::IpNet;
 use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, endpoint::presets};
@@ -22,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
 use stellaris_linkstate::{LinkStateDb, Lsa};
-use stellaris_types::{Config, NetworkId, NodeId, RouteEntry, RouteId, RouteSource, RouteState};
+use stellaris_types::{
+    Config, ControllerMemberConfig, NetworkId, NodeId, RouteEntry, RouteId, RouteSource, RouteState,
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -33,6 +36,9 @@ pub struct ControllerState {
     link_state: Arc<RwLock<LinkStateDb>>,
     acks: Arc<RwLock<HashMap<NodeId, u64>>>,
     acks_path: PathBuf,
+    grants: Arc<HashMap<NodeId, ControllerMemberConfig>>,
+    signing_key: Option<Arc<SigningKey>>,
+    signer: Option<NodeId>,
     pub epoch: u64,
     generation: Arc<AtomicU64>,
 }
@@ -44,9 +50,15 @@ pub struct Snapshot {
     pub generation: u64,
     pub members: Vec<MemberView>,
     pub routes: Vec<RouteEntry>,
+    /// Controller NodeId when the snapshot is Ed25519-signed.
+    #[serde(default)]
+    pub signer: Option<String>,
     /// HMAC-SHA256 over the snapshot payload when control.secret is set.
     #[serde(default)]
     pub signature: Option<String>,
+    /// Ed25519 signature by the controller identity.
+    #[serde(default)]
+    pub ed25519_signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,7 +81,25 @@ struct SnapshotPayload<'a> {
     routes: &'a [RouteEntry],
 }
 
-/// Sign a snapshot. Kept public so members and tests use identical canonical bytes.
+/// Canonical snapshot payload bytes used by HMAC and Ed25519 signatures.
+pub fn snapshot_payload_bytes(
+    network_id: &str,
+    epoch: u64,
+    generation: u64,
+    members: &[MemberView],
+    routes: &[RouteEntry],
+) -> Vec<u8> {
+    let payload = SnapshotPayload {
+        network_id,
+        epoch,
+        generation,
+        members,
+        routes,
+    };
+    serde_json::to_vec(&payload).unwrap_or_default()
+}
+
+/// Sign a snapshot with the legacy shared HMAC secret.
 #[allow(clippy::too_many_arguments)]
 pub fn snapshot_signature(
     secret: &str,
@@ -79,17 +109,18 @@ pub fn snapshot_signature(
     members: &[MemberView],
     routes: &[RouteEntry],
 ) -> String {
-    let payload = SnapshotPayload {
-        network_id,
-        epoch,
-        generation,
-        members,
-        routes,
-    };
-    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let bytes = snapshot_payload_bytes(network_id, epoch, generation, members, routes);
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
     mac.update(&bytes);
     hex::encode(mac.finalize().into_bytes())
+}
+
+pub fn verify_ed25519(signer: NodeId, payload: &[u8], signature: &str) -> anyhow::Result<()> {
+    let key = VerifyingKey::from_bytes(signer.as_bytes())?;
+    let bytes = hex::decode(signature)?;
+    let sig = Signature::from_slice(&bytes)?;
+    key.verify(payload, &sig)?;
+    Ok(())
 }
 
 impl ControllerState {
@@ -117,6 +148,14 @@ impl ControllerState {
         let acks_path = state_dir.join("controller-acks.json");
         let acks = load_acks(&acks_path);
         let epoch = config.control.epoch.unwrap_or_else(now_epoch);
+        let mut grants = HashMap::new();
+        for member in &config.control.members {
+            let node: NodeId = member
+                .node_id
+                .parse()
+                .context("controller member node_id")?;
+            grants.insert(node, member.clone());
+        }
         Ok(Self {
             network,
             secret: config.control.secret.clone(),
@@ -124,9 +163,18 @@ impl ControllerState {
             link_state: Arc::new(RwLock::new(LinkStateDb::new())),
             acks: Arc::new(RwLock::new(acks)),
             acks_path,
+            grants: Arc::new(grants),
+            signing_key: None,
+            signer: None,
             epoch,
             generation: Arc::new(AtomicU64::new(1)),
         })
+    }
+
+    pub fn set_signing_key(&mut self, secret: [u8; 32]) {
+        let key = SigningKey::from_bytes(&secret);
+        self.signer = Some(NodeId::new(key.verifying_key().to_bytes()));
+        self.signing_key = Some(Arc::new(key));
     }
 
     pub fn snapshot(&self, local: Option<NodeId>) -> Snapshot {
@@ -153,13 +201,20 @@ impl ControllerState {
                 &routes,
             )
         });
+        let ed25519_signature = self.signing_key.as_ref().map(|key| {
+            let bytes =
+                snapshot_payload_bytes(&network_id, self.epoch, generation, &members, &routes);
+            hex::encode(key.sign(&bytes).to_bytes())
+        });
         Snapshot {
             network_id,
             epoch: self.epoch,
             generation,
             members,
             routes,
+            signer: self.signer.map(|n| n.to_string()),
             signature,
+            ed25519_signature,
         }
     }
 
@@ -207,7 +262,8 @@ impl ControllerState {
         }
     }
 
-    fn apply_lsa(&self, lsa: Lsa) -> bool {
+    fn apply_lsa(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
+        self.authorize_lsa(&lsa)?;
         let changed = self
             .link_state
             .write()
@@ -216,7 +272,41 @@ impl ControllerState {
         if changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
-        changed
+        Ok(changed)
+    }
+
+    fn authorize_lsa(&self, lsa: &Lsa) -> Result<(), (u16, String)> {
+        if self.grants.is_empty() {
+            return Ok(());
+        }
+        let Some(grant) = self.grants.get(&lsa.origin) else {
+            return Err((403, format!("member {} is not authorized", lsa.origin)));
+        };
+        if let Some(expected) = grant.overlay_ip
+            && lsa.overlay_ip != Some(expected)
+        {
+            return Err((403, "LSA overlay_ip does not match member grant".into()));
+        }
+        for prefix in &lsa.prefixes {
+            let own = grant
+                .overlay_ip
+                .is_some_and(|ip| ipnet::IpNet::new(ip, 32).is_ok_and(|p| p == prefix.prefix));
+            if !own && !grant.prefixes.contains(&prefix.prefix) {
+                return Err((
+                    403,
+                    format!(
+                        "prefix {} is not authorized for {}",
+                        prefix.prefix, lsa.origin
+                    ),
+                ));
+            }
+        }
+        for link in &lsa.links {
+            if !self.grants.contains_key(&link.to) {
+                return Err((403, format!("link target {} is not authorized", link.to)));
+            }
+        }
+        Ok(())
     }
 
     fn authorized(&self, headers: &HeaderMap) -> bool {
@@ -359,13 +449,19 @@ async fn apply_lsa(
     if !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let changed = state.apply_lsa(lsa);
-    Json(json!({
-        "changed": changed,
-        "generation": state.generation.load(Ordering::Relaxed),
-        "lsas": state.link_state.read().unwrap_or_else(|e| e.into_inner()).len(),
-    }))
-    .into_response()
+    match state.apply_lsa(lsa) {
+        Ok(changed) => Json(json!({
+            "changed": changed,
+            "generation": state.generation.load(Ordering::Relaxed),
+            "lsas": state.link_state.read().unwrap_or_else(|e| e.into_inner()).len(),
+        }))
+        .into_response(),
+        Err((code, message)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+            message,
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -432,7 +528,11 @@ async fn add_route(
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    let state = ControllerState::from_config(&config)?;
+    let mut state = ControllerState::from_config(&config)?;
+    let state_dir = PathBuf::from(&config.node.state_dir);
+    std::fs::create_dir_all(&state_dir)?;
+    let identity = crate::identity::load_or_create(&state_dir)?;
+    state.set_signing_key(identity.secret);
     if config.control.iroh_port.is_some() {
         let state = state.clone();
         let config = config.clone();
@@ -563,11 +663,13 @@ fn dispatch_control(
                     message: "unauthorized".into(),
                 };
             }
-            let changed = state.apply_lsa(lsa);
-            Response::Ok {
-                changed,
-                generation: state.generation.load(Ordering::Relaxed),
-                epoch: state.epoch,
+            match state.apply_lsa(lsa) {
+                Ok(changed) => Response::Ok {
+                    changed,
+                    generation: state.generation.load(Ordering::Relaxed),
+                    epoch: state.epoch,
+                },
+                Err((code, message)) => Response::Error { code, message },
             }
         }
         Request::Ack {
@@ -786,35 +888,121 @@ bind = "127.0.0.1:0"
     }
 
     #[test]
-    fn link_state_snapshot_computes_routes() {
-        let state = state();
-        let a = stellaris_types::NodeId::new([1u8; 32]);
-        let b = stellaris_types::NodeId::new([2u8; 32]);
-        state.apply_lsa(Lsa {
-            origin: a,
+    fn ed25519_snapshot_is_verifiable() {
+        let mut state = state();
+        state.set_signing_key([7u8; 32]);
+        let snapshot = state.snapshot(None);
+        let signer: NodeId = snapshot.signer.as_deref().unwrap().parse().unwrap();
+        let payload = snapshot_payload_bytes(
+            &snapshot.network_id,
+            snapshot.epoch,
+            snapshot.generation,
+            &snapshot.members,
+            &snapshot.routes,
+        );
+        verify_ed25519(
+            signer,
+            &payload,
+            snapshot.ed25519_signature.as_deref().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unauthorized_lsa_is_rejected() {
+        let toml = r#"
+[node]
+name = "ctrl"
+role = "controller"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+epoch = 1
+
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.7.0.1"
+prefixes = ["192.168.50.0/24"]
+"#;
+        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+        let unknown = Lsa {
+            origin: NodeId::new([2u8; 32]),
             seq: 1,
-            zone: Some("az-a".into()),
-            links: vec![stellaris_linkstate::Link {
-                to: b,
-                metric: 1,
-                zone: Some("az-a".into()),
-            }],
+            zone: None,
+            links: vec![],
             prefixes: vec![],
             overlay_ip: None,
-            addrs: Vec::new(),
-        });
-        state.apply_lsa(Lsa {
-            origin: b,
+            addrs: vec![],
+        };
+        assert!(state.apply_lsa(unknown).is_err());
+
+        let allowed = Lsa {
+            origin: NodeId::new([1u8; 32]),
             seq: 1,
-            zone: Some("az-a".into()),
+            zone: None,
             links: vec![],
             prefixes: vec![stellaris_linkstate::Prefix {
                 prefix: "192.168.50.0/24".parse().unwrap(),
                 metric: 0,
             }],
-            overlay_ip: None,
-            addrs: Vec::new(),
-        });
+            overlay_ip: Some("10.7.0.1".parse().unwrap()),
+            addrs: vec![],
+        };
+        assert!(state.apply_lsa(allowed).unwrap());
+
+        let bad_prefix = Lsa {
+            origin: NodeId::new([1u8; 32]),
+            seq: 2,
+            zone: None,
+            links: vec![],
+            prefixes: vec![stellaris_linkstate::Prefix {
+                prefix: "0.0.0.0/0".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.1".parse().unwrap()),
+            addrs: vec![],
+        };
+        assert!(state.apply_lsa(bad_prefix).is_err());
+    }
+
+    #[test]
+    fn link_state_snapshot_computes_routes() {
+        let state = state();
+        let a = stellaris_types::NodeId::new([1u8; 32]);
+        let b = stellaris_types::NodeId::new([2u8; 32]);
+        state
+            .apply_lsa(Lsa {
+                origin: a,
+                seq: 1,
+                zone: Some("az-a".into()),
+                links: vec![stellaris_linkstate::Link {
+                    to: b,
+                    metric: 1,
+                    zone: Some("az-a".into()),
+                }],
+                prefixes: vec![],
+                overlay_ip: None,
+                addrs: Vec::new(),
+            })
+            .unwrap();
+        state
+            .apply_lsa(Lsa {
+                origin: b,
+                seq: 1,
+                zone: Some("az-a".into()),
+                links: vec![],
+                prefixes: vec![stellaris_linkstate::Prefix {
+                    prefix: "192.168.50.0/24".parse().unwrap(),
+                    metric: 0,
+                }],
+                overlay_ip: None,
+                addrs: Vec::new(),
+            })
+            .unwrap();
         let snapshot = state.snapshot(Some(a));
         let route = snapshot
             .routes

@@ -275,7 +275,41 @@ fn apply_snapshot(
     if snapshot.generation == last_generation {
         return None;
     }
-    if let Some(secret) = secret {
+    if !state.config.control.controller_keys.is_empty() {
+        let Some(signer) = snapshot
+            .signer
+            .as_deref()
+            .and_then(|s| s.parse::<NodeId>().ok())
+        else {
+            tracing::warn!("controller snapshot has no signer");
+            return None;
+        };
+        if !state
+            .config
+            .control
+            .controller_keys
+            .iter()
+            .any(|key| key == &signer.to_string())
+        {
+            tracing::warn!(%signer, "untrusted controller signer");
+            return None;
+        }
+        let Some(signature) = snapshot.ed25519_signature.as_deref() else {
+            tracing::warn!("controller snapshot has no Ed25519 signature");
+            return None;
+        };
+        let payload = crate::controller::snapshot_payload_bytes(
+            &snapshot.network_id,
+            snapshot.epoch,
+            snapshot.generation,
+            &snapshot.members,
+            &snapshot.routes,
+        );
+        if let Err(e) = crate::controller::verify_ed25519(signer, &payload, signature) {
+            tracing::warn!(error = %e, "controller Ed25519 signature mismatch");
+            return None;
+        }
+    } else if let Some(secret) = secret {
         let expected = crate::controller::snapshot_signature(
             secret,
             &snapshot.network_id,

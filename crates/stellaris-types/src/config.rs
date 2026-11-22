@@ -88,6 +88,12 @@ pub struct ControlConfig {
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
+    /// Trusted controller NodeIds for verifying Ed25519 snapshots.
+    #[serde(default)]
+    pub controller_keys: Vec<String>,
+    /// Optional controller-side member allowlist / prefix grants.
+    #[serde(default)]
+    pub members: Vec<ControllerMemberConfig>,
     /// Controller iroh control UDP port (None = HTTP-only).
     #[serde(default)]
     pub iroh_port: Option<u16>,
@@ -97,6 +103,18 @@ pub struct ControlConfig {
     /// Member: controller iroh direct addresses.
     #[serde(default)]
     pub addrs: Vec<SocketAddr>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ControllerMemberConfig {
+    pub node_id: String,
+    #[serde(default)]
+    pub overlay_ip: Option<IpAddr>,
+    /// Prefixes this member may advertise; empty means only its overlay /32.
+    #[serde(default)]
+    pub prefixes: Vec<IpNet>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -336,6 +354,23 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "network.auth.secret is required when auth.mode = psk".into(),
             ));
+        }
+        for key in &self.control.controller_keys {
+            key.parse::<NodeId>()
+                .map_err(|e| ConfigError::Invalid(format!("control.controller_keys: {e}")))?;
+        }
+        let mut member_ids = HashSet::new();
+        for member in &self.control.members {
+            let node: NodeId = member
+                .node_id
+                .parse()
+                .map_err(|e| ConfigError::Invalid(format!("control.members: {e}")))?;
+            if !member_ids.insert(node) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate controller member {}",
+                    member.node_id
+                )));
+            }
         }
         if self.network.auth.mode == AuthMode::Controller {
             return Err(ConfigError::Invalid(
