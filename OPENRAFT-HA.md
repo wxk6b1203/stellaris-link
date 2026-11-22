@@ -449,7 +449,10 @@ three_node_raft_over_http
 - 集群重启测试已验证（固定监听地址）
 - snapshot 传输已实现（`POST /raft/snapshot` + `SnapshotRpc`）
 - 已验证停掉的 follower 重启后通过 snapshot 追平（`restarting_follower_catches_up_via_snapshot`）
-- 大快照/断点/校验和仍未测试
+- snapshot RPC 带 SHA-256 checksum，服务端校验
+- Raft HTTP body limit 64 MiB
+- raft log/state 使用 fsync + atomic rename
+- 大 snapshot 分块/断点仍未测试
 - controller 支持 `control.raft_dir` 启用单节点 Raft
 - `/v1/lsa` 在 Raft 模式走 `client_write`
 - `/v1/snapshot` / `/v1/model` 从 Raft state machine 生成

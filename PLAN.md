@@ -49,6 +49,7 @@
 - [x] follower 停机后通过 snapshot 追平。
 - [x] 真实 LAN macvlan 3 controller Raft + leader failover + network partition recovery。
 - [x] Raft internal HTTPS + CA 校验 E2E。
+- [x] snapshot checksum 校验 + Raft 状态 fsync/atomic rename。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。

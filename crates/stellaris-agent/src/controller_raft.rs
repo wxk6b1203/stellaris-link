@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use openraft::storage::{
 };
 use openraft::{BasicNode, EntryPayload, OptionalSend, Raft, RaftTypeConfig};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::controller_model::{ControllerCommand, ControllerModel};
@@ -69,6 +70,29 @@ struct PersistedLog {
     vote: Option<VoteOf<TypeConfig>>,
     last_purged: Option<LogIdOf<TypeConfig>>,
     committed: Option<LogIdOf<TypeConfig>>,
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 pub struct LogStore {
@@ -136,8 +160,7 @@ impl LogStore {
             tracing::warn!(error = %e, "create raft log dir");
             return;
         }
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+        if let Err(e) = atomic_write(path, &bytes) {
             tracing::warn!(error = %e, "persist raft log");
         }
     }
@@ -314,8 +337,7 @@ impl StateMachineStore {
             tracing::warn!(error = %e, "create raft state dir");
             return;
         }
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+        if let Err(e) = atomic_write(path, &bytes) {
             tracing::warn!(error = %e, "persist controller raft state");
         }
     }
@@ -647,6 +669,8 @@ struct SnapshotRpc {
     vote: VoteOf<TypeConfig>,
     meta: SnapshotMetaOf<TypeConfig>,
     data: Vec<u8>,
+    #[serde(default)]
+    checksum: String,
 }
 
 fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>) -> Router {
@@ -654,6 +678,7 @@ fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>
         .route("/raft/append", post(raft_append))
         .route("/raft/vote", post(raft_vote))
         .route("/raft/snapshot", post(raft_snapshot))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(RaftHttpState {
             raft,
             secret: secret.map(Arc::new),
@@ -679,6 +704,13 @@ async fn raft_snapshot(
         return Err((
             axum::http::StatusCode::UNAUTHORIZED,
             "invalid raft secret".into(),
+        ));
+    }
+    let checksum = hex::encode(Sha256::digest(&rpc.data));
+    if !rpc.checksum.is_empty() && rpc.checksum != checksum {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "snapshot checksum mismatch".into(),
         ));
     }
     let snapshot = SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
@@ -825,10 +857,12 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         openraft::raft::SnapshotResponse<TypeConfig>,
         openraft::error::StreamingError<TypeConfig>,
     > {
+        let data = snapshot.snapshot.into_inner();
         let rpc = SnapshotRpc {
             vote,
             meta: snapshot.meta,
-            data: snapshot.snapshot.into_inner(),
+            checksum: hex::encode(Sha256::digest(&data)),
+            data,
         };
         let mut request = self
             .client
@@ -1236,6 +1270,41 @@ mod tests {
         for raft in rafts.read().await.values() {
             let _ = raft.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_rpc_rejects_bad_checksum() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let node = start_http_node(
+            ControllerModel::new(NetworkId::new(), 1),
+            1,
+            addr,
+            Vec::new(),
+            None,
+            Some("secret".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        let rpc = SnapshotRpc {
+            vote: VoteOf::<TypeConfig>::new(0, 0),
+            meta: SnapshotMetaOf::<TypeConfig> {
+                last_log_id: None,
+                last_membership: StoredMembershipOf::<TypeConfig>::default(),
+            },
+            data: vec![1, 2, 3],
+            checksum: "bad".into(),
+        };
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/raft/snapshot", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .json(&rpc)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let _ = node.raft.shutdown().await;
+        node.server.abort();
     }
 
     #[tokio::test]
