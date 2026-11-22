@@ -88,8 +88,7 @@ impl AgentState {
         // Direct peer /32 routes make the overlay reachable even with no static routes.
         for peer in &config.peers {
             let via: NodeId = peer.endpoint_id.parse().context("parse peer endpoint_id")?;
-            let prefix = ipnet::IpNet::new(peer.overlay_ip, 32)
-                .with_context(|| format!("peer {} overlay_ip", peer.name))?;
+            let prefix = stellaris_types::host_prefix(peer.overlay_ip);
             let (pref, attrs) = route_zone(&config, peer);
             routes
                 .add_static_with_attrs(

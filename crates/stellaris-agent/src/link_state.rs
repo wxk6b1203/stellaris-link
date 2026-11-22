@@ -339,10 +339,11 @@ fn local_lsa(state: &AgentState, seq: u64, connected: &HashSet<NodeId>) -> Lsa {
         .collect();
 
     let mut prefixes = Vec::new();
-    if let Some(ip) = state.config.node.overlay_ip
-        && let Ok(prefix) = ipnet::IpNet::new(ip, 32)
-    {
-        prefixes.push(Prefix { prefix, metric: 0 });
+    if let Some(ip) = state.config.node.overlay_ip {
+        prefixes.push(Prefix {
+            prefix: stellaris_types::host_prefix(ip),
+            metric: 0,
+        });
     }
     for prefix in &state.config.dataplane.advertise {
         prefixes.push(Prefix {

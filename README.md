@@ -357,6 +357,13 @@ cargo build -p stellaris-agent --bin stellaris-controller
 - Linux/macOS IPv6 route 安装
 - IPv6 outbound FIB / inbound local delivery 单测通过
 - IPv6 当前不做 NAT（网关路由）
+- Linux netns IPv6 TUN 双向测试：
+
+```bash
+sudo BIN=./target/release/stellaris-agent CTRL=./target/release/stellaris-controller \
+  ./scripts/test-linux-netns-ipv6.sh
+# OK: IPv6 TUN overlay bidirectional works.
+```
 - TCP MSS clamp：overlay MTU 1100 时 IPv4 MSS <=1060、IPv6 MSS <=1040
 
 ### 21.8 Raft mTLS E2E

@@ -50,16 +50,26 @@ pub async fn start(
         );
     }
     let prefix_len = state.config.network.cidr.prefix_len();
-    // Conservative initial MTU; the monitor raises it once iroh reports path capacity.
-    let initial_mtu = state.config.dataplane.mtu.min(1100);
-    let mut builder = DeviceBuilder::new().name(tun_name.clone()).mtu(initial_mtu);
-    builder = match local_ip {
-        IpAddr::V4(ip) => builder.ipv4(ip, prefix_len, None),
-        IpAddr::V6(ip) => builder.ipv6(ip, prefix_len),
+    // IPv6 requires a minimum MTU of 1280; IPv4 uses a conservative initial value.
+    let initial_mtu = if local_ip.is_ipv6() {
+        state.config.dataplane.mtu.max(1280)
+    } else {
+        state.config.dataplane.mtu.min(1100)
     };
-    let dev = builder
-        .build_async()
-        .context("create TUN device (need root/CAP_NET_ADMIN)")?;
+    let builder = DeviceBuilder::new().name(tun_name.clone()).mtu(initial_mtu);
+    let dev = match local_ip {
+        IpAddr::V4(ip) => builder
+            .ipv4(ip, prefix_len, None)
+            .build_async()
+            .context("create TUN device (need root/CAP_NET_ADMIN)")?,
+        IpAddr::V6(ip) => {
+            let dev = builder
+                .build_async()
+                .context("create TUN device (need root/CAP_NET_ADMIN)")?;
+            configure_ipv6(&tun_name, ip, prefix_len)?;
+            dev
+        }
+    };
     let dev = Arc::new(dev);
     info!(
         tun = %tun_name,
@@ -105,6 +115,46 @@ pub async fn start(
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_ipv6(tun: &str, ip: std::net::Ipv6Addr, prefix: u8) -> anyhow::Result<()> {
+    let status = std::process::Command::new("ip")
+        .args([
+            "-6",
+            "addr",
+            "replace",
+            &format!("{ip}/{prefix}"),
+            "dev",
+            tun,
+        ])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("ip -6 addr replace {ip}/{prefix} dev {tun} failed");
+    }
+    let status = std::process::Command::new("ip")
+        .args(["link", "set", tun, "up"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("ip link set {tun} up failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn configure_ipv6(tun: &str, ip: std::net::Ipv6Addr, prefix: u8) -> anyhow::Result<()> {
+    let status = std::process::Command::new("ifconfig")
+        .args([tun, "inet6", &format!("{ip}/{prefix}"), "up"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("ifconfig {tun} inet6 failed");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn configure_ipv6(_tun: &str, _ip: std::net::Ipv6Addr, _prefix: u8) -> anyhow::Result<()> {
+    anyhow::bail!("IPv6 TUN is supported on Linux/macOS only")
 }
 
 fn tun_name(state: &AgentState) -> String {

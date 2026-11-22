@@ -86,8 +86,7 @@ pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa)
         for prefix in &lsa.prefixes {
             let own = grant
                 .overlay_ip
-                .and_then(|ip| IpNet::new(ip, 32).ok())
-                .is_some_and(|p| p == prefix.prefix);
+                .is_some_and(|ip| stellaris_types::host_prefix(ip) == prefix.prefix);
             if !own && !grant.prefixes.contains(&prefix.prefix) {
                 return false;
             }
@@ -99,11 +98,11 @@ pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa)
     let Some(peer) = state.peers.get(&lsa.origin) else {
         return lsa.prefixes.iter().all(|p| {
             lsa.overlay_ip
-                .is_some_and(|ip| IpNet::new(ip, 32).is_ok_and(|x| x == p.prefix))
+                .is_some_and(|ip| stellaris_types::host_prefix(ip) == p.prefix)
         });
     };
     for prefix in &lsa.prefixes {
-        let own = IpNet::new(peer.overlay_ip, 32).is_ok_and(|p| p == prefix.prefix);
+        let own = stellaris_types::host_prefix(peer.overlay_ip) == prefix.prefix;
         if !own && !peer.advertised.contains(&prefix.prefix) {
             return false;
         }

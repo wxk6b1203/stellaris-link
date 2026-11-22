@@ -465,7 +465,7 @@ impl ControllerState {
         for prefix in &lsa.prefixes {
             let own = member
                 .overlay_ip
-                .is_some_and(|ip| ipnet::IpNet::new(ip, 32).is_ok_and(|p| p == prefix.prefix));
+                .is_some_and(|ip| stellaris_types::host_prefix(ip) == prefix.prefix);
             let allowed = member
                 .prefixes
                 .iter()
@@ -807,7 +807,7 @@ impl ControllerState {
         for prefix in &lsa.prefixes {
             let own = grant
                 .overlay_ip
-                .is_some_and(|ip| ipnet::IpNet::new(ip, 32).is_ok_and(|p| p == prefix.prefix));
+                .is_some_and(|ip| stellaris_types::host_prefix(ip) == prefix.prefix);
             if !own && !grant.prefixes.contains(&prefix.prefix) {
                 return Err((
                     403,

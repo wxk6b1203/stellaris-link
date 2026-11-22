@@ -5,6 +5,7 @@ pub mod error;
 pub mod id;
 pub mod policy;
 pub mod route;
+pub mod util;
 
 pub use config::{
     ApiConfig, AuthMode, Config, ControlConfig, ControllerMemberConfig, DataplaneConfig,
@@ -18,3 +19,4 @@ pub use route::{
     Action, Match, PathHint, PeerStatus, RibMode, RouteAttributes, RouteChange, RouteEntry,
     RoutePolicy, RouteSource, RouteState, Scope, UpsertStatic,
 };
+pub use util::host_prefix;
