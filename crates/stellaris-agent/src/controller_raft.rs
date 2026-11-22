@@ -2198,7 +2198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_snapshot_client_retries_failed_chunk() {
+    async fn http_snapshot_client_retries_transient_failures() {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         async fn begin() -> Json<serde_json::Value> {
