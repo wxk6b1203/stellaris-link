@@ -145,6 +145,7 @@ Agent
 | overlay 不在 CIDR | 配置拒绝 |
 | 显式 network id | 使用配置 id |
 | 两网络不同 PSK | 不能互连 |
+| 两网络相同 PSK、不同 network id | handshake 拒绝 |
 | 两网络同名不同 id | 网络隔离 |
 | manifest network 不匹配 | 拒绝 |
 | 错误 network hash 数据报 | 丢弃 |

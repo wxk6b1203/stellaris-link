@@ -32,7 +32,7 @@
 - [x] controller + 3 members 本机联调（ACK/snapshot/LSA）。
 - [x] controller + 3 TUN 节点真实 Linux netns 联调：双向 0% loss、1000B。
 - [x] 数据面 source grant 强制（member/transit capability）。
-- [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档（单进程多网络仍待做）。
+- [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。
 - [x] UDP broadcast bootstrap discovery（定向广播 + PSK 认证），Linux netns 实测通过。
 - [x] `transport.bind_ip`：TUN 场景绑定 underlay，避免 iroh underlay QUIC 走进 TUN。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。

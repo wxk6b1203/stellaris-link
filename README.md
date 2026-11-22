@@ -257,7 +257,14 @@ sudo BIN=./target/release/stellaris-agent \
 
 验证 controller 路由、LSA、TUN transit、双向 0% loss 和 1000B 包。
 
-### 16. 真正的 TUN overlay（两台机器，需要 root）
+### 16. 多网络凭证隔离
+
+```bash
+./scripts/demo-multi-network-isolation.sh
+# OK: different network IDs reject the same PSK.
+```
+
+### 17. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
