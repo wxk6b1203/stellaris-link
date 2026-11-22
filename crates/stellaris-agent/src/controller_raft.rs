@@ -10,6 +10,8 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axum::body::Bytes;
+use axum::http::HeaderMap;
 use axum::{Json, Router, extract::State, routing::post};
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
 use openraft::entry::RaftEntry;
@@ -27,6 +29,7 @@ use openraft::{BasicNode, EntryPayload, OptionalSend, Raft, RaftTypeConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::controller_model::{ControllerCommand, ControllerModel};
 
@@ -666,10 +669,30 @@ pub async fn start_cluster(
 
 const RAFT_SECRET_HEADER: &str = "x-stellaris-raft-secret";
 
+#[derive(Clone, Default)]
+struct SnapshotAssemblies(Arc<std::sync::Mutex<HashMap<String, PendingSnapshot>>>);
+
+struct PendingSnapshot {
+    vote: VoteOf<TypeConfig>,
+    meta: SnapshotMetaOf<TypeConfig>,
+    total: usize,
+    checksum: String,
+    data: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotBegin {
+    vote: VoteOf<TypeConfig>,
+    meta: SnapshotMetaOf<TypeConfig>,
+    total: usize,
+    checksum: String,
+}
+
 #[derive(Clone)]
 struct RaftHttpState {
     raft: Raft<TypeConfig, StateMachineStore>,
     secret: Option<Arc<String>>,
+    assemblies: SnapshotAssemblies,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -686,10 +709,14 @@ fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>
         .route("/raft/append", post(raft_append))
         .route("/raft/vote", post(raft_vote))
         .route("/raft/snapshot", post(raft_snapshot))
+        .route("/raft/snapshot/begin", post(raft_snapshot_begin))
+        .route("/raft/snapshot/chunk", post(raft_snapshot_chunk))
+        .route("/raft/snapshot/finish", post(raft_snapshot_finish))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(RaftHttpState {
             raft,
             secret: secret.map(Arc::new),
+            assemblies: SnapshotAssemblies::default(),
         })
 }
 
@@ -701,6 +728,126 @@ fn authorized(state: &RaftHttpState, headers: &axum::http::HeaderMap) -> bool {
         .get(RAFT_SECRET_HEADER)
         .and_then(|value| value.to_str().ok())
         == Some(secret)
+}
+
+async fn raft_snapshot_begin(
+    State(state): State<RaftHttpState>,
+    headers: HeaderMap,
+    Json(req): Json<SnapshotBegin>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid raft secret".into(),
+        ));
+    }
+    if req.total > 512 * 1024 * 1024 {
+        return Err((
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "snapshot too large".into(),
+        ));
+    }
+    let id = Uuid::now_v7().to_string();
+    {
+        let mut assemblies = state.assemblies.0.lock().unwrap_or_else(|e| e.into_inner());
+        if assemblies.len() >= 8 {
+            return Err((
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent snapshot transfers".into(),
+            ));
+        }
+        assemblies.insert(
+            id.clone(),
+            PendingSnapshot {
+                vote: req.vote,
+                meta: req.meta,
+                total: req.total,
+                checksum: req.checksum,
+                data: Vec::with_capacity(req.total),
+            },
+        );
+    }
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn raft_snapshot_chunk(
+    State(state): State<RaftHttpState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid raft secret".into(),
+        ));
+    }
+    let Some(id) = headers.get("x-raft-transfer").and_then(|v| v.to_str().ok()) else {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing transfer id".into(),
+        ));
+    };
+    let mut assemblies = state.assemblies.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pending) = assemblies.get_mut(id) else {
+        return Err((axum::http::StatusCode::NOT_FOUND, "unknown transfer".into()));
+    };
+    if pending.data.len() + body.len() > pending.total {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "snapshot overflow".into(),
+        ));
+    }
+    pending.data.extend_from_slice(&body);
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+async fn raft_snapshot_finish(
+    State(state): State<RaftHttpState>,
+    headers: HeaderMap,
+) -> Result<Json<openraft::raft::SnapshotResponse<TypeConfig>>, (axum::http::StatusCode, String)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid raft secret".into(),
+        ));
+    }
+    let Some(id) = headers.get("x-raft-transfer").and_then(|v| v.to_str().ok()) else {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing transfer id".into(),
+        ));
+    };
+    let Some(pending) = state
+        .assemblies
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id)
+    else {
+        return Err((axum::http::StatusCode::NOT_FOUND, "unknown transfer".into()));
+    };
+    if pending.data.len() != pending.total {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "snapshot size mismatch".into(),
+        ));
+    }
+    if hex::encode(Sha256::digest(&pending.data)) != pending.checksum {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "snapshot checksum mismatch".into(),
+        ));
+    }
+    let snapshot = SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
+        meta: pending.meta,
+        snapshot: Cursor::new(pending.data),
+    };
+    state
+        .raft
+        .install_full_snapshot(pending.vote, snapshot)
+        .await
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn raft_snapshot(
@@ -866,23 +1013,69 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         openraft::error::StreamingError<TypeConfig>,
     > {
         let data = snapshot.snapshot.into_inner();
-        let rpc = SnapshotRpc {
-            vote,
-            meta: snapshot.meta,
-            checksum: hex::encode(Sha256::digest(&data)),
-            data,
-        };
-        let mut request = self
-            .client
-            .post(format!("{}/raft/snapshot", self.base))
-            .json(&rpc);
-        if let Some(secret) = &self.secret {
-            request = request.header(RAFT_SECRET_HEADER, secret.as_str());
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| openraft::error::StreamingError::Unreachable(Unreachable::new(&e)))?;
+        let checksum = hex::encode(Sha256::digest(&data));
+        let response =
+            if data.len() > 4 * 1024 * 1024 {
+                let mut begin = self
+                    .client
+                    .post(format!("{}/raft/snapshot/begin", self.base))
+                    .json(&serde_json::json!({
+                        "vote": vote,
+                        "meta": snapshot.meta,
+                        "total": data.len(),
+                        "checksum": checksum,
+                    }));
+                if let Some(secret) = &self.secret {
+                    begin = begin.header(RAFT_SECRET_HEADER, secret.as_str());
+                }
+                let begin = begin.send().await.map_err(|e| {
+                    openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
+                })?;
+                let body: serde_json::Value = begin.json().await.map_err(|e| {
+                    openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
+                })?;
+                let id = body["id"].as_str().unwrap_or_default().to_string();
+                for chunk in data.chunks(2 * 1024 * 1024) {
+                    let mut request = self
+                        .client
+                        .post(format!("{}/raft/snapshot/chunk", self.base))
+                        .header("x-raft-transfer", &id)
+                        .body(chunk.to_vec());
+                    if let Some(secret) = &self.secret {
+                        request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+                    }
+                    request.send().await.map_err(|e| {
+                        openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
+                    })?;
+                }
+                let mut finish = self
+                    .client
+                    .post(format!("{}/raft/snapshot/finish", self.base))
+                    .header("x-raft-transfer", &id);
+                if let Some(secret) = &self.secret {
+                    finish = finish.header(RAFT_SECRET_HEADER, secret.as_str());
+                }
+                finish.send().await.map_err(|e| {
+                    openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
+                })?
+            } else {
+                let rpc = SnapshotRpc {
+                    vote,
+                    meta: snapshot.meta,
+                    checksum,
+                    data,
+                };
+                let mut request = self
+                    .client
+                    .post(format!("{}/raft/snapshot", self.base))
+                    .json(&rpc);
+                if let Some(secret) = &self.secret {
+                    request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+                }
+                request.send().await.map_err(|e| {
+                    openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
+                })?
+            };
         if !response.status().is_success() {
             return Err(openraft::error::StreamingError::Unreachable(
                 Unreachable::new(&io::Error::other(format!(
@@ -1312,6 +1505,63 @@ mod tests {
         for raft in rafts.read().await.values() {
             let _ = raft.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn chunked_snapshot_rejects_bad_checksum() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let node = start_http_node(
+            ControllerModel::new(NetworkId::new(), 1),
+            1,
+            addr,
+            Vec::new(),
+            None,
+            Some("secret".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        let begin = SnapshotBegin {
+            vote: VoteOf::<TypeConfig>::new(0, 0),
+            meta: SnapshotMetaOf::<TypeConfig> {
+                last_log_id: None,
+                last_membership: StoredMembershipOf::<TypeConfig>::default(),
+            },
+            total: 5,
+            checksum: "bad".into(),
+        };
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}/raft/snapshot/begin", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .json(&begin)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let id = response.json::<serde_json::Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = client
+            .post(format!("http://{}/raft/snapshot/chunk", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .body(vec![1, 2, 3, 4, 5])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        let response = client
+            .post(format!("http://{}/raft/snapshot/finish", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let _ = node.raft.shutdown().await;
+        node.server.abort();
     }
 
     #[tokio::test]

@@ -403,6 +403,18 @@ cargo build -p stellaris-agent --bin stellaris-controller
 
 脚本生成 CA/server/client 证书，启用 `raft_tls_require_client_cert=true`。
 
+### 21.9 大 snapshot 分块
+
+Raft snapshot > 4 MiB 时客户端自动走：
+
+```text
+POST /raft/snapshot/begin
+POST /raft/snapshot/chunk
+POST /raft/snapshot/finish
+```
+
+每块 2 MiB，总大小上限 512 MiB，最终 SHA-256 校验。
+
 ### 22. API / controller TLS
 
 ```bash
