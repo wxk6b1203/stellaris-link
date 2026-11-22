@@ -60,6 +60,7 @@ pub struct ControllerState {
     strict_membership: bool,
     signing_key: Option<Arc<SigningKey>>,
     signer: Option<NodeId>,
+    leader: Option<NodeId>,
     manifest_ttl: u64,
     pub epoch: u64,
     generation: Arc<AtomicU64>,
@@ -280,6 +281,13 @@ impl ControllerState {
             strict_membership,
             signing_key: None,
             signer: None,
+            leader: config
+                .control
+                .leader_id
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .context("control.leader_id")?,
             manifest_ttl: config.control.manifest_ttl_secs,
             epoch,
             generation: Arc::new(AtomicU64::new(if loaded_lsas > 0 { 2 } else { 1 })),
@@ -311,6 +319,15 @@ impl ControllerState {
             manifest.signature = Some(hex::encode(key.sign(&bytes).to_bytes()));
         }
         manifest
+    }
+
+    fn ensure_leader(&self) -> Result<(), (u16, String)> {
+        match self.leader {
+            Some(leader) if self.signer != Some(leader) => {
+                Err((503, format!("controller is not leader (leader {leader})")))
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn snapshot(&self, local: Option<NodeId>) -> Snapshot {
@@ -499,6 +516,7 @@ impl ControllerState {
     }
 
     fn apply_lsa(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
+        self.ensure_leader()?;
         self.authorize_lsa(&lsa)?;
         let changed = self
             .link_state
@@ -553,6 +571,7 @@ impl ControllerState {
         overlay: std::net::IpAddr,
         token: &str,
     ) -> Result<(), (u16, String)> {
+        self.ensure_leader()?;
         let now = now_epoch();
         let join = self
             .join_tokens
@@ -584,6 +603,7 @@ impl ControllerState {
     }
 
     fn revoke(&self, node: NodeId) -> Result<(), (u16, String)> {
+        self.ensure_leader()?;
         let removed = self
             .grants
             .write()
@@ -949,6 +969,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&state_dir)?;
     let identity = crate::identity::load_or_create(&state_dir)?;
     state.set_signing_key(identity.secret);
+    if let Some(leader) = state.leader
+        && state.signer != Some(leader)
+    {
+        tracing::warn!(%leader, signer = ?state.signer, "controller is not the configured leader; writes will be rejected");
+    }
     if config.control.iroh_port.is_some() {
         let state = state.clone();
         let config = config.clone();
@@ -1675,6 +1700,51 @@ previous_secrets = ["old"]
         assert!(state.authorized_secret(Some("old")));
         assert!(state.authorized_secret(Some("new")));
         assert!(!state.authorized_secret(Some("bad")));
+    }
+
+    #[test]
+    fn nonleader_controller_rejects_writes() {
+        let dir = temp_state_dir();
+        let leader = NodeId::new(
+            SigningKey::from_bytes(&[1u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+leader_id = "{}"
+
+[[control.join_tokens]]
+token = "join"
+"#,
+            dir, leader
+        );
+        let mut state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        state.set_signing_key([2u8; 32]);
+        assert!(state.ensure_leader().is_err());
+        assert!(
+            state
+                .join(NodeId::new([3u8; 32]), "10.7.0.3".parse().unwrap(), "join")
+                .is_err()
+        );
+        state.set_signing_key([1u8; 32]);
+        assert!(state.ensure_leader().is_ok());
+        assert!(
+            state
+                .join(NodeId::new([3u8; 32]), "10.7.0.3".parse().unwrap(), "join")
+                .is_ok()
+        );
     }
 
     #[test]

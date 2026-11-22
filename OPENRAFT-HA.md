@@ -334,6 +334,23 @@ Raft quorum 丢失时：
 
 ---
 
+## 8.1 当前过渡：手动 leader fence
+
+在 openraft 实现前，controller 支持：
+
+```toml
+[control]
+leader_id = "<controller-node-id>"
+```
+
+- 只有签名身份等于 `leader_id` 的 controller 接受 LSA/join/revoke 写入
+- 非 leader 返回 503
+- 这不是自动 failover；leader 变更需要管理员更新配置/重启
+- 成员侧仍使用 snapshot/manifest threshold
+
+它用于在过渡期避免“多个 controller 同时接受写”的明显 split-brain，
+最终仍需 openraft 的 term/leader/quorum。
+
 ## 9. 迁移步骤
 
 ### Phase 0：确定性与影子状态机

@@ -88,6 +88,9 @@ pub struct ControlConfig {
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
+    /// Optional controller leader NodeId. Non-leader controllers reject writes.
+    #[serde(default)]
+    pub leader_id: Option<String>,
     /// Previous shared secrets accepted during rotation.
     #[serde(default)]
     pub previous_secrets: Vec<String>,
@@ -146,6 +149,7 @@ impl Default for ControlConfig {
             bind: None,
             secret: None,
             epoch: None,
+            leader_id: None,
             previous_secrets: Vec::new(),
             manifest_ttl_secs: default_manifest_ttl(),
             controller_keys: Vec::new(),
