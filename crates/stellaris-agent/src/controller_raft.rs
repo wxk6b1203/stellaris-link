@@ -10,11 +10,15 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axum::{Json, Router, extract::State, routing::post};
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
 use openraft::entry::RaftEntry;
 use openraft::error::{RPCError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::network::{RaftNetworkFactory, RaftNetworkV2};
+use openraft::raft::{
+    AppendEntriesRequest, AppendResult, StreamAppendResult, VoteRequest, VoteResponse,
+};
 use openraft::storage::{
     EntryResponder, IOFlushed, LogState, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder,
     RaftStateMachine,
@@ -609,6 +613,182 @@ pub async fn start_cluster(
     Ok((rafts, stores))
 }
 
+#[derive(Clone)]
+struct RaftHttpState {
+    raft: Raft<TypeConfig, StateMachineStore>,
+}
+
+fn raft_router(raft: Raft<TypeConfig, StateMachineStore>) -> Router {
+    Router::new()
+        .route("/raft/append", post(raft_append))
+        .route("/raft/vote", post(raft_vote))
+        .with_state(RaftHttpState { raft })
+}
+
+async fn raft_append(
+    State(state): State<RaftHttpState>,
+    Json(req): Json<AppendEntriesRequest<TypeConfig>>,
+) -> Result<Json<StreamAppendResult<TypeConfig>>, (axum::http::StatusCode, String)> {
+    let result = state
+        .raft
+        .append_entries(req)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(result.map_err(Into::into)))
+}
+
+async fn raft_vote(
+    State(state): State<RaftHttpState>,
+    Json(req): Json<VoteRequest<TypeConfig>>,
+) -> Result<Json<VoteResponse<TypeConfig>>, (axum::http::StatusCode, String)> {
+    state
+        .raft
+        .vote(req)
+        .await
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+pub struct HttpFactory {
+    client: reqwest::Client,
+}
+
+pub struct HttpNetwork {
+    client: reqwest::Client,
+    base: String,
+}
+
+impl RaftNetworkFactory<TypeConfig> for HttpFactory {
+    type Network = HttpNetwork;
+
+    async fn new_client(&mut self, _target: u64, node: &BasicNode) -> Self::Network {
+        HttpNetwork {
+            client: self.client.clone(),
+            base: format!("http://{}", node.addr),
+        }
+    }
+}
+
+impl RaftNetworkV2<TypeConfig> for HttpNetwork {
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
+        let response = self
+            .client
+            .post(format!("{}/raft/append", self.base))
+            .json(&rpc)
+            .send()
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+        if !response.status().is_success() {
+            return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                format!("raft append status {}", response.status()),
+            ))));
+        }
+        let result: StreamAppendResult<TypeConfig> = response
+            .json()
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+        Ok(result.map_err(Into::into))
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        let response = self
+            .client
+            .post(format!("{}/raft/vote", self.base))
+            .json(&rpc)
+            .send()
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+        if !response.status().is_success() {
+            return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                format!("raft vote status {}", response.status()),
+            ))));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        _vote: VoteOf<TypeConfig>,
+        _snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
+        _cancel: impl std::future::Future<Output = openraft::error::ReplicationClosed>
+        + OptionalSend
+        + 'static,
+        _option: RPCOption,
+    ) -> Result<
+        openraft::raft::SnapshotResponse<TypeConfig>,
+        openraft::error::StreamingError<TypeConfig>,
+    > {
+        Err(openraft::error::StreamingError::Unreachable(
+            Unreachable::new(&io::Error::new(
+                io::ErrorKind::Unsupported,
+                "HTTP snapshot transport not implemented yet",
+            )),
+        ))
+    }
+}
+
+pub struct HttpCluster {
+    pub rafts: Arc<RwLock<HashMap<u64, Raft<TypeConfig, StateMachineStore>>>>,
+    pub stores: Vec<StateMachineStore>,
+    pub servers: Vec<tokio::task::JoinHandle<()>>,
+}
+
+pub async fn start_http_cluster(models: Vec<ControllerModel>) -> anyhow::Result<HttpCluster> {
+    let count = models.len();
+    let mut listeners = Vec::with_capacity(count);
+    let mut addresses = Vec::with_capacity(count);
+    for _ in 0..count {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        addresses.push(listener.local_addr()?);
+        listeners.push(listener);
+    }
+    let config = Arc::new(openraft::Config::default().validate()?);
+    let rafts = Arc::new(RwLock::new(HashMap::new()));
+    let mut stores = Vec::with_capacity(count);
+    let mut servers = Vec::with_capacity(count);
+    for (i, model) in models.into_iter().enumerate() {
+        let id = i as u64 + 1;
+        let log = Arc::new(LogStore::default());
+        let store = StateMachineStore::new(model, None);
+        let factory = HttpFactory {
+            client: reqwest::Client::new(),
+        };
+        let raft = Raft::new(id, config.clone(), factory, log, store.clone()).await?;
+        stores.push(store);
+        rafts.write().await.insert(id, raft.clone());
+        let app = raft_router(raft);
+        let listener = listeners.remove(0);
+        servers.push(tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        }));
+    }
+    let mut members = BTreeMap::new();
+    for (i, addr) in addresses.iter().enumerate() {
+        members.insert(i as u64 + 1, BasicNode::new(addr.to_string()));
+    }
+    if let Some(first) = rafts.read().await.get(&1).cloned() {
+        first.initialize(members).await?;
+    }
+    Ok(HttpCluster {
+        rafts,
+        stores,
+        servers,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,6 +911,60 @@ mod tests {
         assert!(applied >= 2, "only {applied} replicas applied");
         for raft in rafts.read().await.values() {
             let _ = raft.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn three_node_raft_over_http() {
+        let models = (0..3)
+            .map(|_| ControllerModel::new(NetworkId::new(), 1))
+            .collect();
+        let cluster = start_http_cluster(models).await.unwrap();
+        let node = NodeId::new([3u8; 32]);
+        let lsa = stellaris_linkstate::Lsa {
+            origin: node,
+            seq: 1,
+            zone: None,
+            links: vec![],
+            prefixes: vec![stellaris_linkstate::Prefix {
+                prefix: "192.168.97.0/24".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.3".parse().unwrap()),
+            addrs: vec![],
+        };
+        let mut leader = None;
+        for _ in 0..100 {
+            for (id, raft) in cluster.rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(raft.clone());
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        leader
+            .expect("leader")
+            .client_write(ControllerCommand::ApplyLsa { lsa })
+            .await
+            .unwrap();
+        for store in &cluster.stores {
+            for _ in 0..50 {
+                if store.model().await.lsas.contains_key(&node) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(store.model().await.lsas.contains_key(&node));
+        }
+        for raft in cluster.rafts.read().await.values() {
+            let _ = raft.shutdown().await;
+        }
+        for server in cluster.servers {
+            server.abort();
         }
     }
 

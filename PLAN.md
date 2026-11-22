@@ -41,7 +41,7 @@
 - [x] controller 手动 leader fence：非 leader 拒绝 LSA/join/revoke 写入。
 - [x] openraft H0 确定性 ControllerModel/Command，作为 controller shadow 接入（`/v1/model` + durable command log）。
 - [x] openraft H1 单节点原型：storage/state machine/single voter；支持 raft-log/raft-state 落盘重启恢复。
-- [x] openraft H2 进程内 3 节点：leader 写入复制、leader failover 测试。
+- [x] openraft H2 3 节点：进程内 leader 复制/failover + HTTP Raft RPC。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。
