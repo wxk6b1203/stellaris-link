@@ -39,9 +39,10 @@ pub async fn start(
         if state.config.dataplane.nat {
             if matches!(state.config.network.cidr, ipnet::IpNet::V4(_)) {
                 crate::gateway::ensure_nat(&state.config.network.cidr.to_string(), &tun_name)?;
-                info!("subnet gateway NAT enabled");
+                info!("subnet gateway NAT44 enabled");
             } else {
-                warn!("NAT is only enabled for IPv4 overlay; IPv6 gateway is routed");
+                crate::gateway::ensure_nat_v6(&state.config.network.cidr.to_string(), &tun_name)?;
+                info!("subnet gateway NAT66 enabled");
             }
         }
         info!(

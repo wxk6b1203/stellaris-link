@@ -356,7 +356,7 @@ cargo build -p stellaris-agent --bin stellaris-controller
 - TUN 创建 IPv6 地址
 - Linux/macOS IPv6 route 安装
 - IPv6 outbound FIB / inbound local delivery 单测通过
-- IPv6 当前不做 NAT（网关路由）
+- IPv6 gateway 支持 forwarding + NAT66（`ip6tables MASQUERADE`）
 - Linux netns IPv6 TUN 双向测试：
 
 ```bash

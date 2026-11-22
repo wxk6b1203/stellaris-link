@@ -55,6 +55,7 @@
 - [x] dataplane IPv6 overlay 基础：TUN IPv6、IPv6 route、IPv6 outbound/inbound。
 - [x] TCP MSS clamp（IPv4/IPv6）。
 - [x] IPv6 TUN netns 双向转发（fd00:115::/64，含 1000B ping）。
+- [x] IPv6 forwarding + NAT66 gateway rule。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。
