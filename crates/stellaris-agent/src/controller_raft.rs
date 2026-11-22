@@ -2291,6 +2291,45 @@ mod tests {
         assert!(store.save_vote(&vote).await.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_write_failure_does_not_apply_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-raft-diskfail-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = start_single_on_disk(ControllerModel::new(NetworkId::new(), 1), &dir)
+            .await
+            .unwrap();
+        let node_id = NodeId::new([15u8; 32]);
+        let lsa = stellaris_linkstate::Lsa {
+            origin: node_id,
+            seq: 1,
+            zone: None,
+            links: vec![],
+            prefixes: vec![],
+            overlay_ip: Some("10.7.0.15".parse().unwrap()),
+            addrs: vec![],
+        };
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let result = node
+            .raft
+            .client_write(ControllerCommand::ApplyLsa { lsa })
+            .await;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        assert!(
+            result.is_err(),
+            "write should fail when raft dir is read-only"
+        );
+        assert!(!node.store.model().await.lsas.contains_key(&node_id));
+        let _ = node.raft.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn single_node_raft_applies_command() {
         let model = ControllerModel::new(NetworkId::new(), 1);
