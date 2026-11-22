@@ -365,11 +365,8 @@ gateway/exit 才能广告其他前缀
 
 ### 9.2 待实现
 
-- token 撤销/过期传播已实现；
-- 数据面前缀仍由 anti-spoof + peer advertised 约束。
-- controller key set/threshold（已实现 member 侧 threshold snapshot 选择）；
+- 数据面前缀仍由 anti-spoof + peer advertised 约束；
 - multi-network runtime；
-- revocation/epoch propagation；
 - openraft command integration。
 
 ---
