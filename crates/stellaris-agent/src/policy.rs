@@ -1,5 +1,6 @@
 //! ACL and QoS policy evaluation (userspace, per packet).
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -67,7 +68,15 @@ struct Bucket {
     last: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+struct FragmentKey {
+    src: std::net::IpAddr,
+    dst: std::net::IpAddr,
+    protocol: u8,
+    id: u32,
+    direction: AclDirection,
+}
+
 pub struct Policy {
     file: PolicyFile,
     acl_order: Vec<usize>,
@@ -75,6 +84,7 @@ pub struct Policy {
     buckets: Vec<Mutex<Bucket>>,
     byte_buckets: Vec<Mutex<Bucket>>,
     acl_hits: Vec<AtomicU64>,
+    fragment_cache: Mutex<HashMap<FragmentKey, AclVerdict>>,
 }
 
 impl Policy {
@@ -128,6 +138,7 @@ impl Policy {
         let acl_hits = (0..file.acl.rules.len())
             .map(|_| AtomicU64::new(0))
             .collect();
+        let fragment_cache = Mutex::new(HashMap::new());
         Self {
             file,
             acl_order,
@@ -135,6 +146,7 @@ impl Policy {
             buckets,
             byte_buckets,
             acl_hits,
+            fragment_cache,
         }
     }
 
@@ -161,6 +173,55 @@ impl Policy {
     }
 
     pub fn check(
+        &self,
+        direction: AclDirection,
+        info: &PacketInfo,
+        peer: Option<NodeId>,
+        zone: Option<&str>,
+    ) -> AclVerdict {
+        let fragment = info.fragment;
+        if let Some(frag) = fragment
+            && frag.offset > 0
+        {
+            let key = FragmentKey {
+                src: info.src,
+                dst: info.dst,
+                protocol: info.protocol,
+                id: frag.id,
+                direction,
+            };
+            return self
+                .fragment_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| AclVerdict::Deny("fragment without first".into()));
+        }
+        let verdict = self.check_rules(direction, info, peer, zone);
+        if let Some(frag) = fragment
+            && frag.more
+        {
+            let key = FragmentKey {
+                src: info.src,
+                dst: info.dst,
+                protocol: info.protocol,
+                id: frag.id,
+                direction,
+            };
+            let mut cache = self
+                .fragment_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+            cache.insert(key, verdict.clone());
+        }
+        verdict
+    }
+
+    fn check_rules(
         &self,
         direction: AclDirection,
         info: &PacketInfo,
@@ -303,6 +364,76 @@ mod tests {
             AclVerdict::Deny(_)
         ));
         assert_eq!(policy.acl_hits()[0].1, 1);
+    }
+
+    #[test]
+    fn non_first_fragment_uses_first_fragment_acl_verdict() {
+        use stellaris_types::{AclConfig, AclRule};
+        let acl = AclConfig {
+            default_action: AclAction::Allow,
+            rules: vec![AclRule {
+                name: "deny-https".into(),
+                action: AclAction::Deny,
+                direction: AclDirection::Both,
+                priority: 10,
+                src: None,
+                dst: None,
+                protocol: Some(6),
+                src_port: None,
+                dst_port: Some(443),
+                peer: None,
+                zone: None,
+            }],
+        };
+        let policy = Policy::from_config(acl, QosConfig::default());
+        let src = "10.7.0.1".parse().unwrap();
+        let dst = "10.7.0.2".parse().unwrap();
+        let first = PacketInfo {
+            src,
+            dst,
+            ttl: 64,
+            protocol: 6,
+            src_port: Some(1234),
+            dst_port: Some(443),
+            fragment: Some(crate::wire::FragmentInfo {
+                id: 7,
+                offset: 0,
+                more: true,
+            }),
+        };
+        let non_first = PacketInfo {
+            src,
+            dst,
+            ttl: 64,
+            protocol: 6,
+            src_port: None,
+            dst_port: None,
+            fragment: Some(crate::wire::FragmentInfo {
+                id: 7,
+                offset: 100,
+                more: false,
+            }),
+        };
+        assert!(matches!(
+            policy.check(AclDirection::Inbound, &first, None, None),
+            AclVerdict::Deny(_)
+        ));
+        assert!(matches!(
+            policy.check(AclDirection::Inbound, &non_first, None, None),
+            AclVerdict::Deny(_)
+        ));
+        let unknown = PacketInfo {
+            fragment: Some(crate::wire::FragmentInfo {
+                id: 8,
+                offset: 100,
+                more: false,
+            }),
+            ..non_first
+        };
+        assert!(matches!(
+            policy.check(AclDirection::Inbound, &unknown, None, None),
+            AclVerdict::Deny(_)
+        ));
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub struct PacketInfo {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FragmentInfo {
+    pub id: u32,
     pub offset: u16,
     pub more: bool,
 }
@@ -105,7 +106,11 @@ fn parse_v4(packet: &[u8]) -> Option<PacketInfo> {
     let frag = u16::from_be_bytes([packet[6], packet[7]]);
     let offset = (frag & 0x1fff) * 8;
     let more = frag & 0x2000 != 0;
-    let fragment = (offset > 0 || more).then_some(FragmentInfo { offset, more });
+    let fragment = (offset > 0 || more).then_some(FragmentInfo {
+        id: u16::from_be_bytes([packet[4], packet[5]]) as u32,
+        offset,
+        more,
+    });
     let (src_port, dst_port) = if offset == 0 {
         ports(packet, ihl, protocol)
     } else {
@@ -153,6 +158,12 @@ fn parse_v6(packet: &[u8]) -> Option<PacketInfo> {
         let frag_offset = field >> 3;
         let more = field & 1 != 0;
         fragment = Some(FragmentInfo {
+            id: u32::from_be_bytes([
+                packet[offset + 4],
+                packet[offset + 5],
+                packet[offset + 6],
+                packet[offset + 7],
+            ]),
             offset: frag_offset * 8,
             more,
         });
@@ -580,6 +591,7 @@ mod tests {
         assert_eq!(
             info.fragment,
             Some(FragmentInfo {
+                id: 0,
                 offset: 0,
                 more: true
             })
@@ -590,6 +602,7 @@ mod tests {
         assert_eq!(
             info.fragment,
             Some(FragmentInfo {
+                id: 0,
                 offset: 1480,
                 more: false
             })
@@ -610,6 +623,7 @@ mod tests {
         assert_eq!(
             info.fragment,
             Some(FragmentInfo {
+                id: 0,
                 offset: 0,
                 more: true
             })
@@ -620,6 +634,7 @@ mod tests {
         assert_eq!(
             info.fragment,
             Some(FragmentInfo {
+                id: 0,
                 offset: 1480,
                 more: false
             })
