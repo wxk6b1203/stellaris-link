@@ -1,6 +1,6 @@
 # 多网络隔离设计
 
-> 状态：当前实现 **每网络一个 agent 进程**；单进程多网络 runtime 仍是后续工作。
+> 状态：支持 **每网络一个进程**，也支持 **一个进程内多个独立 network runtime**（重复 `--config`）。
 > 关联：[MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md)、[ARCHITECTURE.md](ARCHITECTURE.md)、[PRIORITIES.md](PRIORITIES.md)
 
 ## 0. 目标
@@ -13,13 +13,17 @@
 - 一个网络的 controller/路由故障不影响另一个网络；
 - API/UI 能明确区分网络。
 
-## 1. 当前可用：每网络一个进程
+## 1. 当前可用：每网络一个进程 / 单进程多 runtime
 
-这是目前支持的部署方式：
+两种方式：
 
 ```text
+# 每网络一个进程
 stellaris-agent --config net-a.toml
 stellaris-agent --config net-b.toml
+
+# 单进程、多 network runtime
+stellaris-agent --config net-a.toml --config net-b.toml
 ```
 
 要求：
@@ -42,6 +46,14 @@ stellaris-agent --config net-b.toml
 - 控制连接
 
 因此网络之间没有共享路由或数据面状态。
+
+单进程多 runtime 仍要求：
+
+- 每个 config 独立 `state_dir`（重复会拒绝启动）
+- 每个 config 独立 `network.id`/name（重复会拒绝启动）
+- 每个 runtime 独立 API/TUN/iroh endpoint
+
+进程级资源是共享的，但路由面、TUN、FIB、policy 仍是独立 runtime。
 
 ### 1.1 显式 network id
 
@@ -80,7 +92,7 @@ cidr = "10.7.0.0/16"
 - 错误网络的数据报被丢弃；
 - LSA 控制连接建立于已认证的 per-network transport 上。
 
-## 3. 单进程多网络（未来）
+## 3. 共享 endpoint 的单进程多网络（未来）
 
 单进程多网络需要：
 

@@ -289,21 +289,36 @@ sudo BIN=./target/release/stellaris-agent \
 
 验证 controller 路由、LSA、TUN transit、双向 0% loss 和 1000B 包。
 
-### 19. 多网络凭证隔离
+### 19. 单进程多网络 runtime
+
+```bash
+./scripts/demo-single-process-multi-network.sh
+# OK: one agent process runs two isolated network runtimes.
+```
+
+启动方式：
+
+```bash
+stellaris-agent --config net-a.toml --config net-b.toml
+```
+
+每个 config 必须有独立 `state_dir` 和 network id/name。
+
+### 20. 多网络凭证隔离
 
 ```bash
 ./scripts/demo-multi-network-isolation.sh
 # OK: different network IDs reject the same PSK.
 ```
 
-### 20. 多 controller threshold
+### 21. 多 controller threshold
 
 ```bash
 ./scripts/demo-controller-threshold.sh
 # OK: member applied a 2-controller threshold snapshot.
 ```
 
-### 21. 真正的 TUN overlay（两台机器，需要 root）
+### 22. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
