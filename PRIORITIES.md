@@ -41,15 +41,15 @@
 |---|---|---|
 | L3 overlay / TUN | 可用 | IPv4 only；macOS 未回归；无 IPv6 分片 |
 | iroh 传输 | 可用 | 默认公共 relay；无应用层成员认证 |
-| link-state/SPF | 可用 | seed 静态；无 mDNS；无 controller 跨区拓扑优化 |
+| link-state/SPF | 可用 | UDP/mDNS discovery、static seed、controller；无跨区拓扑优化 |
 | controller | 可用 | HTTP/iroh/fanout；无 Raft quorum |
 | ACL | 可用 | 配置/API/UI；无 counters/日志审计 |
 | QoS | 可用 | DSCP + token bucket + 优先级队列；无整形/队列配置 |
 | AZ | 可用 | 同 zone pref + cross-zone penalty；无 policy engine/故障域 |
-| 安全 | **不足** | 无 Hello、无成员签名、shared HMAC、API token 可选 |
-| 多网络 | **缺失** | 单 NetworkConfig / 单 TUN / 单 FIB |
-| 真实主机测试 | 部分 | bee x86_64 TUN 已通过；未做 3 节点/多主机 chaos |
-| 可观测性 | 缺失 | 无 `/metrics`、无审计日志、无 controller drift |
+| 安全 | 可用 | PSK/Ed25519、TLS、RBAC、轮换、持久化；openraft/quorum 待做 |
+| 多网络 | 可用 | 进程级隔离 + 单进程多 runtime；共享 endpoint 待做 |
+| 真实主机测试 | 可用 | 3 节点 controller+TUN 0% loss；chaos/规模待做 |
+| 可观测性 | 可用 | metrics/audit/每规则命中；tracing/dashboard 待做 |
 
 ---
 
@@ -57,8 +57,8 @@
 
 | 优先级 | 项目 | 用户价值 | 不做的风险 | 工作量 | 依赖 | 建议 |
 |---|---|---|---|---|---|---|
-| **P0** | 身份/成员认证 + Hello | 高 | 任意 iroh peer 可注入 LSA/控制帧；共享 secret 泄露即全泄 | M | 无 | **现在做** |
-| **P0** | 控制面授权/前缀 ownership | 高 | 恶意 member 广告任意前缀，劫持流量 | M | Hello | **现在做** |
+| **P0** | 身份/成员认证 + Hello | 高 | 任意 iroh peer 可注入 LSA/控制帧；共享 secret 泄露即全泄 | M | 无 | **完成：PSK/Ed25519/TLS/RBAC/轮换** |
+| **P0** | 控制面授权/前缀 ownership | 高 | 恶意 member 广告任意前缀，劫持流量 | M | Hello | **完成：grant + LSA/dataplane 强制** |
 | **P0** | 真实 3 节点 TUN/LSA/controller 测试 | 高 | 单机 demo 通过≠真实网络通过；MTU/NAT/防火墙问题 | M | Linux x86 build | **TUN/LSA + controller 3 节点已通过** |
 | **P1** | bootstrap/discovery | 高 | 部署必须手填 controller URL/peer addrs | M | 无 | **完成：UDP broadcast + PSK** |
 | **P1** | 多网络/多租户隔离 | 高 | 无法一个 agent 接入多个 overlay；产品能力缺失 | L | NetworkId/FIB/TUN | **完成：进程级隔离 + 单进程多 runtime + 凭证隔离测试** |
