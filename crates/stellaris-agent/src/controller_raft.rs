@@ -850,6 +850,59 @@ pub async fn start_http_node(
     secret: Option<String>,
     bootstrap: bool,
 ) -> anyhow::Result<HttpRaftNode> {
+    start_http_node_at(
+        model,
+        id,
+        bind,
+        peers,
+        dir,
+        secret,
+        bootstrap,
+        Arc::new(openraft::Config::default().validate()?),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_http_node_with_snapshot_policy(
+    model: ControllerModel,
+    id: u64,
+    bind: std::net::SocketAddr,
+    peers: Vec<(u64, String)>,
+    dir: Option<PathBuf>,
+    secret: Option<String>,
+    bootstrap: bool,
+    snapshot_logs: u64,
+) -> anyhow::Result<HttpRaftNode> {
+    let config = openraft::Config {
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_logs),
+        max_in_snapshot_log_to_keep: 0,
+        ..Default::default()
+    };
+    start_http_node_at(
+        model,
+        id,
+        bind,
+        peers,
+        dir,
+        secret,
+        bootstrap,
+        Arc::new(config.validate()?),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_http_node_at(
+    model: ControllerModel,
+    id: u64,
+    bind: std::net::SocketAddr,
+    peers: Vec<(u64, String)>,
+    dir: Option<PathBuf>,
+    secret: Option<String>,
+    bootstrap: bool,
+    config: Arc<openraft::Config>,
+) -> anyhow::Result<HttpRaftNode> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let address = listener.local_addr()?;
     let (log, state_path) = if let Some(dir) = &dir {
@@ -868,7 +921,6 @@ pub async fn start_http_node(
         client: reqwest::Client::new(),
         secret: secret.clone().map(Arc::new),
     };
-    let config = Arc::new(openraft::Config::default().validate()?);
     let raft = Raft::new(id, config, factory, log, store.clone()).await?;
     let app = raft_router(raft.clone(), secret);
     let server = tokio::spawn(async move {
@@ -1269,6 +1321,127 @@ mod tests {
             let _ = node.raft.shutdown().await;
             node.server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn restarting_follower_catches_up_via_snapshot() {
+        let base =
+            std::env::temp_dir().join(format!("stellaris-raft-snapshot-{}", uuid::Uuid::now_v7()));
+        let dirs: Vec<PathBuf> = (0..3).map(|i| base.join(format!("n{i}"))).collect();
+        let mut addrs = Vec::new();
+        for _ in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            drop(listener);
+        }
+        let peers: Vec<(u64, String)> = addrs
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| (i as u64 + 1, addr.to_string()))
+            .collect();
+        let mut nodes = Vec::new();
+        for i in 0..3 {
+            nodes.push(
+                start_http_node_with_snapshot_policy(
+                    ControllerModel::new(NetworkId::new(), 1),
+                    i as u64 + 1,
+                    addrs[i],
+                    peers.clone(),
+                    Some(dirs[i].clone()),
+                    Some("secret".into()),
+                    i == 0,
+                    2,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut leader = None;
+        for _ in 0..100 {
+            for (i, node) in nodes.iter().enumerate() {
+                if node.raft.current_leader().await == Some(i as u64 + 1) {
+                    leader = Some(node.raft.clone());
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let leader = leader.expect("leader");
+        // Let the leader replicate the initial empty membership before taking n3 down.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let follower = nodes.pop().unwrap();
+        follower.raft.shutdown().await.unwrap();
+        follower.server.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let node_id = NodeId::new([12u8; 32]);
+        for seq in 1..=10 {
+            leader
+                .client_write(ControllerCommand::ApplyLsa {
+                    lsa: stellaris_linkstate::Lsa {
+                        origin: node_id,
+                        seq,
+                        zone: None,
+                        links: vec![],
+                        prefixes: vec![stellaris_linkstate::Prefix {
+                            prefix: "192.168.102.0/24".parse().unwrap(),
+                            metric: 0,
+                        }],
+                        overlay_ip: Some("10.7.0.12".parse().unwrap()),
+                        addrs: vec![],
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        leader.trigger().snapshot().await.unwrap();
+
+        let restarted = start_http_node_with_snapshot_policy(
+            ControllerModel::new(NetworkId::new(), 1),
+            3,
+            addrs[2],
+            peers,
+            Some(dirs[2].clone()),
+            Some("secret".into()),
+            false,
+            2,
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if restarted
+                .store
+                .model()
+                .await
+                .lsas
+                .get(&node_id)
+                .map(|l| l.seq)
+                == Some(10)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            restarted
+                .store
+                .model()
+                .await
+                .lsas
+                .get(&node_id)
+                .map(|l| l.seq),
+            Some(10)
+        );
+        restarted.raft.shutdown().await.unwrap();
+        restarted.server.abort();
+        for node in nodes {
+            let _ = node.raft.shutdown().await;
+            node.server.abort();
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

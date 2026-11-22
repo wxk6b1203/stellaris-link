@@ -447,7 +447,9 @@ three_node_raft_over_http
 - 尚未使用 TLS/mTLS
 - 3 节点可通过 `start_http_cluster_on_disk` 落盘并在整体重启后恢复
 - 集群重启测试已验证（固定监听地址）
-- snapshot 传输已实现（`POST /raft/snapshot` + `SnapshotRpc`），尚未做坏包/分块/大快照测试
+- snapshot 传输已实现（`POST /raft/snapshot` + `SnapshotRpc`）
+- 已验证停掉的 follower 重启后通过 snapshot 追平（`restarting_follower_catches_up_via_snapshot`）
+- 大快照/断点/校验和仍未测试
 - controller 支持 `control.raft_dir` 启用单节点 Raft
 - `/v1/lsa` 在 Raft 模式走 `client_write`
 - `/v1/snapshot` / `/v1/model` 从 Raft state machine 生成
