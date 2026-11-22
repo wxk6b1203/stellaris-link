@@ -2,7 +2,7 @@
 
 **A fully controllable, Rust-native L3 overlay network with optional control plane, per-node route query, and route adjustment.**
 
-> 状态：**MVP+ 已实现**（2026-11-22）。当前是 static-peer + signed controller（HTTP/iroh）+ 分布式 LSA/SPF；**下一步优先级见 [PRIORITIES.md](PRIORITIES.md)**，openraft HA 设计见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
+> 状态：**P0/P1 MVP 已完成**（2026-11-22）。成员/前缀授权、controller 签名与 threshold、真实 3 节点 controller+TUN、UDP discovery、多网络进程级隔离、ACL/QoS counters/整形/审计、RoutePolicy/AZ 均已落地。openraft HA 属 P2，设计见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。
 
 ## MVP 已实现

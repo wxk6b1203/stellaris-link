@@ -42,7 +42,7 @@
 - [ ] ACL/QoS 审计日志、复杂整形。
 - [ ] 完整 controller（openraft quorum/leader election）、mDNS/广播发现、ACL/QoS 复杂整形/队列配置、多网络、Windows、macOS NAT。
 
-下一阶段：安全/成员认证 → 真实 3 节点验证 → bootstrap/discovery → 多网络 → openraft HA（见 PRIORITIES.md / OPENRAFT-HA.md）。
+P0/P1 已完成；下一阶段：openraft HA（P2）与 mDNS/单进程多网络/tracing 等增强。
 
 ---
 

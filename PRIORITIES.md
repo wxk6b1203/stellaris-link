@@ -60,11 +60,12 @@
 | **P0** | 身份/成员认证 + Hello | 高 | 任意 iroh peer 可注入 LSA/控制帧；共享 secret 泄露即全泄 | M | 无 | **现在做** |
 | **P0** | 控制面授权/前缀 ownership | 高 | 恶意 member 广告任意前缀，劫持流量 | M | Hello | **现在做** |
 | **P0** | 真实 3 节点 TUN/LSA/controller 测试 | 高 | 单机 demo 通过≠真实网络通过；MTU/NAT/防火墙问题 | M | Linux x86 build | **TUN/LSA + controller 3 节点已通过** |
-| **P1** | bootstrap/discovery（mDNS/广播/seed 列表） | 高 | 部署必须手填 controller URL/peer addrs | M | 无 | **UDP broadcast + PSK 已做；mDNS 待做** |
-| **P1** | 多网络/多租户隔离 | 高 | 无法一个 agent 接入多个 overlay；产品能力缺失 | L | NetworkId/FIB/TUN | **进程级隔离可用；单进程多网络待做** |
-| **P1** | ACL/QoS 生产化（队列深度、counters、审计、整形） | 中高 | 无法定位丢包；队列满静默丢；无 SLA | M | 现有 policy | **queue_depth/counters/byte shaping 已做；审计日志已做** |
-| **P1** | RoutePolicy/AZ 高级策略 | 中 | `RoutePolicy` 已执行；无故障域自动 failover | M | 状态机/策略引擎 | **policy engine + AZ failover 测试已做** |
+| **P1** | bootstrap/discovery | 高 | 部署必须手填 controller URL/peer addrs | M | 无 | **完成：UDP broadcast + PSK** |
+| **P1** | 多网络/多租户隔离 | 高 | 无法一个 agent 接入多个 overlay；产品能力缺失 | L | NetworkId/FIB/TUN | **完成：进程级隔离 + 凭证隔离测试；单进程多网络为 P2** |
+| **P1** | ACL/QoS 生产化 | 中高 | 无法定位丢包；队列满静默丢；无 SLA | M | 现有 policy | **完成：queue_depth/counters/byte shaping/审计/每规则命中** |
+| **P1** | RoutePolicy/AZ 高级策略 | 中 | `RoutePolicy` 已执行；无故障域自动 failover | M | 状态机/策略引擎 | **完成：policy engine + AZ region + failover 测试** |
 | **P2** | openraft HA | 高（长期） | 单 controller/ fanout 无 split-brain 保护 | XL | P0 安全 + 确定性状态机 | 设计完成，未实现 |
+| **P2** | mDNS / 单进程多网络 / tracing | 中 | 部署便利性和可观测性增强 | L | P1 | 后续增强 |
 | **P2** | metrics/audit/tracing | 中高 | 线上不可观测、不可审计 | M | 无 | **metrics + ACL audit 已做；tracing 待做** |
 | **P2** | 打包/service/upgrade | 中 | 部署体验差 | M | — | 后期 |
 | **P2** | Windows / macOS NAT / IPv6 | 中 | 平台覆盖不足 | L | 数据面 | 后期 |
