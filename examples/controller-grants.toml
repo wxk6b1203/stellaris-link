@@ -1,0 +1,37 @@
+[node]
+name = "controller"
+role = "controller"
+state_dir = "./state/controller"
+overlay_ip = "10.7.0.254"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+bind = "0.0.0.0:7800"
+secret = "change-me"
+epoch = 1
+# Members verify controller snapshots with these Ed25519 NodeIds.
+# controller_keys = ["<controller-node-id>"]
+iroh_port = 43100
+
+[transport]
+disable_relay = false
+
+[api]
+bind = "127.0.0.1:7801"
+
+# Optional allowlist/prefix grants. If empty, controller accepts any LSA.
+# Each member may always advertise its own overlay /32; extra prefixes need a grant.
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.7.0.1"
+prefixes = ["192.168.50.0/24"]
+capabilities = ["member", "gateway"]
+
+[[control.members]]
+node_id = "0202020202020202020202020202020202020202020202020202020202020202"
+overlay_ip = "10.7.0.2"
+prefixes = []
+capabilities = ["member"]

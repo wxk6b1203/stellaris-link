@@ -55,6 +55,7 @@ cidr = "10.104.0.0/16"
 endpoint_id = "$CID"
 addrs = ["127.0.0.1:$CTRL_IROH"]
 secret = "demo-secret"
+controller_keys = ["$CID"]
 
 [transport]
 disable_relay = true

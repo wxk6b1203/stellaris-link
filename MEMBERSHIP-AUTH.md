@@ -1,6 +1,6 @@
 # 入网与成员授权 — 设计
 
-> 状态：设计稿；当前已实现 **PSK 双向 HMAC 入网认证**，controller-signed membership/prefix grant 仍在实现中。
+> 状态：设计稿；已实现 **PSK 双向 HMAC 入网认证 + allowlist**、controller Ed25519 snapshot 签名、controller 侧 member/prefix grant 校验。Join token、完整 signed membership manifest、member 侧前缀强制仍在实现中。
 > 关联：[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、[PROTOCOL.md](PROTOCOL.md)
 > 目标：把“谁能加入网络、谁能让别人加入、谁能广告哪些前缀”设计清楚，再实现。
 
@@ -353,17 +353,20 @@ gateway/exit 才能广告其他前缀
 - `NetworkAuthConfig`：`none | psk` + `secret` + `allowed_nodes`；
 - iroh 连接建立后、数据/LSA 前做 PSK handshake；
 - 错误 secret 拒绝连接；
-- 测试脚本 `scripts/demo-psk-join.sh` 已通过。
+- controller Ed25519 snapshot 签名 + member `controller_keys` 校验；
+- controller `control.members` allowlist / 每 member prefix grant；
+- 未授权 LSA origin、overlay_ip、prefix、link target 被拒绝；
+- 测试脚本 `scripts/demo-psk-join.sh`、`scripts/demo-iroh-controller.sh` 已通过。
 
 ### 9.2 待实现
 
-- controller Ed25519 key + signed membership manifest；
+- 完整 signed membership manifest（当前是 controller 内存 grants + snapshot 签名）；
 - JoinRequest/one-time token；
-- `MemberGrant` + prefix authorization；
+- member 侧对 LSA/数据面前缀的 grant 强制（当前 controller 入口校验）；
 - controller key set/threshold；
 - multi-network runtime；
 - revocation/epoch propagation；
-- openraft command integration.
+- openraft command integration。
 
 ---
 
