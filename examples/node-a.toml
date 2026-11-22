@@ -1,0 +1,33 @@
+[node]
+name = "node-a"
+state_dir = "./state/node-a"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[transport]
+relay_urls = []
+listen_port = 41001
+
+[routing]
+rib_mode = "full"
+max_routes = 10000
+ecmp_max = 8
+
+[dataplane]
+enabled = false
+tun_name = "stellaris0"
+mtu = 1280
+
+[api]
+bind = "127.0.0.1:7781"
+
+# Add the other node after running:
+#   stellaris-agent --config examples/node-a.toml --print-id
+# [[peers]]
+# name = "node-..."
+# endpoint_id = "..."
+# overlay_ip = "10.7.0...."
+# addrs = ["127.0.0.1:..."]

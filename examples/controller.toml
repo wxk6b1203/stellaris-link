@@ -1,0 +1,26 @@
+[node]
+name = "controller"
+role = "controller"
+state_dir = "./state/controller"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+bind = "127.0.0.1:7800"
+secret = "change-me"
+
+[api]
+bind = "127.0.0.1:7801"
+
+# Named peers are used to resolve [[routes]].via.
+[[peers]]
+name = "node-b"
+endpoint_id = "0202020202020202020202020202020202020202020202020202020202020202"
+overlay_ip = "10.7.0.2"
+
+# Network-scope static routes pushed to members.
+[[routes]]
+prefix = "192.168.50.0/24"
+via = "node-b"

@@ -1,0 +1,37 @@
+[node]
+name = "policy-demo"
+state_dir = "./state/policy-demo"
+overlay_ip = "10.7.0.1"
+zone = "az-a"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[dataplane]
+enabled = false
+tun_name = "stellaris0"
+mtu = 1280
+
+[api]
+bind = "127.0.0.1:7783"
+
+# Deny inbound SSH; allow everything else by default.
+[acl]
+default_action = "allow"
+[[acl.rules]]
+name = "deny-inbound-ssh"
+action = "deny"
+direction = "inbound"
+protocol = 6
+dst_port = 22
+
+# DSCP EF for UDP/443 (example; real DSCP depends on your underlay).
+[qos]
+enabled = true
+[[qos.classes]]
+name = "realtime"
+priority = 100
+dscp = 46
+protocol = 17
+dst_port = 443

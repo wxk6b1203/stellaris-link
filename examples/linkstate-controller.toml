@@ -1,0 +1,15 @@
+[node]
+name = "controller"
+role = "controller"
+state_dir = "./state/linkstate-controller"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+bind = "127.0.0.1:7800"
+secret = "change-me"
+
+[api]
+bind = "127.0.0.1:7801"

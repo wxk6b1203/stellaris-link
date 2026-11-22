@@ -1,0 +1,21 @@
+[node]
+name = "member"
+state_dir = "./state/linkstate-member"
+overlay_ip = "10.7.0.1"
+zone = "az-a"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+url = "http://127.0.0.1:7800"
+secret = "change-me"
+
+[transport]
+relay_urls = []
+disable_relay = true
+listen_port = 41301
+
+[api]
+bind = "127.0.0.1:7784"
