@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, bail};
 use axum::extract::{Query, State};
+use axum::http::HeaderValue;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -353,6 +354,13 @@ impl ControllerState {
         match &self.raft_store {
             Some(store) => self.snapshot_from_model(store.model().await, local),
             None => self.snapshot(local),
+        }
+    }
+
+    pub async fn leader_hint(&self) -> Option<u64> {
+        match &self.raft {
+            Some(raft) => raft.current_leader().await,
+            None => None,
         }
     }
 
@@ -1161,6 +1169,22 @@ struct SnapshotQuery {
     node: Option<String>,
 }
 
+async fn controller_error(state: &ControllerState, code: u16, message: String) -> Response {
+    let mut response = (
+        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        message,
+    )
+        .into_response();
+    if let Some(leader) = state.leader_hint().await
+        && let Ok(value) = HeaderValue::from_str(&leader.to_string())
+    {
+        response
+            .headers_mut()
+            .insert("x-stellaris-raft-leader", value);
+    }
+    response
+}
+
 async fn snapshot(
     State(state): State<ControllerState>,
     headers: HeaderMap,
@@ -1214,11 +1238,7 @@ async fn apply_lsa(
             }))
             .into_response()
         }
-        Err((code, message)) => (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
-            message,
-        )
-            .into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
     }
 }
 
@@ -1255,11 +1275,7 @@ async fn join(
             "generation": state.generation.load(Ordering::Relaxed),
         }))
         .into_response(),
-        Err((code, message)) => (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
-            message,
-        )
-            .into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
     }
 }
 
@@ -1288,11 +1304,7 @@ async fn revoke(
             "generation": state.generation.load(Ordering::Relaxed),
         }))
         .into_response(),
-        Err((code, message)) => (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
-            message,
-        )
-            .into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
     }
 }
 
@@ -1318,11 +1330,7 @@ async fn ack(
     };
     match state.ack_current(node, req.generation, req.epoch).await {
         Ok(()) => Json(json!({"acked": req.generation, "node": node.to_string()})).into_response(),
-        Err((code, message)) => (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
-            message,
-        )
-            .into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
     }
 }
 
@@ -1628,6 +1636,65 @@ via = "b"
     async fn json(response: axum::response::Response) -> serde_json::Value {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn follower_returns_leader_hint() {
+        let mut state = state();
+        let models = (0..3)
+            .map(|_| ControllerModel::new(state.network, state.epoch))
+            .collect();
+        let (rafts, stores) = crate::controller_raft::start_cluster(models).await.unwrap();
+        let mut leader = None;
+        for _ in 0..50 {
+            for (id, raft) in rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(*id);
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let leader = leader.expect("leader");
+        let follower = (1..=3).find(|id| *id != leader).unwrap();
+        let raft = rafts.read().await.get(&follower).cloned().unwrap();
+        state.set_raft(Arc::new(raft), stores[(follower - 1) as usize].clone());
+        let app = router(state);
+        let body = json!({
+            "origin": NodeId::new([11u8; 32]).to_string(),
+            "seq": 1,
+            "zone": null,
+            "links": [],
+            "prefixes": [],
+            "overlay_ip": "10.7.0.11",
+            "addrs": []
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/lsa")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-stellaris-raft-leader")
+                .and_then(|v| v.to_str().ok()),
+            Some(leader.to_string().as_str())
+        );
+        for raft in rafts.read().await.values() {
+            let _ = raft.shutdown().await;
+        }
     }
 
     #[tokio::test]
