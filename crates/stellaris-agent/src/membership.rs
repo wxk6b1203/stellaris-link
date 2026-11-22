@@ -48,6 +48,29 @@ pub fn manifest_grants(members: &[crate::controller::MemberView]) -> HashMap<Nod
         .collect()
 }
 
+/// Enforce controller grants (when present) on the dataplane source address.
+pub fn inbound_source_allowed(state: &crate::AgentState, peer: NodeId, src: IpAddr) -> bool {
+    let grants = state.grants.read().unwrap_or_else(|e| e.into_inner());
+    if grants.is_empty() {
+        return state.peers.get(&peer).is_some_and(|p| {
+            src == p.overlay_ip || p.advertised.iter().any(|prefix| prefix.contains(&src))
+        });
+    }
+    let Some(grant) = grants.get(&peer) else {
+        return false;
+    };
+    let owns =
+        grant.overlay_ip == Some(src) || grant.prefixes.iter().any(|prefix| prefix.contains(&src));
+    if owns {
+        return true;
+    }
+    // A transit/gateway member may carry another granted member's source.
+    grant.capabilities.iter().any(|c| c == "transit")
+        && grants.values().any(|g| {
+            g.overlay_ip == Some(src) || g.prefixes.iter().any(|prefix| prefix.contains(&src))
+        })
+}
+
 pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa) -> bool {
     let grants = state.grants.read().unwrap_or_else(|e| e.into_inner());
     if !grants.is_empty() {
@@ -324,6 +347,71 @@ overlay_ip = "10.7.0.2"
             ..own
         };
         assert!(!lsa_authorized(&state, &unknown));
+    }
+
+    #[test]
+    fn dataplane_grants_allow_own_and_transit_sources() {
+        use stellaris_types::Config;
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-iface-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[[peers]]
+name = "b"
+endpoint_id = "{}"
+overlay_ip = "10.7.0.2"
+"#,
+            dir.display(),
+            hex::encode([2u8; 32])
+        );
+        let state = crate::AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        let b = NodeId::new([2u8; 32]);
+        state.grants.write().unwrap().insert(
+            b,
+            Grant {
+                overlay_ip: Some("10.7.0.2".parse().unwrap()),
+                prefixes: vec!["192.168.50.0/24".parse().unwrap()],
+                capabilities: vec!["transit".into()],
+            },
+        );
+        assert!(inbound_source_allowed(
+            &state,
+            b,
+            "10.7.0.2".parse().unwrap()
+        ));
+        assert!(inbound_source_allowed(
+            &state,
+            b,
+            "192.168.50.9".parse().unwrap()
+        ));
+        assert!(!inbound_source_allowed(
+            &state,
+            b,
+            "10.7.0.99".parse().unwrap()
+        ));
+        state.grants.write().unwrap().insert(
+            NodeId::new([1u8; 32]),
+            Grant {
+                overlay_ip: Some("10.7.0.1".parse().unwrap()),
+                prefixes: Vec::new(),
+                capabilities: vec!["member".into()],
+            },
+        );
+        assert!(inbound_source_allowed(
+            &state,
+            b,
+            "10.7.0.1".parse().unwrap()
+        ));
     }
 
     #[test]

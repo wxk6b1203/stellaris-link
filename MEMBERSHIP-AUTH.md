@@ -361,11 +361,12 @@ gateway/exit 才能广告其他前缀
 - `POST /v1/revoke`：撤销 member，移除其 grant/LSA/ACK，generation+1；strict membership 下空 grant 不会退化为 allow-all；
 - 独立 signed membership manifest：`GET /v1/manifest`，member 校验 Ed25519/expiry 后更新 grants；
 - 未授权 LSA origin、overlay_ip、prefix、link target 被拒绝；
+- 数据面 source 按 grant 检查；transit 需要 `transit` capability；
 - 测试：`demo-psk-join.sh`、`demo-iroh-controller.sh`、`join_token_admits_once_and_grants_prefix`。
 
 ### 9.2 待实现
 
-- 数据面前缀仍由 anti-spoof + peer advertised 约束；
+- 数据面前缀已由 controller grant + `transit` capability 约束；
 - multi-network runtime；
 - openraft command integration。
 

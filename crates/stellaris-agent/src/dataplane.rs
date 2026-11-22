@@ -442,16 +442,10 @@ pub fn decide_inbound(
         return InboundAction::Drop("unparsable payload");
     };
 
-    // MVP anti-spoof: only the peer's own overlay IP is allowed.
     let Some(peer) = state.peers.get(&from) else {
         return InboundAction::Drop("unknown peer");
     };
-    let source_allowed = info.src == peer.overlay_ip
-        || peer
-            .advertised
-            .iter()
-            .any(|prefix| prefix.contains(&info.src));
-    if !source_allowed {
+    if !crate::membership::inbound_source_allowed(state, from, info.src) {
         return InboundAction::Drop("spoofed source");
     }
 
