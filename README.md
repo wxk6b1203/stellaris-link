@@ -365,6 +365,7 @@ IPv6：
 ```bash
 sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat66.sh
 # OK: public exit + NAT66 works.
+# NAT66 mapping consistent
 ```
 
 ### 21.7 Public exit + NAT44

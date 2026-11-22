@@ -3,7 +3,7 @@ set -euo pipefail
 BIN="${BIN:-$(pwd)/target/release/stellaris-agent}"
 DIR="${DIR:-/tmp/stellaris-exit-nat66}"
 rm -rf "$DIR"; mkdir -p "$DIR"
-cleanup(){ kill ${A_PID:-} ${B_PID:-} 2>/dev/null || true; for ns in sa sb sc; do ip netns del $ns 2>/dev/null || true; done; [ "${KEEP:-0}" = 1 ] || rm -rf "$DIR"; }
+cleanup(){ kill ${A_PID:-} ${B_PID:-} ${UDP_PID:-} 2>/dev/null || true; for ns in sa sb sc; do ip netns del $ns 2>/dev/null || true; done; [ "${KEEP:-0}" = 1 ] || rm -rf "$DIR"; }
 trap cleanup EXIT
 for ns in sa sb sc; do ip netns del $ns 2>/dev/null || true; ip netns add $ns; ip netns exec $ns ip link set lo up; ip netns exec $ns sysctl -qw net.ipv6.conf.all.forwarding=1; done
 ip link add va type veth peer name vb1; ip link set va netns sa; ip link set vb1 netns sb
@@ -98,6 +98,39 @@ set +e
 ip netns exec sa ping -6 -c 3 -W 2 fd00:201::2
 PING_RC=$?
 set -e
+echo '--- NAT66 mapping consistency ---'
+cat > "$DIR/udp_server.py" <<'PY'
+import socket
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("fd00:201::2", 9999))
+for _ in range(3):
+    data, peer = s.recvfrom(2048)
+    print(f"{peer[0]}:{peer[1]} {data.decode()}")
+s.close()
+PY
+ip netns exec sc python3 "$DIR/udp_server.py" > "$DIR/udp_server.out" 2>&1 & UDP_PID=$!
+sleep 1
+ip netns exec sa python3 - <<'PY'
+import socket, time
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+for i in range(3):
+    s.sendto(f"udp6-{i}".encode(), ("fd00:201::2", 9999))
+    time.sleep(0.1)
+s.close()
+PY
+wait "$UDP_PID" || true
+UDP_PID=
+cat "$DIR/udp_server.out"
+python3 - "$DIR/udp_server.out" <<'PY'
+import sys
+lines = [line.split()[0] for line in open(sys.argv[1]) if line.strip()]
+assert len(lines) == 3, lines
+assert len(set(lines)) == 1, f"NAT66 mapping changed: {lines}"
+host, _ = lines[0].rsplit(":", 1)
+assert host == "fd00:201::1", f"unexpected NAT66 source {host}"
+print("NAT66 mapping consistent")
+PY
 echo '--- logs ---'
+
 for f in "$DIR"/{a,b}.log; do echo "===$f"; grep -E 'inbound|outbound|NAT|nat|forward|dropped|error' "$f" | tail -30; done
 if [ "$PING_RC" = 0 ]; then echo "OK: public exit + NAT66 works."; else echo "FAIL: public exit IPv6 ping failed" >&2; exit 1; fi
