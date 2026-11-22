@@ -245,6 +245,7 @@ impl IrohTransport {
 
     fn insert_conn(&self, node: NodeId, conn: iroh::endpoint::Connection) {
         let stable_id = conn.stable_id();
+        info!(peer = %node.short(), stable_id, "connection installed");
         self.conns
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -262,6 +263,7 @@ impl IrohTransport {
             .unwrap_or_else(|e| e.into_inner())
             .get(&node)
             .copied();
+        info!(peer = %node.short(), stable_id, current, "connection close observed");
         if current == Some(stable_id) {
             self.conns
                 .write()
