@@ -2,10 +2,10 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -32,29 +32,32 @@ pub async fn start(
     transport: Arc<IrohTransport>,
     mut inbound_rx: mpsc::Receiver<InboundPacket>,
 ) -> anyhow::Result<()> {
-    let local_ip = local_ipv4(&state)?;
+    let local_ip = local_ip(&state)?;
     let tun_name = tun_name(&state);
     if !state.config.dataplane.advertise.is_empty() {
         crate::gateway::ensure_forwarding()?;
         if state.config.dataplane.nat {
-            crate::gateway::ensure_nat(&state.config.network.cidr.to_string(), &tun_name)?;
-            info!("subnet gateway NAT enabled");
+            if matches!(state.config.network.cidr, ipnet::IpNet::V4(_)) {
+                crate::gateway::ensure_nat(&state.config.network.cidr.to_string(), &tun_name)?;
+                info!("subnet gateway NAT enabled");
+            } else {
+                warn!("NAT is only enabled for IPv4 overlay; IPv6 gateway is routed");
+            }
         }
         info!(
             prefixes = ?state.config.dataplane.advertise,
             "subnet gateway forwarding enabled"
         );
     }
-    let prefix_len = match state.config.network.cidr {
-        ipnet::IpNet::V4(cidr) => cidr.prefix_len(),
-        ipnet::IpNet::V6(_) => bail!("MVP dataplane supports IPv4 overlay CIDR only"),
-    };
+    let prefix_len = state.config.network.cidr.prefix_len();
     // Conservative initial MTU; the monitor raises it once iroh reports path capacity.
     let initial_mtu = state.config.dataplane.mtu.min(1100);
-    let dev = DeviceBuilder::new()
-        .name(tun_name.clone())
-        .ipv4(local_ip, prefix_len, None)
-        .mtu(initial_mtu)
+    let mut builder = DeviceBuilder::new().name(tun_name.clone()).mtu(initial_mtu);
+    builder = match local_ip {
+        IpAddr::V4(ip) => builder.ipv4(ip, prefix_len, None),
+        IpAddr::V6(ip) => builder.ipv6(ip, prefix_len),
+    };
+    let dev = builder
         .build_async()
         .context("create TUN device (need root/CAP_NET_ADMIN)")?;
     let dev = Arc::new(dev);
@@ -121,14 +124,12 @@ fn tun_name(state: &AgentState) -> String {
     }
 }
 
-fn local_ipv4(state: &AgentState) -> anyhow::Result<Ipv4Addr> {
-    let Some(local_ip) = state.config.node.overlay_ip else {
-        bail!("node.overlay_ip is required when dataplane is enabled");
-    };
-    match local_ip {
-        std::net::IpAddr::V4(ip) => Ok(ip),
-        std::net::IpAddr::V6(_) => bail!("MVP dataplane supports IPv4 overlay only"),
-    }
+fn local_ip(state: &AgentState) -> anyhow::Result<IpAddr> {
+    state
+        .config
+        .node
+        .overlay_ip
+        .ok_or_else(|| anyhow::anyhow!("node.overlay_ip is required when dataplane is enabled"))
 }
 
 fn spawn_route_reconciler(
@@ -173,7 +174,11 @@ fn spawn_route_reconciler(
 
 #[cfg(target_os = "linux")]
 fn install_os_route(prefix: ipnet::IpNet, tun: &str) -> bool {
-    let status = std::process::Command::new("ip")
+    let mut command = std::process::Command::new("ip");
+    if matches!(prefix, ipnet::IpNet::V6(_)) {
+        command.arg("-6");
+    }
+    let status = command
         .args(["route", "replace", &prefix.to_string(), "dev", tun])
         .status();
     match status {
@@ -191,25 +196,48 @@ fn install_os_route(prefix: ipnet::IpNet, tun: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn remove_os_route(prefix: ipnet::IpNet, tun: &str) {
-    let _ = std::process::Command::new("ip")
+    let mut command = std::process::Command::new("ip");
+    if matches!(prefix, ipnet::IpNet::V6(_)) {
+        command.arg("-6");
+    }
+    let _ = command
         .args(["route", "del", &prefix.to_string(), "dev", tun])
         .status();
 }
 
 #[cfg(target_os = "macos")]
 fn install_os_route(prefix: ipnet::IpNet, tun: &str) -> bool {
+    let family = if matches!(prefix, ipnet::IpNet::V6(_)) {
+        "-inet6"
+    } else {
+        "-inet"
+    };
     let status = std::process::Command::new("route")
-        .args(["-n", "add", "-net", &prefix.to_string(), "-interface", tun])
+        .args([
+            "-n",
+            "add",
+            family,
+            "-net",
+            &prefix.to_string(),
+            "-interface",
+            tun,
+        ])
         .status();
     matches!(status, Ok(s) if s.success())
 }
 
 #[cfg(target_os = "macos")]
 fn remove_os_route(prefix: ipnet::IpNet, tun: &str) {
+    let family = if matches!(prefix, ipnet::IpNet::V6(_)) {
+        "-inet6"
+    } else {
+        "-inet"
+    };
     let _ = std::process::Command::new("route")
         .args([
             "-n",
             "delete",
+            family,
             "-net",
             &prefix.to_string(),
             "-interface",
@@ -357,8 +385,8 @@ fn route_outbound_priority(
     packet: &[u8],
 ) -> Option<(stellaris_types::NodeId, Bytes, i32)> {
     let info = PacketInfo::parse(packet)?;
-    let local = local_ipv4(state).ok()?;
-    if info.dst == std::net::IpAddr::V4(local) {
+    let local = state.config.node.overlay_ip?;
+    if info.dst == local {
         return None;
     }
     let entry = state.routes.lookup(info.dst)?;
@@ -460,10 +488,10 @@ pub fn decide_inbound(
         return InboundAction::Drop("spoofed source");
     }
 
-    let Ok(local) = local_ipv4(state) else {
+    let Some(local) = state.config.node.overlay_ip else {
         return InboundAction::Drop("no local overlay IP");
     };
-    let is_local = info.dst == std::net::IpAddr::V4(local);
+    let is_local = info.dst == local;
     let is_gateway = state
         .config
         .dataplane
@@ -565,6 +593,45 @@ via = "c"
             hex::encode([3u8; 32])
         );
         AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
+    }
+
+    fn state_v6() -> AgentState {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-dataplane-v6-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "fd00::1"
+
+[network]
+name = "demo6"
+cidr = "fd00::/64"
+
+[[peers]]
+name = "b"
+endpoint_id = "{}"
+overlay_ip = "fd00::2"
+"#,
+            dir.display(),
+            hex::encode([2u8; 32]),
+        );
+        AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
+    }
+
+    fn v6(src: [u8; 16], dst: [u8; 16], hop: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 40 + 8];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&8u16.to_be_bytes());
+        p[6] = 17;
+        p[7] = hop;
+        p[8..24].copy_from_slice(&src);
+        p[24..40].copy_from_slice(&dst);
+        p[40..42].copy_from_slice(&1234u16.to_be_bytes());
+        p[42..44].copy_from_slice(&53u16.to_be_bytes());
+        p
     }
 
     fn v4(src: [u8; 4], dst: [u8; 4], ttl: u8) -> Vec<u8> {
@@ -793,6 +860,35 @@ overlay_ip = "10.7.0.2"
         let state = state();
         // c (192.168.50.3) is behind peer b; b relays the reply to a.
         let p = v4([192, 168, 50, 3], [10, 7, 0, 1], 64);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MeshHeader::new(state.network, 64, 0).encode());
+        frame.extend_from_slice(&p);
+        assert_eq!(
+            decide_inbound(&state, node(2), &frame),
+            InboundAction::Deliver(p)
+        );
+    }
+    #[test]
+    fn ipv6_outbound_uses_fib() {
+        let state = state_v6();
+        let p = v6(
+            "fd00::1".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            "fd00::2".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            64,
+        );
+        let (next, frame) = route_outbound(&state, &p).unwrap();
+        assert_eq!(next, node(2));
+        assert_eq!(frame.len(), HEADER_LEN + p.len());
+    }
+
+    #[test]
+    fn ipv6_inbound_local_delivers() {
+        let state = state_v6();
+        let p = v6(
+            "fd00::2".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            "fd00::1".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            64,
+        );
         let mut frame = Vec::new();
         frame.extend_from_slice(&MeshHeader::new(state.network, 64, 0).encode());
         frame.extend_from_slice(&p);

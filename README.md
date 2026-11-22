@@ -350,7 +350,15 @@ cargo build -p stellaris-agent --bin stellaris-controller
 # OK: 3-controller raft TLS join/LSA/snapshot works.
 ```
 
-### 21.7 Raft mTLS E2E
+### 21.7 Dataplane IPv6 基础
+
+- `node.overlay_ip` / `network.cidr` 可为 IPv6
+- TUN 创建 IPv6 地址
+- Linux/macOS IPv6 route 安装
+- IPv6 outbound FIB / inbound local delivery 单测通过
+- IPv6 当前不做 NAT（网关路由）
+
+### 21.8 Raft mTLS E2E
 
 ```bash
 cargo build -p stellaris-agent --bin stellaris-controller
