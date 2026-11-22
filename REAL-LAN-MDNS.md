@@ -73,6 +73,28 @@ OpenWrt x86_64（10.0.10.239）可选测试未完成：
 - 静态 musl agent 启动即 SIGSEGV
 - 说明 OpenWrt 侧二进制/CPU/兼容性仍需排查，不是 mDNS 协议问题
 
+## 容器替代验证（成功）
+
+没有第二台 Linux 主机时，使用同一 Docker bridge 上的两个 Linux 容器：
+
+```bash
+BIN=./target/release/stellaris-agent ./scripts/test-docker-mdns.sh
+```
+
+结果：
+
+```text
+OK: container mDNS discovery + PSK works.
+```
+
+两个容器都：
+
+- mDNS 发现对方
+- 建立 iroh transport 连接
+- 通过 PSK handshake
+
+这验证了 Linux 网络栈上的完整 mDNS 发现 + 认证流程，只是不是物理 LAN。
+
 ## 结论
 
 真实局域网 mDNS 的 **服务注册与 browse** 已验证：
@@ -80,7 +102,8 @@ OpenWrt x86_64（10.0.10.239）可选测试未完成：
 - bee → macOS：agent 日志发现
 - macOS → bee：`dns-sd` 发现
 
-完整 agent 双向连接受 macOS firewall/local-network 权限阻塞，未验证通过。
+完整 agent 双向连接受 macOS firewall/local-network 权限阻塞，未在物理 LAN 上验证通过；
+但 Docker bridge 容器已完整通过。
 
 ## 下一步
 

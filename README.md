@@ -239,7 +239,16 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-mdns.sh
 
 mDNS 服务类型：`_stellaris._udp.local.`；发现后仍必须通过 PSK/controller 认证。
 
-### 14. 真实局域网 mDNS 验证
+### 14. Docker mDNS 完整验证
+
+```bash
+BIN=./target/release/stellaris-agent ./scripts/test-docker-mdns.sh
+# OK: container mDNS discovery + PSK works.
+```
+
+两个 Docker bridge 容器完成 mDNS 发现、iroh 连接、PSK 认证。
+
+### 15. 真实局域网 mDNS 验证
 
 见 [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md)。已在 macOS + bee 同一 /24 上验证：
 - bee agent 发现 macOS mDNS 服务
@@ -247,7 +256,7 @@ mDNS 服务类型：`_stellaris._udp.local.`；发现后仍必须通过 PSK/cont
 
 完整双向 agent 连接受 macOS firewall/local-network 权限影响，未宣称通过。
 
-### 15. UDP bootstrap discovery（Linux netns）
+### 16. UDP bootstrap discovery（Linux netns）
 
 ```toml
 [transport]
@@ -262,7 +271,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 发现只产生候选 peer，仍必须通过 PSK/controller 认证。
 
-### 16. Controller + 3 members（本机）
+### 17. Controller + 3 members（本机）
 
 ```bash
 ./scripts/demo-controller-3node.sh
@@ -270,7 +279,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 一个 controller + 三个 member，验证 controller ACK、snapshot 成员、LSA 路由学习。
 
-### 17. Controller + 3 TUN 节点（Linux netns）
+### 18. Controller + 3 TUN 节点（Linux netns）
 
 ```bash
 sudo BIN=./target/release/stellaris-agent \
@@ -280,21 +289,21 @@ sudo BIN=./target/release/stellaris-agent \
 
 验证 controller 路由、LSA、TUN transit、双向 0% loss 和 1000B 包。
 
-### 18. 多网络凭证隔离
+### 19. 多网络凭证隔离
 
 ```bash
 ./scripts/demo-multi-network-isolation.sh
 # OK: different network IDs reject the same PSK.
 ```
 
-### 19. 多 controller threshold
+### 20. 多 controller threshold
 
 ```bash
 ./scripts/demo-controller-threshold.sh
 # OK: member applied a 2-controller threshold snapshot.
 ```
 
-### 20. 真正的 TUN overlay（两台机器，需要 root）
+### 21. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
