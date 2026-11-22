@@ -264,7 +264,14 @@ sudo BIN=./target/release/stellaris-agent \
 # OK: different network IDs reject the same PSK.
 ```
 
-### 17. 真正的 TUN overlay（两台机器，需要 root）
+### 17. 多 controller threshold
+
+```bash
+./scripts/demo-controller-threshold.sh
+# OK: member applied a 2-controller threshold snapshot.
+```
+
+### 18. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
