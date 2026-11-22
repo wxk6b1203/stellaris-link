@@ -16,3 +16,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - run: cargo build --bins
+      - run: ./scripts/test-tls.sh
+      - run: BIN=target/debug/stellaris-agent ./scripts/test-docker-mdns.sh
