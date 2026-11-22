@@ -615,14 +615,6 @@ async fn handle_inbound(
     }
 }
 
-fn mtu_for_packet(state: &AgentState, packet: &[u8]) -> u16 {
-    if packet.first().is_some_and(|b| b >> 4 == 6) {
-        state.config.dataplane.mtu.max(1280)
-    } else {
-        state.config.dataplane.mtu.min(1100)
-    }
-}
-
 fn path_mtu(state: &AgentState, peer: Option<&crate::PeerState>, packet: &[u8]) -> u16 {
     let v6 = packet.first().is_some_and(|b| b >> 4 == 6);
     let configured = if v6 {
@@ -637,12 +629,17 @@ fn path_mtu(state: &AgentState, peer: Option<&crate::PeerState>, packet: &[u8]) 
         .max(if v6 { 1280 } else { 576 })
 }
 
-fn too_big_action(state: &AgentState, packet: &[u8]) -> Option<InboundAction> {
-    if packet.len() <= mtu_for_packet(state, packet) as usize {
+fn too_big_action(
+    state: &AgentState,
+    packet: &[u8],
+    peer: Option<&crate::PeerState>,
+) -> Option<InboundAction> {
+    let mtu = path_mtu(state, peer, packet);
+    if packet.len() <= mtu as usize {
         return None;
     }
     let local = state.config.node.overlay_ip?;
-    let mut error = wire::icmp_too_big(packet, mtu_for_packet(state, packet), local)?;
+    let mut error = wire::icmp_too_big(packet, mtu, local)?;
     let error_info = PacketInfo::parse(&error)?;
     let entry = state.routes.lookup(error_info.dst)?;
     let next = entry.select(flow_hash(&error_info))?;
@@ -692,7 +689,7 @@ pub fn decide_inbound(
     if !crate::membership::inbound_source_allowed(state, from, info.src) {
         return InboundAction::Drop("spoofed source");
     }
-    if let Some(action) = too_big_action(state, payload) {
+    if let Some(action) = too_big_action(state, payload, state.peers.get(&from).as_ref()) {
         return action;
     }
 
@@ -1148,6 +1145,9 @@ overlay_ip = "10.7.0.2"
     #[test]
     fn oversized_inbound_generates_packet_too_big() {
         let state = state();
+        state
+            .peers
+            .mark(&node(2), true, Some("direct".into()), Some(5), Some(1000));
         let mut p = vec![0u8; 1400];
         p[0] = 0x45;
         p[2..4].copy_from_slice(&1400u16.to_be_bytes());
@@ -1165,6 +1165,7 @@ overlay_ip = "10.7.0.2"
                 assert_eq!(payload[9], 1);
                 assert_eq!(payload[20], 3);
                 assert_eq!(payload[21], 4);
+                assert_eq!(u16::from_be_bytes([payload[26], payload[27]]), 984);
             }
             other => panic!("expected ICMP forward, got {other:?}"),
         }
