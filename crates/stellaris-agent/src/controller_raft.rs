@@ -1565,6 +1565,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_snapshot_chunks_are_accepted() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let node = start_http_node(
+            ControllerModel::new(NetworkId::new(), 1),
+            1,
+            addr,
+            Vec::new(),
+            None,
+            Some("secret".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        for i in 0..20_000u64 {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&i.to_be_bytes());
+            let origin = NodeId::new(id);
+            model.lsas.insert(
+                origin,
+                stellaris_linkstate::Lsa {
+                    origin,
+                    seq: i,
+                    zone: Some("z".repeat(64)),
+                    links: vec![],
+                    prefixes: vec![stellaris_linkstate::Prefix {
+                        prefix: "192.168.0.0/16".parse().unwrap(),
+                        metric: 0,
+                    }],
+                    overlay_ip: Some("10.7.0.1".parse().unwrap()),
+                    addrs: vec![],
+                },
+            );
+        }
+        let data = serde_json::to_vec(&model).unwrap();
+        assert!(data.len() > 4 * 1024 * 1024, "size {}", data.len());
+        let begin = SnapshotBegin {
+            vote: VoteOf::<TypeConfig>::new(0, 0),
+            meta: SnapshotMetaOf::<TypeConfig> {
+                last_log_id: None,
+                last_membership: StoredMembershipOf::<TypeConfig>::default(),
+            },
+            total: data.len(),
+            checksum: hex::encode(Sha256::digest(&data)),
+        };
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}/raft/snapshot/begin", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .json(&begin)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let id = response.json::<serde_json::Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for chunk in data.chunks(2 * 1024 * 1024) {
+            let response = client
+                .post(format!("http://{}/raft/snapshot/chunk", node.address))
+                .header(RAFT_SECRET_HEADER, "secret")
+                .header("x-raft-transfer", &id)
+                .body(chunk.to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        }
+        let response = client
+            .post(format!("http://{}/raft/snapshot/finish", node.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        // The transport/assembly path is what this test exercises; applying a
+        // snapshot to an uninitialized single-node Raft requires a real log id.
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let _ = node.raft.shutdown().await;
+        node.server.abort();
+    }
+
+    #[tokio::test]
     async fn snapshot_rpc_rejects_bad_checksum() {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
         let node = start_http_node(

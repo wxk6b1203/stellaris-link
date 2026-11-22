@@ -453,7 +453,8 @@ three_node_raft_over_http
 - Raft HTTP body limit 64 MiB
 - raft log/state 使用 fsync + atomic rename
 - 大 snapshot 分块上传：`/raft/snapshot/begin` + `/chunk` + `/finish`（单块 2 MiB）
-- 大包/断点恢复仍未测试
+- 已用 >4 MiB snapshot 覆盖 begin/chunk/finish 装配路径
+- 断点恢复仍未测试
 - controller 支持 `control.raft_dir` 启用单节点 Raft
 - `/v1/lsa` 在 Raft 模式走 `client_write`
 - `/v1/snapshot` / `/v1/model` 从 Raft state machine 生成
