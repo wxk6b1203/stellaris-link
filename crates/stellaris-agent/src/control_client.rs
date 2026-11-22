@@ -527,7 +527,22 @@ fn apply_verified_snapshot(
     if snapshot.generation == last_generation {
         return None;
     }
+    state.set_grants(&snapshot.members);
     discover_members(state, &snapshot.members, transport);
+    let before = snapshot.routes.len();
+    snapshot.routes.retain(|route| {
+        route.next_hop == state.node_id
+            || state
+                .peers
+                .get(&route.next_hop)
+                .is_some_and(|peer| peer.connected)
+    });
+    if snapshot.routes.len() != before {
+        tracing::warn!(
+            dropped = before - snapshot.routes.len(),
+            "dropped controller routes with unconnected next hop"
+        );
+    }
     if state.config.routing.prefer_same_zone
         && let Some(local_zone) = state.config.node.zone.as_deref()
     {
