@@ -657,6 +657,14 @@ impl Config {
                 "qos.queue_depth_per_priority must be > 0".into(),
             ));
         }
+        if self.qos.queue_bytes == Some(0) {
+            return Err(ConfigError::Invalid("qos.queue_bytes must be > 0".into()));
+        }
+        if self.qos.queue_bytes_per_priority == Some(0) {
+            return Err(ConfigError::Invalid(
+                "qos.queue_bytes_per_priority must be > 0".into(),
+            ));
+        }
         for class in &self.qos.classes {
             if class.name.trim().is_empty() {
                 return Err(ConfigError::Invalid(

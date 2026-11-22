@@ -66,6 +66,12 @@ pub struct QosConfig {
     /// Optional per-priority queue depth cap.
     #[serde(default)]
     pub queue_depth_per_priority: Option<usize>,
+    /// Optional total queued bytes cap.
+    #[serde(default)]
+    pub queue_bytes: Option<usize>,
+    /// Optional per-priority queued bytes cap.
+    #[serde(default)]
+    pub queue_bytes_per_priority: Option<usize>,
     #[serde(default)]
     pub classes: Vec<QosClass>,
 }

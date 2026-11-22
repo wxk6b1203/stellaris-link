@@ -61,7 +61,7 @@
 - [x] peer `advertised` 自动安装路由，public exit 无手写 route。
 - [x] IPv4/IPv6 分片解析与稳定 flow hash。
 - [x] 超大包 ICMPv4 Fragmentation Needed / ICMPv6 Packet Too Big。
-- [x] per-priority egress queue depth + queue drop counter。
+- [x] per-priority egress queue depth/byte cap + queue drop counter。
 - [x] Raft 大 snapshot 分块上传（2 MiB chunk，512 MiB 上限；offset/idempotent retry；>4 MiB 装配测试）。
 - [x] Raft 持久化失败传播 + 先落盘后 ACK。
 - [x] 分片 ACL：first-fragment verdict cache，缺失首片 fail-closed。

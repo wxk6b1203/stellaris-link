@@ -91,9 +91,20 @@ pub async fn start(
     {
         let transport = transport.clone();
         let per_priority = state.config.qos.queue_depth_per_priority;
+        let queue_bytes = state.config.qos.queue_bytes;
+        let queue_bytes_per_priority = state.config.qos.queue_bytes_per_priority;
         let stats = state.stats.clone();
         tokio::spawn(async move {
-            egress_worker(egress_rx, transport, queue_depth, per_priority, stats).await;
+            egress_worker(
+                egress_rx,
+                transport,
+                queue_depth,
+                per_priority,
+                queue_bytes,
+                queue_bytes_per_priority,
+                stats,
+            )
+            .await;
         });
     }
     {
@@ -365,20 +376,34 @@ async fn egress_worker(
     transport: Arc<IrohTransport>,
     queue_depth: usize,
     per_priority_depth: Option<usize>,
+    queue_bytes: Option<usize>,
+    queue_bytes_per_priority: Option<usize>,
     stats: Arc<crate::stats::Stats>,
 ) {
     let mut queue = BinaryHeap::new();
     let mut by_priority: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    let mut bytes_by_priority: std::collections::BTreeMap<i32, usize> =
+        std::collections::BTreeMap::new();
+    let mut queued_bytes = 0usize;
     let push = |queue: &mut BinaryHeap<EgressFrame>,
                 counts: &mut std::collections::BTreeMap<i32, usize>,
+                byte_counts: &mut std::collections::BTreeMap<i32, usize>,
+                queued_bytes: &mut usize,
                 frame: EgressFrame| {
         let current = counts.get(&frame.priority).copied().unwrap_or(0);
         let full_priority = per_priority_depth.is_some_and(|cap| current >= cap);
-        if queue.len() >= queue_depth || full_priority {
+        let current_bytes = byte_counts.get(&frame.priority).copied().unwrap_or(0);
+        let frame_bytes = frame.frame.len();
+        let full_priority_bytes =
+            queue_bytes_per_priority.is_some_and(|cap| current_bytes + frame_bytes > cap);
+        let full_bytes = queue_bytes.is_some_and(|cap| *queued_bytes + frame_bytes > cap);
+        if queue.len() >= queue_depth || full_priority || full_priority_bytes || full_bytes {
             crate::stats::Stats::inc(&stats.queue_dropped);
             return;
         }
         *counts.entry(frame.priority).or_default() += 1;
+        *byte_counts.entry(frame.priority).or_default() += frame_bytes;
+        *queued_bytes += frame_bytes;
         queue.push(frame);
     };
     loop {
@@ -386,12 +411,24 @@ async fn egress_worker(
             let Some(frame) = rx.recv().await else {
                 break;
             };
-            push(&mut queue, &mut by_priority, frame);
+            push(
+                &mut queue,
+                &mut by_priority,
+                &mut bytes_by_priority,
+                &mut queued_bytes,
+                frame,
+            );
         }
         tokio::select! {
             frame = rx.recv() => {
                 if let Some(frame) = frame {
-                    push(&mut queue, &mut by_priority, frame);
+                    push(
+                &mut queue,
+                &mut by_priority,
+                &mut bytes_by_priority,
+                &mut queued_bytes,
+                frame,
+            );
                 } else {
                     while let Some(frame) = queue.pop() {
                         if let Err(e) = transport.send(frame.next, frame.frame).await {
@@ -405,6 +442,10 @@ async fn egress_worker(
                 if let Some(count) = by_priority.get_mut(&frame.priority) {
                     *count = count.saturating_sub(1);
                 }
+                if let Some(bytes) = bytes_by_priority.get_mut(&frame.priority) {
+                    *bytes = bytes.saturating_sub(frame.frame.len());
+                }
+                queued_bytes = queued_bytes.saturating_sub(frame.frame.len());
                 if let Err(e) = transport.send(frame.next, frame.frame).await {
                     debug!(peer = %frame.next.short(), error = %e, "egress send failed");
                 }
