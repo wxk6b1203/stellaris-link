@@ -231,6 +231,9 @@ pub struct TransportConfig {
     /// Enable mDNS/DNS-SD bootstrap discovery (`_stellaris._udp.local.`).
     #[serde(default)]
     pub mdns: bool,
+    /// mDNS UDP port (default 5353; useful for isolated tests).
+    #[serde(default)]
+    pub mdns_port: Option<u16>,
 }
 
 impl Default for TransportConfig {
@@ -245,6 +248,7 @@ impl Default for TransportConfig {
             discovery_port: None,
             discovery_broadcast: None,
             mdns: false,
+            mdns_port: None,
         }
     }
 }

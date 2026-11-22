@@ -239,7 +239,15 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-mdns.sh
 
 mDNS 服务类型：`_stellaris._udp.local.`；发现后仍必须通过 PSK/controller 认证。
 
-### 14. UDP bootstrap discovery（Linux netns）
+### 14. 真实局域网 mDNS 验证
+
+见 [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md)。已在 macOS + bee 同一 /24 上验证：
+- bee agent 发现 macOS mDNS 服务
+- macOS `dns-sd` 发现 bee 服务
+
+完整双向 agent 连接受 macOS firewall/local-network 权限影响，未宣称通过。
+
+### 15. UDP bootstrap discovery（Linux netns）
 
 ```toml
 [transport]
@@ -254,7 +262,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 发现只产生候选 peer，仍必须通过 PSK/controller 认证。
 
-### 15. Controller + 3 members（本机）
+### 16. Controller + 3 members（本机）
 
 ```bash
 ./scripts/demo-controller-3node.sh
@@ -262,7 +270,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 一个 controller + 三个 member，验证 controller ACK、snapshot 成员、LSA 路由学习。
 
-### 16. Controller + 3 TUN 节点（Linux netns）
+### 17. Controller + 3 TUN 节点（Linux netns）
 
 ```bash
 sudo BIN=./target/release/stellaris-agent \
@@ -272,21 +280,21 @@ sudo BIN=./target/release/stellaris-agent \
 
 验证 controller 路由、LSA、TUN transit、双向 0% loss 和 1000B 包。
 
-### 17. 多网络凭证隔离
+### 18. 多网络凭证隔离
 
 ```bash
 ./scripts/demo-multi-network-isolation.sh
 # OK: different network IDs reject the same PSK.
 ```
 
-### 18. 多 controller threshold
+### 19. 多 controller threshold
 
 ```bash
 ./scripts/demo-controller-threshold.sh
 # OK: member applied a 2-controller threshold snapshot.
 ```
 
-### 19. 真正的 TUN overlay（两台机器，需要 root）
+### 20. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
@@ -353,6 +361,7 @@ examples/               # 示例 TOML
 | [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
 | [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) | 入网、成员授权、前缀授权设计 |
 | [MULTI-NETWORK.md](MULTI-NETWORK.md) | 多网络隔离与单进程多网络设计 |
+| [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md) | 真实局域网 mDNS 验证记录 |
 | [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 详细设计（未实现） |
 | [examples/policy.toml](examples/policy.toml) | ACL/QoS 配置示例 |
 | [scripts/demo-linkstate.sh](scripts/demo-linkstate.sh) | controller-mediated link-state 演示 |

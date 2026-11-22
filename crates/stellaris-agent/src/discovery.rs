@@ -145,7 +145,11 @@ fn start_mdns(state: AgentState, transport: Arc<IrohTransport>) {
         warn!("transport.mdns requires node.overlay_ip");
         return;
     };
-    let daemon = match ServiceDaemon::new() {
+    let daemon = match state.config.transport.mdns_port {
+        Some(port) => ServiceDaemon::new_with_port(port),
+        None => ServiceDaemon::new(),
+    };
+    let daemon = match daemon {
         Ok(daemon) => daemon,
         Err(e) => {
             warn!(error = %e, "start mDNS daemon");
