@@ -45,7 +45,7 @@ pub struct ControllerState {
     generation: Arc<AtomicU64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub network_id: String,
     pub epoch: u64,

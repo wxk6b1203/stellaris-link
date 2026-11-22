@@ -2,6 +2,7 @@
 //!
 //! Both transports carry the same signed snapshot / LSA / ACK data model.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -9,6 +10,7 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
     endpoint::presets,
 };
+use sha2::{Digest, Sha256};
 use stellaris_linkstate::{Link, Lsa, Prefix};
 use stellaris_types::NodeId;
 
@@ -75,7 +77,7 @@ async fn run_http(
             }
         }
 
-        let mut best: Option<Snapshot> = None;
+        let mut snapshots: Vec<Snapshot> = Vec::new();
         for base in &bases {
             let mut request = client.get(format!("{base}/v1/snapshot?node={}", state.node_id));
             if let Some(secret) = &secret {
@@ -85,14 +87,10 @@ async fn run_http(
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Snapshot>().await {
                         Ok(snapshot) => {
-                            let newer = best
-                                .as_ref()
-                                .map(|b| {
-                                    (snapshot.epoch, snapshot.generation) > (b.epoch, b.generation)
-                                })
-                                .unwrap_or(true);
-                            if newer {
-                                best = Some(snapshot);
+                            if verify_snapshot(&state, secret.as_deref(), &snapshot) {
+                                snapshots.push(snapshot);
+                            } else {
+                                tracing::warn!(base, "controller snapshot rejected");
                             }
                         }
                         Err(e) => tracing::warn!(base, error = %e, "invalid controller snapshot"),
@@ -105,14 +103,9 @@ async fn run_http(
             }
         }
 
-        if let Some(snapshot) = best
-            && let Some((generation, epoch)) = apply_snapshot(
-                &state,
-                secret.as_deref(),
-                snapshot,
-                last_generation,
-                transport.as_ref(),
-            )
+        if let Some(snapshot) = select_threshold(&state, snapshots)
+            && let Some((generation, epoch)) =
+                apply_verified_snapshot(&state, snapshot, last_generation, transport.as_ref())
         {
             last_generation = generation;
             for base in &bases {
@@ -229,13 +222,15 @@ async fn run_iroh(
             };
             match request(&conn, &req).await {
                 Ok(Response::Snapshot { snapshot }) => {
-                    if let Some((generation, epoch)) = apply_snapshot(
-                        &state,
-                        secret.as_deref(),
-                        snapshot,
-                        last_generation,
-                        transport.as_ref(),
-                    ) {
+                    if verify_snapshot(&state, secret.as_deref(), &snapshot)
+                        && let Some(snapshot) = select_threshold(&state, vec![snapshot])
+                        && let Some((generation, epoch)) = apply_verified_snapshot(
+                            &state,
+                            snapshot,
+                            last_generation,
+                            transport.as_ref(),
+                        )
+                    {
                         last_generation = generation;
                         let ack = Request::Ack {
                             node: state.node_id.to_string(),
@@ -306,16 +301,7 @@ async fn try_join(
     accepted
 }
 
-fn apply_snapshot(
-    state: &AgentState,
-    secret: Option<&str>,
-    mut snapshot: Snapshot,
-    last_generation: u64,
-    transport: Option<&std::sync::Arc<IrohTransport>>,
-) -> Option<(u64, u64)> {
-    if snapshot.generation == last_generation {
-        return None;
-    }
+fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot) -> bool {
     if !state.config.control.controller_keys.is_empty() {
         let Some(signer) = snapshot
             .signer
@@ -323,7 +309,7 @@ fn apply_snapshot(
             .and_then(|s| s.parse::<NodeId>().ok())
         else {
             tracing::warn!("controller snapshot has no signer");
-            return None;
+            return false;
         };
         if !state
             .config
@@ -333,11 +319,11 @@ fn apply_snapshot(
             .any(|key| key == &signer.to_string())
         {
             tracing::warn!(%signer, "untrusted controller signer");
-            return None;
+            return false;
         }
         let Some(signature) = snapshot.ed25519_signature.as_deref() else {
             tracing::warn!("controller snapshot has no Ed25519 signature");
-            return None;
+            return false;
         };
         let payload = crate::controller::snapshot_payload_bytes(
             &snapshot.network_id,
@@ -348,8 +334,9 @@ fn apply_snapshot(
         );
         if let Err(e) = crate::controller::verify_ed25519(signer, &payload, signature) {
             tracing::warn!(error = %e, "controller Ed25519 signature mismatch");
-            return None;
+            return false;
         }
+        true
     } else if let Some(secret) = secret {
         let expected = crate::controller::snapshot_signature(
             secret,
@@ -361,10 +348,67 @@ fn apply_snapshot(
         );
         if snapshot.signature.as_deref() != Some(expected.as_str()) {
             tracing::warn!("controller snapshot signature mismatch; ignored");
-            return None;
+            return false;
+        }
+        true
+    } else {
+        true
+    }
+}
+
+fn select_threshold(state: &AgentState, snapshots: Vec<Snapshot>) -> Option<Snapshot> {
+    if snapshots.is_empty() {
+        return None;
+    }
+    let threshold = if state.config.control.controller_keys.is_empty() {
+        1
+    } else {
+        state.config.control.controller_threshold.max(1)
+    };
+    if threshold <= 1 {
+        return snapshots
+            .into_iter()
+            .max_by_key(|s| (s.epoch, s.generation));
+    }
+    let mut groups: HashMap<[u8; 32], (Snapshot, HashSet<NodeId>)> = HashMap::new();
+    for snapshot in snapshots {
+        let payload = crate::controller::snapshot_payload_bytes(
+            &snapshot.network_id,
+            snapshot.epoch,
+            snapshot.generation,
+            &snapshot.members,
+            &snapshot.routes,
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        let hash: [u8; 32] = hasher.finalize().into();
+        let entry = groups
+            .entry(hash)
+            .or_insert_with(|| (snapshot.clone(), HashSet::new()));
+        if let Some(signer) = snapshot
+            .signer
+            .as_deref()
+            .and_then(|s| s.parse::<NodeId>().ok())
+        {
+            entry.1.insert(signer);
         }
     }
-    state.set_grants(&snapshot.members);
+    groups
+        .into_values()
+        .filter(|(_, signers)| signers.len() >= threshold)
+        .map(|(snapshot, _)| snapshot)
+        .max_by_key(|s| (s.epoch, s.generation))
+}
+
+fn apply_verified_snapshot(
+    state: &AgentState,
+    mut snapshot: Snapshot,
+    last_generation: u64,
+    transport: Option<&std::sync::Arc<IrohTransport>>,
+) -> Option<(u64, u64)> {
+    if snapshot.generation == last_generation {
+        return None;
+    }
     discover_members(state, &snapshot.members, transport);
     if state.config.routing.prefer_same_zone
         && let Some(local_zone) = state.config.node.zone.as_deref()
@@ -489,5 +533,55 @@ fn local_lsa(state: &AgentState, seq: u64) -> Lsa {
         prefixes,
         overlay_ip: state.config.node.overlay_ip,
         addrs: state.config.transport.advertise.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellaris_types::{Config, NetworkId};
+
+    fn snapshot(network: NetworkId, signer: u8, generation: u64) -> Snapshot {
+        Snapshot {
+            network_id: network.to_string(),
+            epoch: 1,
+            generation,
+            members: Vec::new(),
+            routes: Vec::new(),
+            signer: Some(NodeId::new([signer; 32]).to_string()),
+            signature: None,
+            ed25519_signature: None,
+        }
+    }
+
+    #[test]
+    fn threshold_requires_distinct_controllers() {
+        let keys = [NodeId::new([1u8; 32]), NodeId::new([2u8; 32])];
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+controller_keys = ["{}", "{}"]
+controller_threshold = 2
+"#,
+            keys[0], keys[1]
+        );
+        let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        let network = state.network;
+        assert!(select_threshold(&state, vec![snapshot(network, 1, 1)]).is_none());
+        assert!(
+            select_threshold(
+                &state,
+                vec![snapshot(network, 1, 1), snapshot(network, 2, 1)]
+            )
+            .is_some()
+        );
     }
 }

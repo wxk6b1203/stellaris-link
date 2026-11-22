@@ -71,7 +71,7 @@ fn default_role() -> String {
     "member".to_string()
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlConfig {
     /// Controller base URL for members (MVP: HTTP).
     #[serde(default)]
@@ -91,6 +91,9 @@ pub struct ControlConfig {
     /// Trusted controller NodeIds for verifying Ed25519 snapshots.
     #[serde(default)]
     pub controller_keys: Vec<String>,
+    /// Minimum distinct controller signatures for a snapshot (default 1).
+    #[serde(default = "default_controller_threshold")]
+    pub controller_threshold: usize,
     /// Optional controller-side member allowlist / prefix grants.
     #[serde(default)]
     pub members: Vec<ControllerMemberConfig>,
@@ -109,6 +112,26 @@ pub struct ControlConfig {
     /// Member: controller iroh direct addresses.
     #[serde(default)]
     pub addrs: Vec<SocketAddr>,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            urls: Vec::new(),
+            bind: None,
+            secret: None,
+            epoch: None,
+            controller_keys: Vec::new(),
+            controller_threshold: 1,
+            members: Vec::new(),
+            join_tokens: Vec::new(),
+            join_token: None,
+            iroh_port: None,
+            endpoint_id: None,
+            addrs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +259,10 @@ fn default_ecmp_max() -> usize {
 
 fn default_cross_zone_penalty() -> u32 {
     20
+}
+
+fn default_controller_threshold() -> usize {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -368,6 +395,18 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "network.auth.secret is required when auth.mode = psk".into(),
+            ));
+        }
+        if self.control.controller_threshold == 0 {
+            return Err(ConfigError::Invalid(
+                "control.controller_threshold must be > 0".into(),
+            ));
+        }
+        if !self.control.controller_keys.is_empty()
+            && self.control.controller_threshold > self.control.controller_keys.len()
+        {
+            return Err(ConfigError::Invalid(
+                "control.controller_threshold exceeds controller_keys".into(),
             ));
         }
         for key in &self.control.controller_keys {

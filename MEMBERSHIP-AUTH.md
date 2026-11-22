@@ -355,6 +355,7 @@ gateway/exit 才能广告其他前缀
 - 错误 secret 拒绝连接；
 - controller Ed25519 snapshot 签名 + member `controller_keys` 校验；
 - controller `control.members` allowlist / 每 member prefix grant；
+- member 侧 controller threshold（同一 payload 至少 N 个不同 controller 签名）；
 - member 侧对 LSA prefix 的 grant 强制（`lsa_authorized`）；
 - 一次性 join token：`POST /v1/join`，member `control.join_token` 自动申请；
 - 未授权 LSA origin、overlay_ip、prefix、link target 被拒绝；
@@ -364,7 +365,7 @@ gateway/exit 才能广告其他前缀
 
 - 完整 signed membership manifest（当前是 controller 内存 grants + snapshot 签名 + join token）；
 - member 侧对 LSA 前缀的 grant 强制已实现；数据面前缀仍由 anti-spoof + peer advertised 约束。
-- controller key set/threshold；
+- controller key set/threshold（已实现 member 侧 threshold snapshot 选择）；
 - multi-network runtime；
 - revocation/epoch propagation；
 - openraft command integration。
