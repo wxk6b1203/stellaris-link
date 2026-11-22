@@ -1,0 +1,20 @@
+[package]
+name = "stellaris-routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+stellaris-fib = { path = "../stellaris-fib" }
+stellaris-types = { path = "../stellaris-types" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
