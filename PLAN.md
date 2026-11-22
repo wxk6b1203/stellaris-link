@@ -66,6 +66,7 @@
 - [x] Raft 持久化失败传播 + 先落盘后 ACK。
 - [x] 分片 ACL：first-fragment verdict cache，缺失首片 fail-closed。
 - [x] peer direct/relay path change 计数与 metric。
+- [x] 本地 HTTP relay 上 endpoint 建连测试（relay path）。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。

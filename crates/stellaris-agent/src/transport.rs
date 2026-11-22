@@ -439,3 +439,96 @@ async fn connect_loop(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    use std::net::Ipv4Addr;
+    use stellaris_types::Config;
+
+    fn config(name: &str, state: &std::path::Path, relay: &str, overlay: &str) -> Config {
+        let toml = format!(
+            r#"
+[node]
+name = "{name}"
+state_dir = "{}"
+overlay_ip = "{overlay}"
+[network]
+name = "relay-test"
+cidr = "10.7.0.0/16"
+[transport]
+disable_relay = false
+relay_urls = ["{relay}"]
+[api]
+bind = "127.0.0.1:0"
+"#,
+            state.display()
+        );
+        Config::from_toml(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn endpoint_connects_over_http_relay() {
+        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+        relay.key_cache_capacity = Some(1024);
+        let mut server_config = ServerConfig::default();
+        server_config.relay = Some(relay);
+        let server = Server::spawn(server_config).await.unwrap();
+        let relay_url = format!("http://{}", server.http_addr().unwrap());
+        let base = std::env::temp_dir().join(format!("stellaris-relay-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let config_a = config("a", &base.join("a"), &relay_url, "10.7.0.1");
+        let config_b = config("b", &base.join("b"), &relay_url, "10.7.0.2");
+        let network = NetworkId::new();
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let (tx_b, _rx_b) = mpsc::channel(64);
+        let a = IrohTransport::start(
+            Arc::new(config_a.clone()),
+            network,
+            [1u8; 32],
+            PeerRegistry::from_config(&config_a).unwrap(),
+            tx_a,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = IrohTransport::start(
+            Arc::new(config_b.clone()),
+            network,
+            [2u8; 32],
+            PeerRegistry::from_config(&config_b).unwrap(),
+            tx_b,
+            None,
+        )
+        .await
+        .unwrap();
+        let a_id = NodeId::new(*a.endpoint_id().as_bytes());
+        let b_id = NodeId::new(*b.endpoint_id().as_bytes());
+        let peer = |name: &str, id: NodeId, overlay: &str| PeerConfig {
+            name: name.into(),
+            endpoint_id: id.to_string(),
+            overlay_ip: overlay.parse().unwrap(),
+            addrs: vec![],
+            relay_url: Some(relay_url.clone()),
+            advertised: vec![],
+            zone: None,
+        };
+        a.add_peer(peer("b", b_id, "10.7.0.2"), true);
+        b.add_peer(peer("a", a_id, "10.7.0.1"), true);
+        for _ in 0..100 {
+            if a.peers.get(&b_id).is_some_and(|p| p.connected)
+                && b.peers.get(&a_id).is_some_and(|p| p.connected)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let path = a.peers.get(&b_id).and_then(|p| p.path);
+        assert_eq!(path.as_deref(), Some("relay"), "path={path:?}");
+        drop(a);
+        drop(b);
+        drop(server);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}
