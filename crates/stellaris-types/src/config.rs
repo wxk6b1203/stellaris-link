@@ -470,6 +470,34 @@ impl Config {
             key.parse::<NodeId>()
                 .map_err(|e| ConfigError::Invalid(format!("control.controller_keys: {e}")))?;
         }
+        let api_bind: SocketAddr = self
+            .api
+            .bind
+            .parse()
+            .map_err(|e| ConfigError::Invalid(format!("api.bind: {e}")))?;
+        if !api_bind.ip().is_loopback() && self.api.token.is_none() {
+            return Err(ConfigError::Invalid(
+                "api.bind is non-loopback but api.token is missing".into(),
+            ));
+        }
+        if let Some(bind) = &self.control.bind {
+            let bind: SocketAddr = bind
+                .parse()
+                .map_err(|e| ConfigError::Invalid(format!("control.bind: {e}")))?;
+            if !bind.ip().is_loopback() && self.control.secret.is_none() {
+                return Err(ConfigError::Invalid(
+                    "control.bind is non-loopback but control.secret is missing".into(),
+                ));
+            }
+        }
+        if self.node.role == "controller"
+            && self.control.iroh_port.is_some()
+            && self.control.secret.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "controller iroh control requires control.secret".into(),
+            ));
+        }
         let mut join_tokens = HashSet::new();
         for join in &self.control.join_tokens {
             if join.token.trim().is_empty() {
@@ -629,6 +657,45 @@ name = "demo"
 cidr = "10.7.0.0/16"
 "#;
         assert!(Config::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn non_loopback_api_requires_token() {
+        let toml = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[api]
+bind = "0.0.0.0:7777"
+"#;
+        assert!(Config::from_toml(toml).is_err());
+        let with_token = toml.replace(
+            r#"bind = "0.0.0.0:7777""#,
+            "bind = \"0.0.0.0:7777\"\ntoken = \"t\"",
+        );
+        assert!(Config::from_toml(&with_token).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_controller_bind_requires_secret() {
+        let toml = r#"
+[node]
+name = "c"
+role = "controller"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[control]
+bind = "0.0.0.0:7800"
+"#;
+        assert!(Config::from_toml(toml).is_err());
+        let with_secret = toml.replace(
+            r#"bind = "0.0.0.0:7800""#,
+            "bind = \"0.0.0.0:7800\"\nsecret = \"s\"",
+        );
+        assert!(Config::from_toml(&with_secret).is_ok());
     }
 
     #[test]
