@@ -112,6 +112,18 @@ pub struct ControlConfig {
     /// Apply controller snapshot routes (default true).
     #[serde(default = "default_true")]
     pub apply_routes: bool,
+    /// Controller HTTPS certificate PEM path (requires tls_key).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// Controller HTTPS private key PEM path (requires tls_cert).
+    #[serde(default)]
+    pub tls_key: Option<String>,
+    /// Member: PEM CA used to verify controller HTTPS.
+    #[serde(default)]
+    pub tls_ca: Option<String>,
+    /// Member: skip controller HTTPS certificate verification (development only).
+    #[serde(default)]
+    pub tls_insecure: bool,
     /// Controller iroh control UDP port (None = HTTP-only).
     #[serde(default)]
     pub iroh_port: Option<u16>,
@@ -139,6 +151,10 @@ impl Default for ControlConfig {
             join_token: None,
             discover_members: true,
             apply_routes: true,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            tls_insecure: false,
             iroh_port: None,
             endpoint_id: None,
             addrs: Vec::new(),
@@ -355,6 +371,12 @@ pub struct ApiConfig {
     pub bind: String,
     #[serde(default)]
     pub token: Option<String>,
+    /// HTTPS certificate PEM path (requires tls_key).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// HTTPS private key PEM path (requires tls_cert).
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -362,6 +384,8 @@ impl Default for ApiConfig {
         Self {
             bind: default_api_bind(),
             token: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -496,6 +520,16 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "controller iroh control requires control.secret".into(),
+            ));
+        }
+        if self.api.tls_cert.is_some() != self.api.tls_key.is_some() {
+            return Err(ConfigError::Invalid(
+                "api.tls_cert and api.tls_key must be set together".into(),
+            ));
+        }
+        if self.control.tls_cert.is_some() != self.control.tls_key.is_some() {
+            return Err(ConfigError::Invalid(
+                "control.tls_cert and control.tls_key must be set together".into(),
             ));
         }
         let mut join_tokens = HashSet::new();

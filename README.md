@@ -312,14 +312,38 @@ stellaris-agent --config net-a.toml --config net-b.toml
 # OK: different network IDs reject the same PSK.
 ```
 
-### 21. 多 controller threshold
+### 21. API / controller TLS
+
+```bash
+./scripts/test-tls.sh
+# OK: API TLS, controller TLS, and member HTTPS snapshot work.
+```
+
+配置：
+
+```toml
+[api]
+tls_cert = "/path/server.pem"
+tls_key  = "/path/server.key"
+
+[control]
+tls_cert = "/path/server.pem"
+tls_key  = "/path/server.key"
+
+# member:
+tls_ca = "/path/ca.pem"
+```
+
+TLS 只保护 HTTP 控制面；认证仍走 API token / `control.secret`。证书需使用 CA 签发的 server cert，不要把 CA 证书直接当 leaf 使用。
+
+### 22. 多 controller threshold
 
 ```bash
 ./scripts/demo-controller-threshold.sh
 # OK: member applied a 2-controller threshold snapshot.
 ```
 
-### 22. 真正的 TUN overlay（两台机器，需要 root）
+### 23. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 

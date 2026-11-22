@@ -12,6 +12,7 @@ pub mod link_state;
 pub mod membership;
 pub mod peers;
 pub mod policy;
+pub mod serve;
 pub mod stats;
 pub mod transport;
 pub mod wire;
@@ -244,21 +245,26 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     }
 
     let app = api::router(state.clone());
-    let listener = tokio::net::TcpListener::bind(&state.config.api.bind)
-        .await
-        .with_context(|| format!("bind API {}", state.config.api.bind))?;
+    let addr: std::net::SocketAddr = state
+        .config
+        .api
+        .bind
+        .parse()
+        .with_context(|| format!("api.bind {}", state.config.api.bind))?;
     tracing::info!(
         node = %state.node_id.short(),
         network = %state.network,
         api = %state.config.api.bind,
+        tls = state.config.api.tls_cert.is_some(),
         "stellaris agent started"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("API server")
+    let tls = state
+        .config
+        .api
+        .tls_cert
+        .clone()
+        .zip(state.config.api.tls_key.clone());
+    serve::serve(addr, app, tls, "API").await
 }
 
 #[cfg(test)]

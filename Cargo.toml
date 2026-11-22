@@ -20,6 +20,7 @@ repository = "https://example.invalid/stellaris-linking"
 anyhow = "1"
 arc-swap = "1.9"
 axum = "0.8"
+axum-server = { version = "0.9", features = ["tls-rustls"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"

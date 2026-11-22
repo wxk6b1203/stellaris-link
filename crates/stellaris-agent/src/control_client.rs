@@ -46,7 +46,13 @@ async fn run_http(
     if bases.is_empty() {
         return;
     }
-    let client = reqwest::Client::new();
+    let client = match http_client(&state.config) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "build controller HTTP client");
+            return;
+        }
+    };
     let mut joined = state.config.control.join_token.is_none();
     let mut last_manifest = Instant::now() - Duration::from_secs(60);
     let mut last_generation = 0u64;
@@ -76,7 +82,7 @@ async fn run_http(
                     Ok(response) => {
                         tracing::debug!(base, status = %response.status(), "controller rejected LSA")
                     }
-                    Err(e) => tracing::debug!(base, error = %e, "controller LSA unreachable"),
+                    Err(e) => tracing::debug!(base, error = ?e, "controller LSA unreachable"),
                 }
             }
             if accepted {
@@ -106,7 +112,7 @@ async fn run_http(
                 Ok(response) => {
                     tracing::warn!(base, status = %response.status(), "controller snapshot rejected")
                 }
-                Err(e) => tracing::debug!(base, error = %e, "controller unreachable"),
+                Err(e) => tracing::debug!(base, error = ?e, "controller unreachable"),
             }
         }
 
@@ -269,6 +275,19 @@ async fn request(conn: &iroh::endpoint::Connection, request: &Request) -> anyhow
     crate::control_wire::read_frame(&mut recv)
         .await?
         .context("empty controller response")
+}
+
+fn http_client(config: &stellaris_types::Config) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(path) = &config.control.tls_ca {
+        let pem = std::fs::read(path).with_context(|| format!("read control.tls_ca {path}"))?;
+        let cert = reqwest::Certificate::from_pem(&pem).context("parse control.tls_ca")?;
+        builder = builder.add_root_certificate(cert);
+    }
+    if config.control.tls_insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().context("build controller HTTP client")
 }
 
 async fn try_manifest(

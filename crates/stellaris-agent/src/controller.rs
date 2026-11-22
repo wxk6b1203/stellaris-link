@@ -894,16 +894,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("control.bind {bind}"))?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind controller {addr}"))?;
-    tracing::info!(%addr, network = %state.network, "stellaris controller started");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("controller HTTP server")
+    tracing::info!(
+        %addr,
+        network = %state.network,
+        tls = config.control.tls_cert.is_some(),
+        "stellaris controller started"
+    );
+    let tls = config
+        .control
+        .tls_cert
+        .clone()
+        .zip(config.control.tls_key.clone());
+    crate::serve::serve(addr, router(state), tls, "controller").await
 }
 
 async fn run_iroh(state: ControllerState, config: Config) -> anyhow::Result<()> {
