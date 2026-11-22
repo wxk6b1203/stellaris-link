@@ -371,6 +371,32 @@ impl ControllerState {
         hex::encode(hasher.finalize())
     }
 
+    pub async fn publish_join_config(&self) {
+        let Some(raft) = &self.raft else {
+            return;
+        };
+        let hash = self.join_config_hash();
+        for _ in 0..100 {
+            let model = self.model_current().await;
+            match &model.join_config_hash {
+                Some(existing) if existing == &hash => return,
+                Some(_) => {
+                    tracing::warn!("controller join token config differs from Raft state");
+                    return;
+                }
+                None => {}
+            }
+            if raft
+                .client_write(ControllerCommand::SetJoinConfigHash { hash: hash.clone() })
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn model_current(&self) -> ControllerModel {
         match &self.raft_store {
             Some(store) => store.model().await,
@@ -884,12 +910,13 @@ impl ControllerState {
         token: &str,
     ) -> Result<(), (u16, String)> {
         if let Some(raft) = &self.raft {
-            if self
-                .model_current()
-                .await
-                .consumed_join_tokens
-                .contains(token)
+            let model = self.model_current().await;
+            if let Some(expected) = &model.join_config_hash
+                && expected != &self.join_config_hash()
             {
+                return Err((409, "controller join token config mismatch".into()));
+            }
+            if model.consumed_join_tokens.contains(token) {
                 return Err((403, "invalid or already used join token".to_string()));
             }
             let member = self.join_member(overlay, token)?;
@@ -1474,6 +1501,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         };
         tracing::info!(dir = %dir.display(), id, addr = %node.address, "controller raft enabled");
         state.set_raft(Arc::new(node.raft), node.store);
+        let publish_state = state.clone();
+        tokio::spawn(async move {
+            publish_state.publish_join_config().await;
+        });
         tokio::spawn(async move {
             let _ = node.server.await;
         });
@@ -1792,6 +1823,7 @@ prefixes = ["192.168.101.0/24"]
         let model = ControllerModel::new(state.network, state.epoch);
         let node = crate::controller_raft::start_single(model).await.unwrap();
         state.set_raft(Arc::new(node.raft), node.store);
+        state.publish_join_config().await;
         let app = router(state);
         let body = json!({
             "node_id": NodeId::new([10u8; 32]).to_string(),
@@ -1838,6 +1870,62 @@ prefixes = ["192.168.101.0/24"]
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn join_rejects_mismatched_raft_config_hash() {
+        let dir = temp_state_dir();
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+bind = "127.0.0.1:0"
+secret = "s3cret"
+
+[[control.join_tokens]]
+token = "join-once"
+"#,
+            dir
+        );
+        let mut state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let model = ControllerModel::new(state.network, state.epoch);
+        let node = crate::controller_raft::start_single(model).await.unwrap();
+        let raft = Arc::new(node.raft);
+        state.set_raft(raft.clone(), node.store);
+        raft.client_write(
+            crate::controller_model::ControllerCommand::SetJoinConfigHash {
+                hash: "different".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let app = router(state);
+        let body = json!({
+            "node_id": NodeId::new([10u8; 32]).to_string(),
+            "overlay_ip": "10.7.0.10",
+            "token": "join-once"
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

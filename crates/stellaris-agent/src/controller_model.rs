@@ -45,6 +45,9 @@ pub enum ControllerCommand {
         member: MemberRecord,
         token: String,
     },
+    SetJoinConfigHash {
+        hash: String,
+    },
     RevokeMember {
         node: NodeId,
     },
@@ -64,6 +67,8 @@ pub struct ControllerModel {
     pub members: BTreeMap<NodeId, MemberRecord>,
     pub acks: BTreeMap<NodeId, AckRecord>,
     pub consumed_join_tokens: BTreeSet<String>,
+    #[serde(default)]
+    pub join_config_hash: Option<String>,
 }
 
 impl ControllerModel {
@@ -76,6 +81,7 @@ impl ControllerModel {
             members: BTreeMap::new(),
             acks: BTreeMap::new(),
             consumed_join_tokens: BTreeSet::new(),
+            join_config_hash: None,
         }
     }
 
@@ -132,6 +138,14 @@ impl ControllerModel {
                     true
                 }
             }
+            ControllerCommand::SetJoinConfigHash { hash } => {
+                if self.join_config_hash.is_none() {
+                    self.join_config_hash = Some(hash);
+                    true
+                } else {
+                    false
+                }
+            }
             ControllerCommand::RevokeMember { node } => {
                 let removed = self.members.remove(&node).is_some();
                 let lsa_removed = self.lsas.remove(&node).is_some();
@@ -173,6 +187,7 @@ impl ControllerModel {
             members: Vec<(&'a NodeId, &'a MemberRecord)>,
             acks: Vec<(&'a NodeId, &'a AckRecord)>,
             consumed_join_tokens: Vec<&'a String>,
+            join_config_hash: Option<&'a String>,
         }
         let snapshot = Snapshot {
             network: &self.network,
@@ -182,6 +197,7 @@ impl ControllerModel {
             members: self.members.iter().collect(),
             acks: self.acks.iter().collect(),
             consumed_join_tokens: self.consumed_join_tokens.iter().collect(),
+            join_config_hash: self.join_config_hash.as_ref(),
         };
         serde_json::to_vec(&snapshot).unwrap_or_default()
     }
