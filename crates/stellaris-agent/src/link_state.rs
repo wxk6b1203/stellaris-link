@@ -161,12 +161,20 @@ impl Service {
     }
 
     fn on_down(&self, node: NodeId) {
-        let removed = self
-            .connections
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&node)
-            .is_some();
+        let removed = {
+            let mut connections = self.connections.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = connections.get_mut(&node) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    connections.remove(&node);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
         if removed {
             self.publish_local();
         }
