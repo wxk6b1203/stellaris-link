@@ -351,6 +351,30 @@ leader_id = "<controller-node-id>"
 它用于在过渡期避免“多个 controller 同时接受写”的明显 split-brain，
 最终仍需 openraft 的 term/leader/quorum。
 
+## 8.2 H0：确定性状态模型（已实现）
+
+新增：
+
+```text
+crates/stellaris-agent/src/controller_model.rs
+```
+
+- `ControllerModel`
+- `ControllerCommand`
+- 无墙钟时间
+- LSA seq 幂等
+- epoch 单调
+- snapshot bytes 可复现
+- revoke 清理 member/LSA
+
+测试：
+
+- 同一 command log 重放结果一致
+- stale LSA/lower epoch 被忽略
+- revoke 清理
+
+它还没有接入 HTTP controller 和 openraft；是 Phase 0 的前置模型。
+
 ## 9. 迁移步骤
 
 ### Phase 0：确定性与影子状态机
