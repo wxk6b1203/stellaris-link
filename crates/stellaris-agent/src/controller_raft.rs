@@ -904,7 +904,12 @@ async fn start_http_node_at(
     config: Arc<openraft::Config>,
 ) -> anyhow::Result<HttpRaftNode> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    let address = listener.local_addr()?;
+    let bound = listener.local_addr()?;
+    let address = peers
+        .iter()
+        .find(|(peer_id, _)| *peer_id == id)
+        .and_then(|(_, addr)| addr.parse().ok())
+        .unwrap_or(bound);
     let (log, state_path) = if let Some(dir) = &dir {
         std::fs::create_dir_all(dir)?;
         (

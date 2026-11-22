@@ -32,7 +32,7 @@ bind = "0.0.0.0:4790$((i+1))"
 secret = "$SECRET"
 raft_dir = "/raft"
 raft_id = $((i+1))
-raft_bind = "${IPS[$i]}:4780$((i+1))"
+raft_bind = "0.0.0.0:4780$((i+1))"
 raft_secret = "$RAFT_SECRET"
 raft_bootstrap = $BOOT
 
