@@ -359,7 +359,7 @@ gateway/exit 才能广告其他前缀
 - member 侧对 LSA prefix 的 grant 强制（`lsa_authorized`）；
 - 一次性 join token：`POST /v1/join`，member `control.join_token` 自动申请；token 支持 `expires_at`，过期/复用拒绝；
 - `POST /v1/revoke`：撤销 member，移除其 grant/LSA/ACK，generation+1；strict membership 下空 grant 不会退化为 allow-all；
-- membership grant 和已消费 join token 持久化到 `state_dir/controller-members.json`，controller 重启后保持；
+- membership grant 和已消费 join token 持久化到 `state_dir/controller-members.json`；LSA 表持久化到 `state_dir/controller-lsas.json`（30s TTL 内恢复）；controller 重启后保持；
 - 独立 signed membership manifest：`GET /v1/manifest`，member 校验 Ed25519/expiry 后更新 grants；
 - 未授权 LSA origin、overlay_ip、prefix、link target 被拒绝；
 - 数据面 source 按 grant 检查；forwarding member 可携带其他已授权成员源地址；`transit` 保留给 gateway/exit 策略；

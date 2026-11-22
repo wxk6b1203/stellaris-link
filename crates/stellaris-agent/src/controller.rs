@@ -37,6 +37,12 @@ struct PersistedMembers {
     consumed_join_tokens: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedLsas {
+    saved_at: u64,
+    lsas: Vec<Lsa>,
+}
+
 #[derive(Clone)]
 pub struct ControllerState {
     pub network: NetworkId,
@@ -46,6 +52,7 @@ pub struct ControllerState {
     acks: Arc<RwLock<HashMap<NodeId, u64>>>,
     acks_path: PathBuf,
     members_path: PathBuf,
+    lsas_path: PathBuf,
     grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenConfig>>>,
     consumed_join_tokens: Arc<RwLock<HashSet<String>>>,
@@ -220,8 +227,17 @@ impl ControllerState {
         let state_dir = PathBuf::from(&config.node.state_dir);
         let acks_path = state_dir.join("controller-acks.json");
         let members_path = state_dir.join("controller-members.json");
+        let lsas_path = state_dir.join("controller-lsas.json");
         let acks = load_acks(&acks_path);
         let persisted = load_members(&members_path);
+        let persisted_lsas = load_lsas(&lsas_path);
+        let mut link_state = LinkStateDb::new();
+        if now_epoch().saturating_sub(persisted_lsas.saved_at) <= 30 {
+            for lsa in persisted_lsas.lsas {
+                link_state.apply(lsa);
+            }
+        }
+        let loaded_lsas = link_state.len();
         let epoch = config.control.epoch.unwrap_or_else(now_epoch);
         let mut grants = HashMap::new();
         for member in &config.control.members {
@@ -251,10 +267,11 @@ impl ControllerState {
             network,
             secret: config.control.secret.clone(),
             routes: Arc::new(RwLock::new(routes)),
-            link_state: Arc::new(RwLock::new(LinkStateDb::new())),
+            link_state: Arc::new(RwLock::new(link_state)),
             acks: Arc::new(RwLock::new(acks)),
             acks_path,
             members_path,
+            lsas_path,
             grants: Arc::new(RwLock::new(grants)),
             join_tokens: Arc::new(RwLock::new(join_tokens)),
             consumed_join_tokens: Arc::new(RwLock::new(consumed)),
@@ -263,7 +280,7 @@ impl ControllerState {
             signer: None,
             manifest_ttl: config.control.manifest_ttl_secs,
             epoch,
-            generation: Arc::new(AtomicU64::new(1)),
+            generation: Arc::new(AtomicU64::new(if loaded_lsas > 0 { 2 } else { 1 })),
         })
     }
 
@@ -343,6 +360,7 @@ impl ControllerState {
             .expire(std::time::Duration::from_secs(30));
         if removed > 0 {
             self.generation.fetch_add(1, Ordering::Relaxed);
+            self.persist_lsas();
         }
     }
 
@@ -448,6 +466,36 @@ impl ControllerState {
         }
     }
 
+    fn persist_lsas(&self) {
+        let lsas = {
+            let db = self.link_state.read().unwrap_or_else(|e| e.into_inner());
+            db.all().cloned().collect::<Vec<_>>()
+        };
+        let persisted = PersistedLsas {
+            saved_at: now_epoch(),
+            lsas,
+        };
+        let bytes = match serde_json::to_vec_pretty(&persisted) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize controller LSAs");
+                return;
+            }
+        };
+        if let Some(parent) = self.lsas_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, "create controller LSA state dir");
+            return;
+        }
+        let tmp = self.lsas_path.with_extension("json.tmp");
+        if let Err(e) =
+            std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &self.lsas_path))
+        {
+            tracing::warn!(error = %e, "persist controller LSAs");
+        }
+    }
+
     fn apply_lsa(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
         self.authorize_lsa(&lsa)?;
         let changed = self
@@ -457,6 +505,7 @@ impl ControllerState {
             .apply(lsa);
         if changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
+            self.persist_lsas();
         }
         Ok(changed)
     }
@@ -546,6 +595,7 @@ impl ControllerState {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(node);
+        self.persist_lsas();
         self.acks
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -606,6 +656,25 @@ fn now_epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(1)
+}
+
+fn load_lsas(path: &std::path::Path) -> PersistedLsas {
+    let Ok(bytes) = std::fs::read(path) else {
+        return PersistedLsas {
+            saved_at: 0,
+            lsas: Vec::new(),
+        };
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(lsas) => lsas,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "load controller LSAs");
+            PersistedLsas {
+                saved_at: 0,
+                lsas: Vec::new(),
+            }
+        }
+    }
 }
 
 fn load_members(path: &std::path::Path) -> PersistedMembers {
@@ -1528,6 +1597,55 @@ expires_at = 1
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn controller_lsas_survive_restart() {
+        let dir = temp_state_dir();
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+epoch = 1
+"#,
+            dir
+        );
+        let config = Config::from_toml(&toml).unwrap();
+        let state = ControllerState::from_config(&config).unwrap();
+        let node = NodeId::new([1u8; 32]);
+        state
+            .apply_lsa(Lsa {
+                origin: node,
+                seq: 1,
+                zone: None,
+                links: vec![],
+                prefixes: vec![stellaris_linkstate::Prefix {
+                    prefix: "192.168.90.0/24".parse().unwrap(),
+                    metric: 0,
+                }],
+                overlay_ip: Some("10.7.0.1".parse().unwrap()),
+                addrs: vec![],
+            })
+            .unwrap();
+        drop(state);
+
+        let restarted = ControllerState::from_config(&config).unwrap();
+        let snapshot = restarted.snapshot(None);
+        assert!(
+            snapshot
+                .members
+                .iter()
+                .any(|m| m.node_id == node.to_string())
+        );
     }
 
     #[test]
