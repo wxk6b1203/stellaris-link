@@ -613,22 +613,45 @@ pub async fn start_cluster(
     Ok((rafts, stores))
 }
 
+const RAFT_SECRET_HEADER: &str = "x-stellaris-raft-secret";
+
 #[derive(Clone)]
 struct RaftHttpState {
     raft: Raft<TypeConfig, StateMachineStore>,
+    secret: Option<Arc<String>>,
 }
 
-fn raft_router(raft: Raft<TypeConfig, StateMachineStore>) -> Router {
+fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>) -> Router {
     Router::new()
         .route("/raft/append", post(raft_append))
         .route("/raft/vote", post(raft_vote))
-        .with_state(RaftHttpState { raft })
+        .with_state(RaftHttpState {
+            raft,
+            secret: secret.map(Arc::new),
+        })
+}
+
+fn authorized(state: &RaftHttpState, headers: &axum::http::HeaderMap) -> bool {
+    let Some(secret) = state.secret.as_deref() else {
+        return true;
+    };
+    headers
+        .get(RAFT_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(secret)
 }
 
 async fn raft_append(
     State(state): State<RaftHttpState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AppendEntriesRequest<TypeConfig>>,
 ) -> Result<Json<StreamAppendResult<TypeConfig>>, (axum::http::StatusCode, String)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid raft secret".into(),
+        ));
+    }
     let result = state
         .raft
         .append_entries(req)
@@ -639,8 +662,15 @@ async fn raft_append(
 
 async fn raft_vote(
     State(state): State<RaftHttpState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<VoteRequest<TypeConfig>>,
 ) -> Result<Json<VoteResponse<TypeConfig>>, (axum::http::StatusCode, String)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid raft secret".into(),
+        ));
+    }
     state
         .raft
         .vote(req)
@@ -651,11 +681,13 @@ async fn raft_vote(
 
 pub struct HttpFactory {
     client: reqwest::Client,
+    secret: Option<Arc<String>>,
 }
 
 pub struct HttpNetwork {
     client: reqwest::Client,
     base: String,
+    secret: Option<Arc<String>>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for HttpFactory {
@@ -665,6 +697,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpFactory {
         HttpNetwork {
             client: self.client.clone(),
             base: format!("http://{}", node.addr),
+            secret: self.secret.clone(),
         }
     }
 }
@@ -677,10 +710,14 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}/raft/append", self.base))
-            .json(&rpc)
+            .json(&rpc);
+        if let Some(secret) = &self.secret {
+            request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
@@ -701,10 +738,14 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         rpc: VoteRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}/raft/vote", self.base))
-            .json(&rpc)
+            .json(&rpc);
+        if let Some(secret) = &self.secret {
+            request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
@@ -748,7 +789,14 @@ pub struct HttpCluster {
 }
 
 pub async fn start_http_cluster(models: Vec<ControllerModel>) -> anyhow::Result<HttpCluster> {
-    start_http_cluster_at(models, None, None).await
+    start_http_cluster_at(models, None, None, None).await
+}
+
+pub async fn start_http_cluster_with_secret(
+    models: Vec<ControllerModel>,
+    secret: &str,
+) -> anyhow::Result<HttpCluster> {
+    start_http_cluster_at(models, None, None, Some(secret.to_string())).await
 }
 
 pub async fn start_http_cluster_on_disk(
@@ -757,13 +805,14 @@ pub async fn start_http_cluster_on_disk(
     addresses: Option<Vec<std::net::SocketAddr>>,
 ) -> anyhow::Result<HttpCluster> {
     anyhow::ensure!(models.len() == dirs.len(), "models/dirs length mismatch");
-    start_http_cluster_at(models, Some(dirs), addresses).await
+    start_http_cluster_at(models, Some(dirs), addresses, None).await
 }
 
 async fn start_http_cluster_at(
     models: Vec<ControllerModel>,
     dirs: Option<Vec<PathBuf>>,
     addresses: Option<Vec<std::net::SocketAddr>>,
+    secret: Option<String>,
 ) -> anyhow::Result<HttpCluster> {
     let count = models.len();
     if let Some(addresses) = &addresses {
@@ -802,11 +851,12 @@ async fn start_http_cluster_at(
         let store = StateMachineStore::new(model, state_path);
         let factory = HttpFactory {
             client: reqwest::Client::new(),
+            secret: secret.clone().map(Arc::new),
         };
         let raft = Raft::new(id, config.clone(), factory, log, store.clone()).await?;
         stores.push(store);
         rafts.write().await.insert(id, raft.clone());
-        let app = raft_router(raft);
+        let app = raft_router(raft, secret.clone());
         let listener = listeners.remove(0);
         servers.push(tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -951,6 +1001,34 @@ mod tests {
         assert!(applied >= 2, "only {applied} replicas applied");
         for raft in rafts.read().await.values() {
             let _ = raft.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn http_raft_requires_shared_secret() {
+        let models = (0..3)
+            .map(|_| ControllerModel::new(NetworkId::new(), 1))
+            .collect();
+        let cluster = start_http_cluster_with_secret(models, "raft-secret")
+            .await
+            .unwrap();
+        let req = VoteRequest::<TypeConfig> {
+            vote: VoteOf::<TypeConfig>::new(0, 0),
+            last_log_id: None,
+            leadership_transfer_from: None,
+        };
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/raft/vote", cluster.addresses[0]))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        for raft in cluster.rafts.read().await.values() {
+            let _ = raft.shutdown().await;
+        }
+        for server in cluster.servers {
+            server.abort();
         }
     }
 
