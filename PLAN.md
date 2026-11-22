@@ -27,7 +27,7 @@
 - [x] 跨 AZ link penalty + 同 AZ local_pref + RTT 驱动的 LSA link metric（5s 刷新）+ LSA 30s TTL + 等代价 ECMP。
 - [x] ACL（方向/五元组/peer/zone/优先级）与 QoS DSCP + token-bucket + egress 优先级队列/queue_depth；`GET/PUT /v1/policy`；`/v1/status` counters。
 - [x] RoutePolicy engine（Accept/Deny/SetLocalPref/SetMetric/SetWeight），AZ region/zone 匹配。
-- [x] `/metrics` Prometheus counters/gauges；ACL deny 审计日志。
+- [x] `/metrics` Prometheus counters/gauges；ACL deny 审计日志；ACL 每规则命中数。
 - [x] QoS 字节速率整形 `rate_bps/burst_bytes`。
 - [x] controller + 3 members 本机联调（ACK/snapshot/LSA）。
 - [x] 数据面 source grant 强制（member/transit capability）。

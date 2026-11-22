@@ -1,6 +1,7 @@
 //! ACL and QoS policy evaluation (userspace, per packet).
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,7 @@ pub struct Policy {
     qos_order: Vec<usize>,
     buckets: Vec<Mutex<Bucket>>,
     byte_buckets: Vec<Mutex<Bucket>>,
+    acl_hits: Vec<AtomicU64>,
 }
 
 impl Policy {
@@ -123,12 +125,16 @@ impl Policy {
                 })
             })
             .collect();
+        let acl_hits = (0..file.acl.rules.len())
+            .map(|_| AtomicU64::new(0))
+            .collect();
         Self {
             file,
             acl_order,
             qos_order,
             buckets,
             byte_buckets,
+            acl_hits,
         }
     }
 
@@ -138,6 +144,16 @@ impl Policy {
 
     pub fn acl_rules(&self) -> usize {
         self.file.acl.rules.len()
+    }
+
+    pub fn acl_hits(&self) -> Vec<(String, u64)> {
+        self.file
+            .acl
+            .rules
+            .iter()
+            .zip(self.acl_hits.iter())
+            .map(|(rule, hits)| (rule.name.clone(), hits.load(Ordering::Relaxed)))
+            .collect()
     }
 
     pub fn qos_classes(&self) -> usize {
@@ -163,6 +179,7 @@ impl Policy {
                 peer,
                 zone,
             ) {
+                self.acl_hits[*idx].fetch_add(1, Ordering::Relaxed);
                 return match rule.action {
                     AclAction::Allow => AclVerdict::Allow,
                     AclAction::Deny => AclVerdict::Deny(rule.name.clone()),
@@ -258,6 +275,34 @@ mod tests {
         p[20..22].copy_from_slice(&1234u16.to_be_bytes());
         p[22..24].copy_from_slice(&443u16.to_be_bytes());
         p
+    }
+
+    #[test]
+    fn acl_rule_hits_are_counted() {
+        use stellaris_types::{AclConfig, AclRule};
+        let acl = AclConfig {
+            default_action: AclAction::Allow,
+            rules: vec![AclRule {
+                name: "deny-443".into(),
+                action: AclAction::Deny,
+                direction: AclDirection::Both,
+                priority: 10,
+                src: None,
+                dst: None,
+                protocol: Some(6),
+                src_port: None,
+                dst_port: Some(443),
+                peer: None,
+                zone: None,
+            }],
+        };
+        let policy = Policy::from_config(acl, QosConfig::default());
+        let info = PacketInfo::parse(&https_packet()).unwrap();
+        assert!(matches!(
+            policy.check(AclDirection::Inbound, &info, None, None),
+            AclVerdict::Deny(_)
+        ));
+        assert_eq!(policy.acl_hits()[0].1, 1);
     }
 
     #[test]

@@ -165,6 +165,7 @@ async fn status(
         "node_name": state.config.node.name,
         "zone": state.config.node.zone,
         "acl_rules": state.policy.read().unwrap_or_else(|e| e.into_inner()).acl_rules(),
+        "acl_hits": state.policy.read().unwrap_or_else(|e| e.into_inner()).acl_hits(),
         "qos_classes": state.policy.read().unwrap_or_else(|e| e.into_inner()).qos_classes(),
         "stats": state.stats.snapshot(),
         "network_id": state.network.to_string(),
