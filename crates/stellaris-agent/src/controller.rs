@@ -3,7 +3,7 @@
 //! HTTP is kept for compatibility/debugging; members can use `control.endpoint_id`
 //! + `control.addrs` to use iroh instead. HA/openraft is still future work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +29,14 @@ use stellaris_types::{
 };
 use uuid::Uuid;
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedMembers {
+    #[serde(default)]
+    grants: Vec<ControllerMemberConfig>,
+    #[serde(default)]
+    consumed_join_tokens: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct ControllerState {
     pub network: NetworkId,
@@ -37,8 +45,10 @@ pub struct ControllerState {
     link_state: Arc<RwLock<LinkStateDb>>,
     acks: Arc<RwLock<HashMap<NodeId, u64>>>,
     acks_path: PathBuf,
+    members_path: PathBuf,
     grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenConfig>>>,
+    consumed_join_tokens: Arc<RwLock<HashSet<String>>>,
     strict_membership: bool,
     signing_key: Option<Arc<SigningKey>>,
     signer: Option<NodeId>,
@@ -209,7 +219,9 @@ impl ControllerState {
         }
         let state_dir = PathBuf::from(&config.node.state_dir);
         let acks_path = state_dir.join("controller-acks.json");
+        let members_path = state_dir.join("controller-members.json");
         let acks = load_acks(&acks_path);
+        let persisted = load_members(&members_path);
         let epoch = config.control.epoch.unwrap_or_else(now_epoch);
         let mut grants = HashMap::new();
         for member in &config.control.members {
@@ -219,14 +231,22 @@ impl ControllerState {
                 .context("controller member node_id")?;
             grants.insert(node, member.clone());
         }
+        for member in &persisted.grants {
+            let node: NodeId = member.node_id.parse().context("persisted member node_id")?;
+            grants.insert(node, member.clone());
+        }
+        let consumed: HashSet<String> = persisted.consumed_join_tokens.into_iter().collect();
         let join_tokens = config
             .control
             .join_tokens
             .iter()
+            .filter(|token| !consumed.contains(&token.token))
             .map(|token| (token.token.clone(), token.clone()))
             .collect();
-        let strict_membership =
-            !config.control.members.is_empty() || !config.control.join_tokens.is_empty();
+        let strict_membership = !config.control.members.is_empty()
+            || !config.control.join_tokens.is_empty()
+            || !grants.is_empty()
+            || !consumed.is_empty();
         Ok(Self {
             network,
             secret: config.control.secret.clone(),
@@ -234,8 +254,10 @@ impl ControllerState {
             link_state: Arc::new(RwLock::new(LinkStateDb::new())),
             acks: Arc::new(RwLock::new(acks)),
             acks_path,
+            members_path,
             grants: Arc::new(RwLock::new(grants)),
             join_tokens: Arc::new(RwLock::new(join_tokens)),
+            consumed_join_tokens: Arc::new(RwLock::new(consumed)),
             strict_membership,
             signing_key: None,
             signer: None,
@@ -384,6 +406,48 @@ impl ControllerState {
         }
     }
 
+    fn persist_members(&self) {
+        let mut grants: Vec<ControllerMemberConfig> = self
+            .grants
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        grants.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        let mut consumed: Vec<String> = self
+            .consumed_join_tokens
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        consumed.sort();
+        let persisted = PersistedMembers {
+            grants,
+            consumed_join_tokens: consumed,
+        };
+        let bytes = match serde_json::to_vec_pretty(&persisted) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize controller members");
+                return;
+            }
+        };
+        if let Some(parent) = self.members_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, "create controller members dir");
+            return;
+        }
+        let tmp = self.members_path.with_extension("json.tmp");
+        if let Err(e) =
+            std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &self.members_path))
+        {
+            tracing::warn!(error = %e, "persist controller members");
+        }
+    }
+
     fn apply_lsa(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
         self.authorize_lsa(&lsa)?;
         let changed = self
@@ -445,7 +509,12 @@ impl ControllerState {
             .unwrap_or_else(|e| e.into_inner())
             .remove(token)
             .ok_or((403, "invalid or already used join token".to_string()))?;
+        self.consumed_join_tokens
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(token.to_string());
         if join.expires_at.is_some_and(|expires| now > expires) {
+            self.persist_members();
             return Err((403, "join token expired".to_string()));
         }
         let grant = ControllerMemberConfig {
@@ -458,6 +527,7 @@ impl ControllerState {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(node, grant);
+        self.persist_members();
         self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -481,6 +551,7 @@ impl ControllerState {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&node);
         self.persist_acks();
+        self.persist_members();
         self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -535,6 +606,19 @@ fn now_epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(1)
+}
+
+fn load_members(path: &std::path::Path) -> PersistedMembers {
+    let Ok(bytes) = std::fs::read(path) else {
+        return PersistedMembers::default();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(members) => members,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "load controller members");
+            PersistedMembers::default()
+        }
+    }
 }
 
 fn load_acks(path: &std::path::Path) -> HashMap<NodeId, u64> {
@@ -973,11 +1057,22 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    fn temp_state_dir() -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "stellaris-controller-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.display().to_string()
+    }
+
     fn state() -> ControllerState {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [node]
 name = "ctrl"
 role = "controller"
+state_dir = "{}"
 
 [network]
 name = "demo"
@@ -995,8 +1090,10 @@ overlay_ip = "10.7.0.2"
 [[routes]]
 prefix = "192.168.50.0/24"
 via = "b"
-"#;
-        ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap()
+"#,
+            temp_state_dir()
+        );
+        ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap()
     }
 
     async fn json(response: axum::response::Response) -> serde_json::Value {
@@ -1170,10 +1267,12 @@ bind = "127.0.0.1:0"
 
     #[tokio::test]
     async fn join_token_admits_once_and_grants_prefix() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [node]
 name = "ctrl"
 role = "controller"
+state_dir = "{}"
 
 [network]
 name = "demo"
@@ -1186,8 +1285,10 @@ epoch = 1
 [[control.join_tokens]]
 token = "join-once"
 prefixes = ["192.168.70.0/24"]
-"#;
-        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
         let app = router(state);
         let body = serde_json::json!({
             "node_id": "0101010101010101010101010101010101010101010101010101010101010101",
@@ -1248,12 +1349,55 @@ prefixes = ["192.168.70.0/24"]
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
-    async fn revoke_removes_member_lsa_and_manifest_entry() {
-        let toml = r#"
+    #[test]
+    fn member_grants_and_consumed_tokens_survive_restart() {
+        let dir = temp_state_dir();
+        let toml = format!(
+            r#"
 [node]
 name = "ctrl"
 role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+epoch = 1
+
+[[control.join_tokens]]
+token = "persist-once"
+prefixes = ["192.168.80.0/24"]
+"#,
+            dir
+        );
+        let config = Config::from_toml(&toml).unwrap();
+        let state = ControllerState::from_config(&config).unwrap();
+        let node = NodeId::new([1u8; 32]);
+        state
+            .join(node, "10.7.0.1".parse().unwrap(), "persist-once")
+            .unwrap();
+        drop(state);
+
+        let restarted = ControllerState::from_config(&config).unwrap();
+        assert!(restarted.grants.read().unwrap().contains_key(&node));
+        assert!(
+            restarted
+                .join(node, "10.7.0.1".parse().unwrap(), "persist-once")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_removes_member_lsa_and_manifest_entry() {
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
 
 [network]
 name = "demo"
@@ -1266,8 +1410,10 @@ epoch = 1
 [[control.join_tokens]]
 token = "join-once"
 prefixes = ["192.168.70.0/24"]
-"#;
-        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
         let app = router(state);
         let node = "0101010101010101010101010101010101010101010101010101010101010101";
         let join =
@@ -1339,10 +1485,12 @@ prefixes = ["192.168.70.0/24"]
 
     #[tokio::test]
     async fn expired_join_token_is_rejected() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [node]
 name = "ctrl"
 role = "controller"
+state_dir = "{}"
 
 [network]
 name = "demo"
@@ -1354,8 +1502,10 @@ secret = "s3cret"
 [[control.join_tokens]]
 token = "expired"
 expires_at = 1
-"#;
-        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
         let response = router(state)
             .oneshot(
                 Request::builder()
@@ -1380,10 +1530,12 @@ expires_at = 1
 
     #[test]
     fn unauthorized_lsa_is_rejected() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [node]
 name = "ctrl"
 role = "controller"
+state_dir = "{}"
 
 [network]
 name = "demo"
@@ -1397,8 +1549,10 @@ epoch = 1
 node_id = "0101010101010101010101010101010101010101010101010101010101010101"
 overlay_ip = "10.7.0.1"
 prefixes = ["192.168.50.0/24"]
-"#;
-        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
         let unknown = Lsa {
             origin: NodeId::new([2u8; 32]),
             seq: 1,
