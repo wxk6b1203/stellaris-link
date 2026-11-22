@@ -608,6 +608,11 @@ impl Config {
                 "control.tls_cert and control.tls_key must be set together".into(),
             ));
         }
+        if self.control.raft_dir.is_some() && !self.control.urls.is_empty() {
+            return Err(ConfigError::Invalid(
+                "control.raft_dir and control.urls (legacy fanout) are mutually exclusive".into(),
+            ));
+        }
         let mut join_tokens = HashSet::new();
         for join in &self.control.join_tokens {
             if join.token.trim().is_empty() {
@@ -850,5 +855,28 @@ cidr = "10.7.0.0/16"
             config.network.id.unwrap().to_string(),
             "11111111-1111-4111-8111-111111111111"
         );
+    }
+}
+
+#[cfg(test)]
+mod raft_mode_tests {
+    use super::*;
+
+    #[test]
+    fn raft_mode_rejects_legacy_fanout() {
+        let toml = r#"
+[node]
+name = "c"
+role = "controller"
+state_dir = "/tmp/stellaris-raft-config-test"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[control]
+secret = "s"
+raft_dir = "/tmp/stellaris-raft-config-test/raft"
+urls = ["http://127.0.0.1:7800"]
+"#;
+        assert!(Config::from_toml(toml).is_err());
     }
 }
