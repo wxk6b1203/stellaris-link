@@ -72,11 +72,12 @@ pub async fn start(
         state.config.network.cidr,
     );
 
-    let (egress_tx, egress_rx) = mpsc::channel::<EgressFrame>(1024);
+    let queue_depth = state.config.qos.queue_depth.unwrap_or(4096);
+    let (egress_tx, egress_rx) = mpsc::channel::<EgressFrame>(queue_depth);
     {
         let transport = transport.clone();
         tokio::spawn(async move {
-            egress_worker(egress_rx, transport).await;
+            egress_worker(egress_rx, transport, queue_depth).await;
         });
     }
     {
@@ -278,7 +279,11 @@ impl PartialOrd for EgressFrame {
     }
 }
 
-async fn egress_worker(mut rx: mpsc::Receiver<EgressFrame>, transport: Arc<IrohTransport>) {
+async fn egress_worker(
+    mut rx: mpsc::Receiver<EgressFrame>,
+    transport: Arc<IrohTransport>,
+    queue_depth: usize,
+) {
     let mut queue = BinaryHeap::new();
     loop {
         if queue.is_empty() {
@@ -290,7 +295,7 @@ async fn egress_worker(mut rx: mpsc::Receiver<EgressFrame>, transport: Arc<IrohT
         tokio::select! {
             frame = rx.recv() => {
                 if let Some(frame) = frame {
-                    if queue.len() < 4096 {
+                    if queue.len() < queue_depth {
                         queue.push(frame);
                     }
                 } else {
@@ -329,7 +334,9 @@ async fn outbound_loop(
             priority,
             sequence,
         };
-        let _ = egress_tx.try_send(egress);
+        if egress_tx.try_send(egress).is_err() {
+            crate::stats::Stats::inc(&state.stats.queue_dropped);
+        }
     }
 }
 
@@ -374,6 +381,7 @@ fn route_outbound_priority(
         policy.check(direction, &info, Some(next.node), zone),
         AclVerdict::Deny(_)
     ) {
+        crate::stats::Stats::inc(&state.stats.acl_denied);
         return None;
     }
     let priority = policy.qos_priority(&info);
@@ -382,6 +390,7 @@ fn route_outbound_priority(
     frame.extend_from_slice(&header.encode());
     frame.extend_from_slice(packet);
     if policy.apply_qos(&mut frame[HEADER_LEN..], &info) == QosVerdict::RateLimited {
+        crate::stats::Stats::inc(&state.stats.qos_rate_limited);
         return None;
     }
     Some((next.node, Bytes::from(frame), priority))
@@ -395,11 +404,13 @@ async fn handle_inbound(
 ) {
     match decide_inbound(state, inbound.from, &inbound.packet) {
         InboundAction::Deliver(packet) => {
+            crate::stats::Stats::inc(&state.stats.delivered);
             if let Err(e) = dev.send(&packet).await {
                 debug!(error = %e, "TUN send failed");
             }
         }
         InboundAction::Forward { next, frame } => {
+            crate::stats::Stats::inc(&state.stats.forwarded);
             if let Err(e) = transport.send(next, frame).await {
                 debug!(peer = %next.short(), error = %e, "transit send failed");
             }
@@ -463,12 +474,14 @@ pub fn decide_inbound(
         policy.check(direction, &info, Some(from), peer.zone.as_deref()),
         AclVerdict::Deny(_)
     ) {
+        crate::stats::Stats::inc(&state.stats.acl_denied);
         return InboundAction::Drop("acl denied");
     }
 
     if is_local || is_gateway {
         let mut delivered = payload.to_vec();
         if policy.apply_qos(&mut delivered, &info) == QosVerdict::RateLimited {
+            crate::stats::Stats::inc(&state.stats.qos_rate_limited);
             return InboundAction::Drop("qos rate limit");
         }
         return InboundAction::Deliver(delivered);
@@ -480,6 +493,7 @@ pub fn decide_inbound(
         return InboundAction::Drop("ttl expired");
     }
     if policy.apply_qos(&mut forwarded, &info) == QosVerdict::RateLimited {
+        crate::stats::Stats::inc(&state.stats.qos_rate_limited);
         return InboundAction::Drop("qos rate limit");
     }
     let Some(entry) = state.routes.lookup(info.dst) else {

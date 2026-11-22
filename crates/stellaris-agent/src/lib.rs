@@ -11,6 +11,7 @@ pub mod link_state;
 pub mod membership;
 pub mod peers;
 pub mod policy;
+pub mod stats;
 pub mod transport;
 pub mod wire;
 
@@ -36,6 +37,7 @@ pub struct AgentState {
     pub peers: PeerRegistry,
     pub grants: membership::GrantMap,
     pub policy: Arc<RwLock<policy::Policy>>,
+    pub stats: Arc<stats::Stats>,
     pub started_at: Instant,
 }
 
@@ -143,6 +145,7 @@ impl AgentState {
             peers,
             grants: Arc::new(RwLock::new(std::collections::HashMap::new())),
             policy,
+            stats: Arc::new(stats::Stats::default()),
             started_at: Instant::now(),
         })
     }

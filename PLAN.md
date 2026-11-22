@@ -25,10 +25,11 @@
 - [x] 分布式 LSA：iroh control stream 洪泛 + 本地 SPF + Ping/Pong 故障收敛 + LSA underlay 地址自动发现 peer（3 节点 demo/FAILOVER 通过）。
 - [x] controller manifest 携带 underlay addrs，member 无静态 peer 自动发现/连接（demo 通过）。
 - [x] 跨 AZ link penalty + 同 AZ local_pref + RTT 驱动的 LSA link metric（5s 刷新）+ LSA 30s TTL + 等代价 ECMP。
-- [x] ACL（方向/五元组/peer/zone/优先级）与 QoS DSCP + token-bucket rate limit + egress 优先级队列；`GET/PUT /v1/policy` 动态更新/持久化。
+- [x] ACL（方向/五元组/peer/zone/优先级）与 QoS DSCP + token-bucket + egress 优先级队列/queue_depth；`GET/PUT /v1/policy`；`/v1/status` counters。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
 - [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；真实 3 节点 TUN/LSA transit 通过。
 - [ ] 完整 signed membership manifest；controller key set threshold 选择已实现。
+- [ ] ACL/QoS 审计日志、复杂整形。
 - [ ] 完整 controller（openraft quorum/leader election）、mDNS/广播发现、ACL/QoS 复杂整形/队列配置、多网络、Windows、macOS NAT。
 
 下一阶段：安全/成员认证 → 真实 3 节点验证 → bootstrap/discovery → 多网络 → openraft HA（见 PRIORITIES.md / OPENRAFT-HA.md）。

@@ -60,6 +60,9 @@ pub struct AclRule {
 pub struct QosConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Egress priority queue depth (default 4096).
+    #[serde(default)]
+    pub queue_depth: Option<usize>,
     #[serde(default)]
     pub classes: Vec<QosClass>,
 }

@@ -454,6 +454,9 @@ impl Config {
                 ));
             }
         }
+        if self.qos.queue_depth == Some(0) {
+            return Err(ConfigError::Invalid("qos.queue_depth must be > 0".into()));
+        }
         for class in &self.qos.classes {
             if class.name.trim().is_empty() {
                 return Err(ConfigError::Invalid(
