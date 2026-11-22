@@ -452,6 +452,7 @@ three_node_raft_over_http
 - snapshot RPC 带 SHA-256 checksum，服务端校验
 - Raft HTTP body limit 64 MiB
 - raft log/state 使用 fsync + atomic rename
+- 持久化失败向 Raft storage 返回 io::Error；state machine 先持久化再 ACK
 - 大 snapshot 分块上传：`/raft/snapshot/begin` + `/chunk` + `/finish`（单块 2 MiB）
 - 已用 >4 MiB snapshot 覆盖 begin/chunk/finish 装配路径
 - chunk 带 offset，重复/重叠 chunk 幂等；断点续传可重试

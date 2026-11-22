@@ -142,9 +142,9 @@ impl LogStore {
         }
     }
 
-    async fn persist(&self) {
+    async fn persist(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let persisted = PersistedLog {
             log: self
@@ -158,22 +158,11 @@ impl LogStore {
             last_purged: *self.last_purged.read().await,
             committed: *self.committed.read().await,
         };
-        let bytes = match serde_json::to_vec(&persisted) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(error = %e, "serialize raft log");
-                return;
-            }
-        };
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            tracing::warn!(error = %e, "create raft log dir");
-            return;
+        let bytes = serde_json::to_vec(&persisted).map_err(invalid_data)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        if let Err(e) = atomic_write(path, &bytes) {
-            tracing::warn!(error = %e, "persist raft log");
-        }
+        atomic_write(path, &bytes)
     }
 
     pub async fn is_empty(&self) -> bool {
@@ -229,7 +218,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
 
     async fn save_vote(&mut self, vote: &VoteOf<TypeConfig>) -> Result<(), io::Error> {
         *self.vote.write().await = Some(*vote);
-        self.persist().await;
+        self.persist().await?;
         Ok(())
     }
 
@@ -238,7 +227,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
         committed: Option<LogIdOf<TypeConfig>>,
     ) -> Result<(), io::Error> {
         *self.committed.write().await = committed;
-        self.persist().await;
+        self.persist().await?;
         Ok(())
     }
 
@@ -260,7 +249,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
             log.insert(entry.index(), bytes);
         }
         drop(log);
-        self.persist().await;
+        self.persist().await?;
         callback.io_completed(Ok(()));
         Ok(())
     }
@@ -276,7 +265,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
             log.remove(&key);
         }
         drop(log);
-        self.persist().await;
+        self.persist().await?;
         Ok(())
     }
 
@@ -288,7 +277,7 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
             log.remove(&key);
         }
         drop(log);
-        self.persist().await;
+        self.persist().await?;
         Ok(())
     }
 }
@@ -327,30 +316,19 @@ impl StateMachineStore {
         }
     }
 
-    async fn persist(&self) {
+    async fn persist(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let data = {
             let inner = self.inner.read().await;
             serde_json::to_vec(&*inner)
         };
-        let bytes = match data {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(error = %e, "serialize controller raft state");
-                return;
-            }
-        };
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            tracing::warn!(error = %e, "create raft state dir");
-            return;
+        let bytes = data.map_err(invalid_data)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        if let Err(e) = atomic_write(path, &bytes) {
-            tracing::warn!(error = %e, "persist controller raft state");
-        }
+        atomic_write(path, &bytes)
     }
 
     pub async fn model(&self) -> ControllerModel {
@@ -398,34 +376,37 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     {
         use futures::TryStreamExt;
         while let Some((entry, responder)) = entries.try_next().await? {
-            let mut inner = self.inner.write().await;
-            inner.last_applied = Some(entry.log_id);
-            let response = match entry.payload {
-                EntryPayload::Blank => CommandResult {
-                    generation: inner.model.generation,
-                    epoch: inner.model.epoch,
-                },
-                EntryPayload::Normal(command) => {
-                    inner.model.apply(command);
-                    CommandResult {
+            let response = {
+                let mut inner = self.inner.write().await;
+                inner.last_applied = Some(entry.log_id);
+                match entry.payload {
+                    EntryPayload::Blank => CommandResult {
                         generation: inner.model.generation,
                         epoch: inner.model.epoch,
+                    },
+                    EntryPayload::Normal(command) => {
+                        inner.model.apply(command);
+                        CommandResult {
+                            generation: inner.model.generation,
+                            epoch: inner.model.epoch,
+                        }
                     }
-                }
-                EntryPayload::Membership(membership) => {
-                    inner.last_membership =
-                        StoredMembershipOf::<TypeConfig>::new(Some(entry.log_id), membership);
-                    CommandResult {
-                        generation: inner.model.generation,
-                        epoch: inner.model.epoch,
+                    EntryPayload::Membership(membership) => {
+                        inner.last_membership =
+                            StoredMembershipOf::<TypeConfig>::new(Some(entry.log_id), membership);
+                        CommandResult {
+                            generation: inner.model.generation,
+                            epoch: inner.model.epoch,
+                        }
                     }
                 }
             };
+            // Acknowledge only after the new state is durable.
+            self.persist().await?;
             if let Some(responder) = responder {
                 responder.send(response);
             }
         }
-        self.persist().await;
         Ok(())
     }
 
@@ -450,7 +431,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         inner.last_membership = meta.last_membership.clone();
         drop(inner);
         *self.snapshot.write().await = Some((meta.clone(), snapshot.into_inner()));
-        self.persist().await;
+        self.persist().await?;
         Ok(())
     }
 
@@ -2125,6 +2106,15 @@ mod tests {
         assert!(second.store.model().await.lsas.contains_key(&node_id));
         second.raft.shutdown().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn log_store_propagates_persist_failure() {
+        let mut store = Arc::new(LogStore::new(Some(PathBuf::from(
+            "/proc/stellaris-raft-impossible/raft-log.json",
+        ))));
+        let vote = VoteOf::<TypeConfig>::new(1, 1);
+        assert!(store.save_vote(&vote).await.is_err());
     }
 
     #[tokio::test]
