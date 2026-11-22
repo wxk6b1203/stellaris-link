@@ -190,7 +190,8 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     let want_transport = state.config.dataplane.enabled
         || !state.config.peers.is_empty()
         || control_configured
-        || state.config.transport.discovery_port.is_some();
+        || state.config.transport.discovery_port.is_some()
+        || state.config.transport.mdns;
     let mut transport_handle = None;
     if want_transport {
         let transport = transport::IrohTransport::start(

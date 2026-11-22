@@ -224,7 +224,22 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-3node.sh
 
 三个 network namespace + 两个 veth，a—b—c；验证 LSA 自动路由、b 的 transit 转发、双向 ping 和 1000B 包。已在 bee x86_64 实测通过。
 
-### 13. UDP bootstrap discovery（Linux netns）
+### 13. mDNS bootstrap discovery（Linux netns）
+
+```toml
+[transport]
+mdns = true
+advertise = ["192.168.1.10:41000"]
+```
+
+```bash
+sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-mdns.sh
+# OK: mDNS discovery + PSK works.
+```
+
+mDNS 服务类型：`_stellaris._udp.local.`；发现后仍必须通过 PSK/controller 认证。
+
+### 14. UDP bootstrap discovery（Linux netns）
 
 ```toml
 [transport]
@@ -239,7 +254,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 发现只产生候选 peer，仍必须通过 PSK/controller 认证。
 
-### 14. Controller + 3 members（本机）
+### 15. Controller + 3 members（本机）
 
 ```bash
 ./scripts/demo-controller-3node.sh
@@ -247,7 +262,7 @@ sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-discovery.s
 
 一个 controller + 三个 member，验证 controller ACK、snapshot 成员、LSA 路由学习。
 
-### 15. Controller + 3 TUN 节点（Linux netns）
+### 16. Controller + 3 TUN 节点（Linux netns）
 
 ```bash
 sudo BIN=./target/release/stellaris-agent \
@@ -257,21 +272,21 @@ sudo BIN=./target/release/stellaris-agent \
 
 验证 controller 路由、LSA、TUN transit、双向 0% loss 和 1000B 包。
 
-### 16. 多网络凭证隔离
+### 17. 多网络凭证隔离
 
 ```bash
 ./scripts/demo-multi-network-isolation.sh
 # OK: different network IDs reject the same PSK.
 ```
 
-### 17. 多 controller threshold
+### 18. 多 controller threshold
 
 ```bash
 ./scripts/demo-controller-threshold.sh
 # OK: member applied a 2-controller threshold snapshot.
 ```
 
-### 18. 真正的 TUN overlay（两台机器，需要 root）
+### 19. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 

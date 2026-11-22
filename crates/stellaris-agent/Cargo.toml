@@ -27,6 +27,7 @@ hex.workspace = true
 hmac.workspace = true
 ipnet.workspace = true
 iroh.workspace = true
+mdns-sd.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

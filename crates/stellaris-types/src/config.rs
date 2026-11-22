@@ -228,6 +228,9 @@ pub struct TransportConfig {
     /// Optional directed broadcast target (e.g. 192.168.1.255:47000).
     #[serde(default)]
     pub discovery_broadcast: Option<SocketAddr>,
+    /// Enable mDNS/DNS-SD bootstrap discovery (`_stellaris._udp.local.`).
+    #[serde(default)]
+    pub mdns: bool,
 }
 
 impl Default for TransportConfig {
@@ -241,6 +244,7 @@ impl Default for TransportConfig {
             bind_ip: None,
             discovery_port: None,
             discovery_broadcast: None,
+            mdns: false,
         }
     }
 }

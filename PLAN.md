@@ -35,6 +35,7 @@
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。
 - [x] UDP broadcast bootstrap discovery（定向广播 + PSK 认证），Linux netns 实测通过。
+- [x] mDNS/DNS-SD discovery（`_stellaris._udp.local.`），Linux netns 实测通过。
 - [x] `transport.bind_ip`：TUN 场景绑定 underlay，避免 iroh underlay QUIC 走进 TUN。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
 - [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。

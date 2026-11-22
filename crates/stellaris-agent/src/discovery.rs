@@ -3,10 +3,12 @@
 //! Discovery only adds candidate peers; PSK/controller membership still
 //! authenticates every connection before data or LSA is accepted.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use stellaris_types::{NodeId, PeerConfig};
@@ -25,6 +27,15 @@ struct Announce {
 }
 
 pub fn start(state: AgentState, transport: Arc<IrohTransport>) {
+    if state.config.transport.discovery_port.is_some() {
+        start_broadcast(state.clone(), transport.clone());
+    }
+    if state.config.transport.mdns {
+        start_mdns(state, transport);
+    }
+}
+
+fn start_broadcast(state: AgentState, transport: Arc<IrohTransport>) {
     let Some(port) = state.config.transport.discovery_port else {
         return;
     };
@@ -118,6 +129,124 @@ pub fn start(state: AgentState, transport: Arc<IrohTransport>) {
             };
             if transport.add_peer(peer, false) {
                 info!(peer = %node.short(), "discovered peer via UDP broadcast");
+            }
+        }
+    });
+}
+
+const MDNS_SERVICE: &str = "_stellaris._udp.local.";
+
+fn start_mdns(state: AgentState, transport: Arc<IrohTransport>) {
+    let Some(first) = state.config.transport.advertise.first().copied() else {
+        warn!("transport.mdns requires transport.advertise");
+        return;
+    };
+    let Some(overlay_ip) = state.config.node.overlay_ip else {
+        warn!("transport.mdns requires node.overlay_ip");
+        return;
+    };
+    let daemon = match ServiceDaemon::new() {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            warn!(error = %e, "start mDNS daemon");
+            return;
+        }
+    };
+    let instance = format!("stellaris-{}", state.node_id.short());
+    let host = format!("{instance}.local.");
+    let mut properties = HashMap::new();
+    properties.insert("network".to_string(), state.network.to_string());
+    properties.insert("node".to_string(), state.node_id.to_string());
+    properties.insert("overlay".to_string(), overlay_ip.to_string());
+    if let Some(zone) = &state.config.node.zone {
+        properties.insert("zone".to_string(), zone.clone());
+    }
+    properties.insert("addr".to_string(), first.to_string());
+    let service = match ServiceInfo::new(
+        MDNS_SERVICE,
+        &instance,
+        &host,
+        first.ip().to_string(),
+        first.port(),
+        properties,
+    ) {
+        Ok(service) => service,
+        Err(e) => {
+            warn!(error = %e, "build mDNS service info");
+            return;
+        }
+    };
+    if let Err(e) = daemon.register(service) {
+        warn!(error = %e, "register mDNS service");
+        return;
+    }
+    let receiver = match daemon.browse(MDNS_SERVICE) {
+        Ok(receiver) => receiver,
+        Err(e) => {
+            warn!(error = %e, "browse mDNS service");
+            return;
+        }
+    };
+    info!(service = MDNS_SERVICE, "mDNS discovery started");
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        // Keep the daemon alive for the lifetime of the process.
+        let _daemon = daemon;
+        // add_peer() spawns a Tokio connect loop; expose the current runtime
+        // to this std thread.
+        let _runtime = runtime.enter();
+        while let Ok(event) = receiver.recv() {
+            let ServiceEvent::ServiceResolved(service) = event else {
+                continue;
+            };
+            let Some(node) = service
+                .get_property_val_str("node")
+                .and_then(|s| s.parse::<NodeId>().ok())
+            else {
+                continue;
+            };
+            if node == state.node_id || state.peers.get(&node).is_some() {
+                continue;
+            }
+            let Some(network) = service.get_property_val_str("network") else {
+                continue;
+            };
+            if network != state.network.to_string() {
+                continue;
+            }
+            let Some(overlay_ip) = service
+                .get_property_val_str("overlay")
+                .and_then(|s| s.parse::<IpAddr>().ok())
+            else {
+                continue;
+            };
+            let port = service.get_port();
+            let mut addrs: Vec<SocketAddr> = service
+                .get_addresses_v4()
+                .into_iter()
+                .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+                .collect();
+            if addrs.is_empty()
+                && let Some(addr) = service
+                    .get_property_val_str("addr")
+                    .and_then(|s| s.parse::<SocketAddr>().ok())
+            {
+                addrs.push(addr);
+            }
+            if addrs.is_empty() {
+                continue;
+            }
+            let peer = PeerConfig {
+                name: format!("mdns-{}", node.short()),
+                endpoint_id: node.to_string(),
+                overlay_ip,
+                addrs,
+                relay_url: None,
+                advertised: Vec::new(),
+                zone: service.get_property_val_str("zone").map(str::to_string),
+            };
+            if transport.add_peer(peer, false) {
+                info!(peer = %node.short(), "discovered peer via mDNS");
             }
         }
     });
