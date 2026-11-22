@@ -27,6 +27,7 @@
 - [x] 跨 AZ link penalty + 同 AZ local_pref + RTT 驱动的 LSA link metric（5s 刷新）+ LSA 30s TTL + 等代价 ECMP。
 - [x] ACL（方向/五元组/peer/zone/优先级）与 QoS DSCP + token-bucket + egress 优先级队列/queue_depth；`GET/PUT /v1/policy`；`/v1/status` counters。
 - [x] RoutePolicy engine（Accept/Deny/SetLocalPref/SetMetric/SetWeight），AZ region/zone 匹配。
+- [x] `/metrics` Prometheus counters/gauges；ACL deny 审计日志。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
 - [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。
 - [x] manifest threshold/多 controller 聚合；join token 过期/撤销。

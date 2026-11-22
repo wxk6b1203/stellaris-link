@@ -65,7 +65,7 @@
 | **P1** | ACL/QoS 生产化（队列深度、counters、审计、整形） | 中高 | 无法定位丢包；队列满静默丢；无 SLA | M | 现有 policy | **queue_depth/counters 已做；审计/整形待做** |
 | **P1** | RoutePolicy/AZ 高级策略 | 中 | `RoutePolicy` 已执行；无故障域自动 failover | M | 状态机/策略引擎 | **policy engine 已做；故障域策略待做** |
 | **P2** | openraft HA | 高（长期） | 单 controller/ fanout 无 split-brain 保护 | XL | P0 安全 + 确定性状态机 | 安全后 |
-| **P2** | metrics/audit/tracing | 中高 | 线上不可观测、不可审计 | M | 无 | 与 ACL/QoS 一起 |
+| **P2** | metrics/audit/tracing | 中高 | 线上不可观测、不可审计 | M | 无 | **metrics + ACL audit 已做；tracing 待做** |
 | **P2** | 打包/service/upgrade | 中 | 部署体验差 | M | — | 后期 |
 | **P2** | Windows / macOS NAT / IPv6 | 中 | 平台覆盖不足 | L | 数据面 | 后期 |
 | **P3** | UI 扩展 | 中 | 当前 UI 只覆盖基础查询 | S/M | API | 随时 |

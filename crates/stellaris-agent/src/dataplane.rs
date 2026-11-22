@@ -382,6 +382,7 @@ fn route_outbound_priority(
         AclVerdict::Deny(_)
     ) {
         crate::stats::Stats::inc(&state.stats.acl_denied);
+        tracing::info!(target: "stellaris_audit", direction = "outbound", "acl denied");
         return None;
     }
     let priority = policy.qos_priority(&info);
@@ -475,6 +476,7 @@ pub fn decide_inbound(
         AclVerdict::Deny(_)
     ) {
         crate::stats::Stats::inc(&state.stats.acl_denied);
+        tracing::info!(target: "stellaris_audit", direction = "inbound", "acl denied");
         return InboundAction::Drop("acl denied");
     }
 

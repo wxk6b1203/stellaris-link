@@ -84,6 +84,7 @@ pub fn router(state: AgentState) -> Router {
         .route("/ui", get(ui))
         .route("/healthz", get(healthz))
         .route("/v1/status", get(status))
+        .route("/metrics", get(metrics))
         .route("/v1/peers", get(peers))
         .route("/v1/routes", get(routes).post(apply))
         .route("/v1/routes/lookup", get(lookup))
@@ -187,6 +188,48 @@ async fn status(
             "mtu": state.config.dataplane.mtu,
         }
     })))
+}
+
+async fn metrics(
+    State(state): State<AgentState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&state, &headers)?;
+    let stats = &state.stats;
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+    let body = format!(
+        "# HELP stellaris_acl_denied_total ACL denied packets\n\
+# TYPE stellaris_acl_denied_total counter\n\
+stellaris_acl_denied_total {}\n\
+# TYPE stellaris_qos_rate_limited_total counter\n\
+stellaris_qos_rate_limited_total {}\n\
+# TYPE stellaris_queue_dropped_total counter\n\
+stellaris_queue_dropped_total {}\n\
+# TYPE stellaris_delivered_total counter\n\
+stellaris_delivered_total {}\n\
+# TYPE stellaris_forwarded_total counter\n\
+stellaris_forwarded_total {}\n\
+# TYPE stellaris_fib_routes gauge\n\
+stellaris_fib_routes {}\n\
+# TYPE stellaris_peers gauge\n\
+stellaris_peers_total {}\n\
+stellaris_peers_connected {}\n",
+        load(&stats.acl_denied),
+        load(&stats.qos_rate_limited),
+        load(&stats.queue_dropped),
+        load(&stats.delivered),
+        load(&stats.forwarded),
+        state.routes.fib_view().len(),
+        state.peers.total(),
+        state.peers.connected_count(),
+    );
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    ))
 }
 
 async fn peers(
@@ -504,6 +547,27 @@ bind = "127.0.0.1:0"
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["network_name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_counters() {
+        let app = router(state(None));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("stellaris_acl_denied_total"));
+        assert!(text.contains("stellaris_fib_routes"));
     }
 
     #[tokio::test]
