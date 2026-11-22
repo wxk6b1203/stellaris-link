@@ -1,6 +1,6 @@
 # Openraft Controller HA — 详细设计（未实现）
 
-> 状态：H0 确定性模型 + H1 单节点持久化 + H2 3 节点 Raft（进程内 + HTTP RPC）已实现；controller API 接入、HTTPS/mTLS、集群持久化与 snapshot 传输尚未完成。
+> 状态：H0 确定性模型 + H1 单节点持久化 + H2 3 节点 Raft/HTTP RPC/落盘 + controller API 写路径 + 3 controller 进程失败切换已实现；HTTPS/mTLS、snapshot 追平、真实多主机尚未完成。
 > 当前实现：单 controller + 多 controller active-active fanout（pre-Raft）+ signed snapshot + epoch/manifest + 持久化 ACK。
 > 目标：把 controller 从“内存状态 + fanout”升级为 **openraft 复制的确定性状态机**，提供 quorum、leader election、快照、成员变更和故障恢复。
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)。
@@ -473,6 +473,36 @@ single_node_raft_recovers_from_disk
 - shutdown
 - 同目录重启
 - state machine 从磁盘恢复 LSA
+
+## 8.4 3 controller 进程 E2E
+
+脚本：
+
+```bash
+./scripts/test-controller-raft-3node.sh
+```
+
+验证：
+
+- 3 个真实 `stellaris-controller` 进程
+- Raft bootstrap
+- leader election
+- `/v1/join`
+- `/v1/lsa`
+- `/v1/snapshot`
+- kill leader
+- 新 leader 继续 LSA
+- 新 leader snapshot 可见
+
+结果：
+
+```text
+leader=1
+snapshot ok
+new leader=3
+failover snapshot ok
+OK: 3-controller raft join/LSA/snapshot/failover works.
+```
 
 ## 9. 迁移步骤
 

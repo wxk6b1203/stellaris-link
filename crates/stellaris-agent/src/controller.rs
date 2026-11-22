@@ -1160,6 +1160,7 @@ async fn status(State(state): State<ControllerState>, headers: HeaderMap) -> Res
         "generation": state.generation.load(Ordering::Relaxed),
         "routes": state.routes.read().unwrap_or_else(|e| e.into_inner()).len(),
         "acks": state.acks.read().unwrap_or_else(|e| e.into_inner()).len(),
+        "leader": state.leader_hint().await,
     }))
     .into_response()
 }

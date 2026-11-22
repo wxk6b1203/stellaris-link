@@ -324,6 +324,14 @@ stellaris-agent --config net-a.toml --config net-b.toml
 # OK: different network IDs reject the same PSK.
 ```
 
+### 21.5 3 controller Raft E2E
+
+```bash
+cargo build -p stellaris-agent --bin stellaris-controller
+./scripts/test-controller-raft-3node.sh
+# OK: 3-controller raft join/LSA/snapshot/failover works.
+```
+
 ### 22. API / controller TLS
 
 ```bash
