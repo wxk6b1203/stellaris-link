@@ -1043,22 +1043,52 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
                 let begin = begin.send().await.map_err(|e| {
                     openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
                 })?;
+                if !begin.status().is_success() {
+                    return Err(openraft::error::StreamingError::Unreachable(
+                        Unreachable::new(&io::Error::other(format!(
+                            "raft snapshot begin status {}",
+                            begin.status()
+                        ))),
+                    ));
+                }
                 let body: serde_json::Value = begin.json().await.map_err(|e| {
                     openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
                 })?;
                 let id = body["id"].as_str().unwrap_or_default().to_string();
-                for chunk in data.chunks(2 * 1024 * 1024) {
-                    let mut request = self
-                        .client
-                        .post(format!("{}/raft/snapshot/chunk", self.base))
-                        .header("x-raft-transfer", &id)
-                        .body(chunk.to_vec());
-                    if let Some(secret) = &self.secret {
-                        request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+                for (offset, chunk) in data.chunks(2 * 1024 * 1024).enumerate() {
+                    let mut last_error = None;
+                    let mut accepted = false;
+                    for attempt in 0..3 {
+                        let mut request = self
+                            .client
+                            .post(format!("{}/raft/snapshot/chunk", self.base))
+                            .header("x-raft-transfer", &id)
+                            .header("x-raft-offset", (offset * 2 * 1024 * 1024).to_string())
+                            .body(chunk.to_vec());
+                        if let Some(secret) = &self.secret {
+                            request = request.header(RAFT_SECRET_HEADER, secret.as_str());
+                        }
+                        match request.send().await {
+                            Ok(response) if response.status().is_success() => {
+                                accepted = true;
+                                break;
+                            }
+                            Ok(response) => {
+                                last_error = Some(format!("chunk status {}", response.status()));
+                            }
+                            Err(e) => last_error = Some(e.to_string()),
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1)))
+                            .await;
                     }
-                    request.send().await.map_err(|e| {
-                        openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
-                    })?;
+                    if !accepted {
+                        return Err(openraft::error::StreamingError::Unreachable(
+                            Unreachable::new(&io::Error::other(format!(
+                                "raft snapshot chunk failed: {}",
+                                last_error.unwrap_or_default()
+                            ))),
+                        ));
+                    }
                 }
                 let mut finish = self
                     .client
