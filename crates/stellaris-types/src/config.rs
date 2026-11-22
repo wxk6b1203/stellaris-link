@@ -88,6 +88,9 @@ pub struct ControlConfig {
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
+    /// Membership manifest lifetime in seconds.
+    #[serde(default = "default_manifest_ttl")]
+    pub manifest_ttl_secs: u64,
     /// Trusted controller NodeIds for verifying Ed25519 snapshots.
     #[serde(default)]
     pub controller_keys: Vec<String>,
@@ -122,6 +125,7 @@ impl Default for ControlConfig {
             bind: None,
             secret: None,
             epoch: None,
+            manifest_ttl_secs: default_manifest_ttl(),
             controller_keys: Vec::new(),
             controller_threshold: 1,
             members: Vec::new(),
@@ -269,6 +273,10 @@ fn default_controller_threshold() -> usize {
     1
 }
 
+fn default_manifest_ttl() -> u64 {
+    3600
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataplaneConfig {
     #[serde(default)]
@@ -399,6 +407,11 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "network.auth.secret is required when auth.mode = psk".into(),
+            ));
+        }
+        if self.control.manifest_ttl_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "control.manifest_ttl_secs must be > 0".into(),
             ));
         }
         if self.control.controller_threshold == 0 {

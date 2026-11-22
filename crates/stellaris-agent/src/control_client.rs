@@ -48,12 +48,19 @@ async fn run_http(
     }
     let client = reqwest::Client::new();
     let mut joined = state.config.control.join_token.is_none();
+    let mut last_manifest = Instant::now() - Duration::from_secs(60);
     let mut last_generation = 0u64;
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
         if !joined && state.config.control.join_token.is_some() {
             joined = try_join(&client, &bases, &state, secret.as_deref()).await;
+        }
+        if !state.config.control.controller_keys.is_empty()
+            && last_manifest.elapsed() >= Duration::from_secs(10)
+            && try_manifest(&client, &bases, &state, secret.as_deref()).await
+        {
+            last_manifest = Instant::now();
         }
         if last_lsa.elapsed() >= Duration::from_secs(10) {
             seq = seq.max(now_seq());
@@ -262,6 +269,89 @@ async fn request(conn: &iroh::endpoint::Connection, request: &Request) -> anyhow
     crate::control_wire::read_frame(&mut recv)
         .await?
         .context("empty controller response")
+}
+
+async fn try_manifest(
+    client: &reqwest::Client,
+    bases: &[String],
+    state: &AgentState,
+    secret: Option<&str>,
+) -> bool {
+    let mut best: Option<crate::controller::MembershipManifest> = None;
+    for base in bases {
+        let mut request = client.get(format!("{base}/v1/manifest"));
+        if let Some(secret) = secret {
+            request = request.header("x-stellaris-secret", secret);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response
+                    .json::<crate::controller::MembershipManifest>()
+                    .await
+                {
+                    Ok(manifest) => {
+                        if best
+                            .as_ref()
+                            .map(|b| {
+                                (manifest.epoch, manifest.generation) > (b.epoch, b.generation)
+                            })
+                            .unwrap_or(true)
+                        {
+                            best = Some(manifest);
+                        }
+                    }
+                    Err(e) => tracing::warn!(base, error = %e, "invalid manifest"),
+                }
+            }
+            Ok(response) => tracing::debug!(base, status = %response.status(), "manifest rejected"),
+            Err(e) => tracing::debug!(base, error = %e, "manifest unreachable"),
+        }
+    }
+    let Some(manifest) = best else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if manifest.expires_at <= now {
+        tracing::warn!("controller manifest expired");
+        return false;
+    }
+    let Some(controller) = manifest
+        .controller
+        .as_deref()
+        .and_then(|s| s.parse::<NodeId>().ok())
+    else {
+        tracing::warn!("manifest has no controller id");
+        return false;
+    };
+    if !state
+        .config
+        .control
+        .controller_keys
+        .iter()
+        .any(|key| key == &controller.to_string())
+    {
+        tracing::warn!(%controller, "untrusted manifest controller");
+        return false;
+    }
+    let Some(signature) = manifest.signature.as_deref() else {
+        tracing::warn!("manifest is unsigned");
+        return false;
+    };
+    let payload = crate::controller::manifest_payload_bytes(&manifest);
+    if let Err(e) = crate::controller::verify_ed25519(controller, &payload, signature) {
+        tracing::warn!(error = %e, "manifest signature invalid");
+        return false;
+    }
+    state.set_grants(&manifest.members);
+    tracing::debug!(
+        generation = manifest.generation,
+        members = manifest.members.len(),
+        "applied signed membership manifest"
+    );
+    true
 }
 
 async fn try_join(

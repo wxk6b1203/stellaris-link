@@ -41,6 +41,7 @@ pub struct ControllerState {
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenConfig>>>,
     signing_key: Option<Arc<SigningKey>>,
     signer: Option<NodeId>,
+    manifest_ttl: u64,
     pub epoch: u64,
     generation: Arc<AtomicU64>,
 }
@@ -74,6 +75,43 @@ pub struct MemberView {
     pub capabilities: Vec<String>,
     pub links: Vec<String>,
     pub last_seq: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MembershipManifest {
+    pub network_id: String,
+    pub epoch: u64,
+    pub generation: u64,
+    pub controller: Option<String>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub members: Vec<MemberView>,
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ManifestPayload<'a> {
+    network_id: &'a str,
+    epoch: u64,
+    generation: u64,
+    controller: &'a Option<String>,
+    issued_at: u64,
+    expires_at: u64,
+    members: &'a [MemberView],
+}
+
+pub fn manifest_payload_bytes(manifest: &MembershipManifest) -> Vec<u8> {
+    let payload = ManifestPayload {
+        network_id: &manifest.network_id,
+        epoch: manifest.epoch,
+        generation: manifest.generation,
+        controller: &manifest.controller,
+        issued_at: manifest.issued_at,
+        expires_at: manifest.expires_at,
+        members: &manifest.members,
+    };
+    serde_json::to_vec(&payload).unwrap_or_default()
 }
 
 #[derive(Serialize)]
@@ -178,6 +216,7 @@ impl ControllerState {
             join_tokens: Arc::new(RwLock::new(join_tokens)),
             signing_key: None,
             signer: None,
+            manifest_ttl: config.control.manifest_ttl_secs,
             epoch,
             generation: Arc::new(AtomicU64::new(1)),
         })
@@ -187,6 +226,27 @@ impl ControllerState {
         let key = SigningKey::from_bytes(&secret);
         self.signer = Some(NodeId::new(key.verifying_key().to_bytes()));
         self.signing_key = Some(Arc::new(key));
+    }
+
+    pub fn manifest(&self) -> MembershipManifest {
+        self.expire_lsas();
+        let generation = self.generation.load(Ordering::Relaxed);
+        let issued_at = now_epoch();
+        let mut manifest = MembershipManifest {
+            network_id: self.network.to_string(),
+            epoch: self.epoch,
+            generation,
+            controller: self.signer.map(|n| n.to_string()),
+            issued_at,
+            expires_at: issued_at.saturating_add(self.manifest_ttl),
+            members: self.members(),
+            signature: None,
+        };
+        if let Some(key) = &self.signing_key {
+            let bytes = manifest_payload_bytes(&manifest);
+            manifest.signature = Some(hex::encode(key.sign(&bytes).to_bytes()));
+        }
+        manifest
     }
 
     pub fn snapshot(&self, local: Option<NodeId>) -> Snapshot {
@@ -467,6 +527,7 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/routes", post(add_route))
         .route("/v1/lsa", post(apply_lsa))
         .route("/v1/join", post(join))
+        .route("/v1/manifest", get(manifest))
         .route("/v1/ack", post(ack))
         .with_state(state)
 }
@@ -506,6 +567,13 @@ async fn snapshot(
         None => None,
     };
     Json(state.snapshot(local)).into_response()
+}
+
+async fn manifest(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
+    if !state.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(state.manifest()).into_response()
 }
 
 async fn apply_lsa(
@@ -1155,6 +1223,17 @@ prefixes = ["192.168.50.0/24"]
             addrs: vec![],
         };
         assert!(state.apply_lsa(bad_prefix).is_err());
+    }
+
+    #[test]
+    fn signed_membership_manifest_is_verifiable() {
+        let mut state = state();
+        state.set_signing_key([9u8; 32]);
+        let manifest = state.manifest();
+        let signer: NodeId = manifest.controller.as_deref().unwrap().parse().unwrap();
+        let payload = manifest_payload_bytes(&manifest);
+        verify_ed25519(signer, &payload, manifest.signature.as_deref().unwrap()).unwrap();
+        assert!(manifest.expires_at > manifest.issued_at);
     }
 
     #[test]

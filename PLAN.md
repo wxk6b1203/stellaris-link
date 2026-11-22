@@ -28,8 +28,8 @@
 - [x] ACL（方向/五元组/peer/zone/优先级）与 QoS DSCP + token-bucket + egress 优先级队列/queue_depth；`GET/PUT /v1/policy`；`/v1/status` counters。
 - [x] RoutePolicy engine（Accept/Deny/SetLocalPref/SetMetric/SetWeight），AZ region/zone 匹配。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
-- [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；真实 3 节点 TUN/LSA transit 通过。
-- [ ] 完整 signed membership manifest；controller key set threshold 选择已实现。
+- [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。
+- [ ] manifest threshold/多 controller 聚合；controller key set threshold 选择已实现。
 - [ ] ACL/QoS 审计日志、复杂整形。
 - [ ] 完整 controller（openraft quorum/leader election）、mDNS/广播发现、ACL/QoS 复杂整形/队列配置、多网络、Windows、macOS NAT。
 

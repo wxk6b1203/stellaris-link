@@ -1,6 +1,6 @@
 # 入网与成员授权 — 设计
 
-> 状态：设计稿；已实现 **PSK 双向 HMAC 入网认证 + allowlist**、controller Ed25519 snapshot 签名、controller 侧 member/prefix grant 校验、**一次性 join token（HTTP `/v1/join`）**。完整 signed membership manifest、member 侧前缀强制仍在实现中。
+> 状态：设计稿；已实现 **PSK 双向 HMAC 入网认证 + allowlist**、controller Ed25519 snapshot 签名、controller 侧 member/prefix grant 校验、一次性 join token（HTTP `/v1/join`）、**独立 Ed25519 signed membership manifest（`GET /v1/manifest`）**、member 侧 LSA prefix 强制。
 > 关联：[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、[PROTOCOL.md](PROTOCOL.md)
 > 目标：把“谁能加入网络、谁能让别人加入、谁能广告哪些前缀”设计清楚，再实现。
 
@@ -358,13 +358,15 @@ gateway/exit 才能广告其他前缀
 - member 侧 controller threshold（同一 payload 至少 N 个不同 controller 签名）；
 - member 侧对 LSA prefix 的 grant 强制（`lsa_authorized`）；
 - 一次性 join token：`POST /v1/join`，member `control.join_token` 自动申请；
+- 独立 signed membership manifest：`GET /v1/manifest`，member 校验 Ed25519/expiry 后更新 grants；
 - 未授权 LSA origin、overlay_ip、prefix、link target 被拒绝；
 - 测试：`demo-psk-join.sh`、`demo-iroh-controller.sh`、`join_token_admits_once_and_grants_prefix`。
 
 ### 9.2 待实现
 
-- 完整 signed membership manifest（当前是 controller 内存 grants + snapshot 签名 + join token）；
-- member 侧对 LSA 前缀的 grant 强制已实现；数据面前缀仍由 anti-spoof + peer advertised 约束。
+- manifest threshold/多 controller 聚合；
+- token 撤销/过期传播；
+- 数据面前缀仍由 anti-spoof + peer advertised 约束。
 - controller key set/threshold（已实现 member 侧 threshold snapshot 选择）；
 - multi-network runtime；
 - revocation/epoch propagation；
