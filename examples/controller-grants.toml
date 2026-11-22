@@ -35,3 +35,9 @@ node_id = "0202020202020202020202020202020202020202020202020202020202020202"
 overlay_ip = "10.7.0.2"
 prefixes = []
 capabilities = ["member"]
+
+# One-time join token (HTTP /v1/join). Consumed on first successful join.
+[[control.join_tokens]]
+token = "change-me-one-time"
+prefixes = ["192.168.60.0/24"]
+capabilities = ["member", "gateway"]

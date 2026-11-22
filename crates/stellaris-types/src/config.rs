@@ -94,6 +94,12 @@ pub struct ControlConfig {
     /// Optional controller-side member allowlist / prefix grants.
     #[serde(default)]
     pub members: Vec<ControllerMemberConfig>,
+    /// One-time join tokens accepted by a controller.
+    #[serde(default)]
+    pub join_tokens: Vec<JoinTokenConfig>,
+    /// Member: one-time token used to request admission.
+    #[serde(default)]
+    pub join_token: Option<String>,
     /// Controller iroh control UDP port (None = HTTP-only).
     #[serde(default)]
     pub iroh_port: Option<u16>,
@@ -103,6 +109,15 @@ pub struct ControlConfig {
     /// Member: controller iroh direct addresses.
     #[serde(default)]
     pub addrs: Vec<SocketAddr>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinTokenConfig {
+    pub token: String,
+    #[serde(default)]
+    pub prefixes: Vec<IpNet>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -358,6 +373,19 @@ impl Config {
         for key in &self.control.controller_keys {
             key.parse::<NodeId>()
                 .map_err(|e| ConfigError::Invalid(format!("control.controller_keys: {e}")))?;
+        }
+        let mut join_tokens = HashSet::new();
+        for join in &self.control.join_tokens {
+            if join.token.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "control.join_tokens token must not be empty".into(),
+                ));
+            }
+            if !join_tokens.insert(join.token.clone()) {
+                return Err(ConfigError::Invalid(
+                    "duplicate control.join_tokens token".into(),
+                ));
+            }
         }
         let mut member_ids = HashSet::new();
         for member in &self.control.members {

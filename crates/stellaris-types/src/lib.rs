@@ -8,8 +8,8 @@ pub mod route;
 
 pub use config::{
     ApiConfig, AuthMode, Config, ControlConfig, ControllerMemberConfig, DataplaneConfig,
-    NetworkAuthConfig, NetworkConfig, NodeConfig, PeerConfig, RoutingConfig, StaticRouteConfig,
-    TransportConfig,
+    JoinTokenConfig, NetworkAuthConfig, NetworkConfig, NodeConfig, PeerConfig, RoutingConfig,
+    StaticRouteConfig, TransportConfig,
 };
 pub use error::{ConfigError, NodeIdParseError};
 pub use id::{NetworkId, NodeId, RouteId};

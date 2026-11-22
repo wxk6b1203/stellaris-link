@@ -45,10 +45,14 @@ async fn run_http(
         return;
     }
     let client = reqwest::Client::new();
+    let mut joined = state.config.control.join_token.is_none();
     let mut last_generation = 0u64;
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
+        if !joined && state.config.control.join_token.is_some() {
+            joined = try_join(&client, &bases, &state, secret.as_deref()).await;
+        }
         if last_lsa.elapsed() >= Duration::from_secs(10) {
             seq = seq.max(now_seq());
             let lsa = local_lsa(&state, seq);
@@ -263,6 +267,43 @@ async fn request(conn: &iroh::endpoint::Connection, request: &Request) -> anyhow
     crate::control_wire::read_frame(&mut recv)
         .await?
         .context("empty controller response")
+}
+
+async fn try_join(
+    client: &reqwest::Client,
+    bases: &[String],
+    state: &AgentState,
+    secret: Option<&str>,
+) -> bool {
+    let Some(token) = state.config.control.join_token.as_deref() else {
+        return true;
+    };
+    let Some(overlay) = state.config.node.overlay_ip else {
+        tracing::warn!("join_token requires node.overlay_ip");
+        return true;
+    };
+    let mut accepted = false;
+    for base in bases {
+        let mut request = client
+            .post(format!("{base}/v1/join"))
+            .json(&serde_json::json!({
+                "node_id": state.node_id.to_string(),
+                "overlay_ip": overlay.to_string(),
+                "token": token,
+            }));
+        if let Some(secret) = secret {
+            request = request.header("x-stellaris-secret", secret);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                accepted = true;
+                tracing::info!(base, "controller admitted member");
+            }
+            Ok(response) => tracing::warn!(base, status = %response.status(), "join rejected"),
+            Err(e) => tracing::debug!(base, error = %e, "join request failed"),
+        }
+    }
+    accepted
 }
 
 fn apply_snapshot(

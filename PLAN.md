@@ -27,8 +27,8 @@
 - [x] 跨 AZ link penalty + 同 AZ local_pref + RTT 驱动的 LSA link metric（5s 刷新）+ LSA 30s TTL + 等代价 ECMP。
 - [x] ACL（方向/五元组/peer/zone/优先级）与 QoS DSCP + token-bucket rate limit + egress 优先级队列；`GET/PUT /v1/policy` 动态更新/持久化。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
-- [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant 校验。
-- [ ] Join token、完整 signed membership manifest、member 侧前缀强制。
+- [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token。
+- [ ] 完整 signed membership manifest、member 侧前缀强制、controller key threshold。
 - [ ] 完整 controller（openraft quorum/leader election）、mDNS/广播发现、ACL/QoS 复杂整形/队列配置、多网络、Windows、macOS NAT。
 
 下一阶段：安全/成员认证 → 真实 3 节点验证 → bootstrap/discovery → 多网络 → openraft HA（见 PRIORITIES.md / OPENRAFT-HA.md）。

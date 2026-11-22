@@ -24,7 +24,8 @@ use serde_json::json;
 use sha2::Sha256;
 use stellaris_linkstate::{LinkStateDb, Lsa};
 use stellaris_types::{
-    Config, ControllerMemberConfig, NetworkId, NodeId, RouteEntry, RouteId, RouteSource, RouteState,
+    Config, ControllerMemberConfig, JoinTokenConfig, NetworkId, NodeId, RouteEntry, RouteId,
+    RouteSource, RouteState,
 };
 use uuid::Uuid;
 
@@ -36,7 +37,8 @@ pub struct ControllerState {
     link_state: Arc<RwLock<LinkStateDb>>,
     acks: Arc<RwLock<HashMap<NodeId, u64>>>,
     acks_path: PathBuf,
-    grants: Arc<HashMap<NodeId, ControllerMemberConfig>>,
+    grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
+    join_tokens: Arc<RwLock<HashMap<String, JoinTokenConfig>>>,
     signing_key: Option<Arc<SigningKey>>,
     signer: Option<NodeId>,
     pub epoch: u64,
@@ -156,6 +158,12 @@ impl ControllerState {
                 .context("controller member node_id")?;
             grants.insert(node, member.clone());
         }
+        let join_tokens = config
+            .control
+            .join_tokens
+            .iter()
+            .map(|token| (token.token.clone(), token.clone()))
+            .collect();
         Ok(Self {
             network,
             secret: config.control.secret.clone(),
@@ -163,7 +171,8 @@ impl ControllerState {
             link_state: Arc::new(RwLock::new(LinkStateDb::new())),
             acks: Arc::new(RwLock::new(acks)),
             acks_path,
-            grants: Arc::new(grants),
+            grants: Arc::new(RwLock::new(grants)),
+            join_tokens: Arc::new(RwLock::new(join_tokens)),
             signing_key: None,
             signer: None,
             epoch,
@@ -276,10 +285,11 @@ impl ControllerState {
     }
 
     fn authorize_lsa(&self, lsa: &Lsa) -> Result<(), (u16, String)> {
-        if self.grants.is_empty() {
+        let grants = self.grants.read().unwrap_or_else(|e| e.into_inner());
+        if grants.is_empty() {
             return Ok(());
         }
-        let Some(grant) = self.grants.get(&lsa.origin) else {
+        let Some(grant) = grants.get(&lsa.origin) else {
             return Err((403, format!("member {} is not authorized", lsa.origin)));
         };
         if let Some(expected) = grant.overlay_ip
@@ -302,10 +312,36 @@ impl ControllerState {
             }
         }
         for link in &lsa.links {
-            if !self.grants.contains_key(&link.to) {
+            if !grants.contains_key(&link.to) {
                 return Err((403, format!("link target {} is not authorized", link.to)));
             }
         }
+        Ok(())
+    }
+
+    fn join(
+        &self,
+        node: NodeId,
+        overlay: std::net::IpAddr,
+        token: &str,
+    ) -> Result<(), (u16, String)> {
+        let join = self
+            .join_tokens
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(token)
+            .ok_or((403, "invalid or already used join token".to_string()))?;
+        let grant = ControllerMemberConfig {
+            node_id: node.to_string(),
+            overlay_ip: Some(overlay),
+            prefixes: join.prefixes,
+            capabilities: join.capabilities,
+        };
+        self.grants
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(node, grant);
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -400,6 +436,7 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/routes", post(add_route))
         .route("/v1/lsa", post(apply_lsa))
+        .route("/v1/join", post(join))
         .route("/v1/ack", post(ack))
         .with_state(state)
 }
@@ -454,6 +491,47 @@ async fn apply_lsa(
             "changed": changed,
             "generation": state.generation.load(Ordering::Relaxed),
             "lsas": state.link_state.read().unwrap_or_else(|e| e.into_inner()).len(),
+        }))
+        .into_response(),
+        Err((code, message)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+            message,
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinRequest {
+    node_id: String,
+    overlay_ip: String,
+    token: String,
+}
+
+async fn join(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Json(req): Json<JoinRequest>,
+) -> Response {
+    if !state.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match req.node_id.parse() {
+        Ok(node) => node,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")).into_response();
+        }
+    };
+    let overlay = match req.overlay_ip.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid overlay_ip: {e}")).into_response();
+        }
+    };
+    match state.join(node, overlay, &req.token) {
+        Ok(()) => Json(json!({
+            "joined": node.to_string(),
+            "generation": state.generation.load(Ordering::Relaxed),
         }))
         .into_response(),
         Err((code, message)) => (
@@ -906,6 +984,86 @@ bind = "127.0.0.1:0"
             snapshot.ed25519_signature.as_deref().unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_token_admits_once_and_grants_prefix() {
+        let toml = r#"
+[node]
+name = "ctrl"
+role = "controller"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+epoch = 1
+
+[[control.join_tokens]]
+token = "join-once"
+prefixes = ["192.168.70.0/24"]
+"#;
+        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+        let app = router(state);
+        let body = serde_json::json!({
+            "node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+            "overlay_ip": "10.7.0.1",
+            "token": "join-once"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let lsa = serde_json::json!({
+            "origin": "0101010101010101010101010101010101010101010101010101010101010101",
+            "seq": 1,
+            "zone": null,
+            "links": [],
+            "prefixes": [{"prefix":"192.168.70.0/24","metric":0}],
+            "overlay_ip": "10.7.0.1",
+            "addrs": []
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/lsa")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(lsa.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
