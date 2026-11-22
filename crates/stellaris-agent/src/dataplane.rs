@@ -507,6 +507,36 @@ async fn handle_inbound(
     }
 }
 
+fn mtu_for_packet(state: &AgentState, packet: &[u8]) -> u16 {
+    if packet.first().is_some_and(|b| b >> 4 == 6) {
+        state.config.dataplane.mtu.max(1280)
+    } else {
+        state.config.dataplane.mtu.min(1100)
+    }
+}
+
+fn too_big_action(state: &AgentState, packet: &[u8]) -> Option<InboundAction> {
+    if packet.len() <= mtu_for_packet(state, packet) as usize {
+        return None;
+    }
+    let local = state.config.node.overlay_ip?;
+    let mut error = wire::icmp_too_big(packet, mtu_for_packet(state, packet), local)?;
+    let error_info = PacketInfo::parse(&error)?;
+    let entry = state.routes.lookup(error_info.dst)?;
+    let next = entry.select(flow_hash(&error_info))?;
+    if next.node == state.node_id {
+        return None;
+    }
+    let header = MeshHeader::new(state.network, 64, flow_hash(&error_info));
+    let mut frame = Vec::with_capacity(HEADER_LEN + error.len());
+    frame.extend_from_slice(&header.encode());
+    frame.append(&mut error);
+    Some(InboundAction::Forward {
+        next: next.node,
+        frame: Bytes::from(frame),
+    })
+}
+
 /// Pure decision function for inbound packets; unit-testable without TUN.
 pub fn decide_inbound(
     state: &AgentState,
@@ -539,6 +569,9 @@ pub fn decide_inbound(
     };
     if !crate::membership::inbound_source_allowed(state, from, info.src) {
         return InboundAction::Drop("spoofed source");
+    }
+    if let Some(action) = too_big_action(state, payload) {
+        return action;
     }
 
     let Some(local) = state.config.node.overlay_ip else {
@@ -959,5 +992,29 @@ overlay_ip = "10.7.0.2"
             decide_inbound(&state, node(2), &frame),
             InboundAction::Deliver(p)
         );
+    }
+    #[test]
+    fn oversized_inbound_generates_packet_too_big() {
+        let state = state();
+        let mut p = vec![0u8; 1400];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&1400u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&[10, 7, 0, 2]);
+        p[16..20].copy_from_slice(&[10, 7, 0, 1]);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MeshHeader::new(state.network, 64, 0).encode());
+        frame.extend_from_slice(&p);
+        match decide_inbound(&state, node(2), &frame) {
+            InboundAction::Forward { frame, .. } => {
+                let payload = &frame[HEADER_LEN..];
+                assert_eq!(payload[0] >> 4, 4);
+                assert_eq!(payload[9], 1);
+                assert_eq!(payload[20], 3);
+                assert_eq!(payload[21], 4);
+            }
+            other => panic!("expected ICMP forward, got {other:?}"),
+        }
     }
 }

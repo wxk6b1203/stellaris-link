@@ -355,6 +355,94 @@ fn clamp_tcp(packet: &mut [u8], offset: usize, max_mss: u16, v4: bool) -> bool {
     true
 }
 
+/// Build an ICMP/ICMPv6 "packet too big" error addressed to the original source.
+pub fn icmp_too_big(original: &[u8], mtu: u16, local: IpAddr) -> Option<Vec<u8>> {
+    let info = PacketInfo::parse(original)?;
+    if matches!(info.protocol, 1 | 58) {
+        return None; // never generate errors for errors
+    }
+    match (local, info.src) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let quote = original.len().min(28);
+            let total = 20 + 8 + quote;
+            let mut out = vec![0u8; total];
+            out[0] = 0x45;
+            out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            out[8] = 64;
+            out[9] = 1;
+            out[12..16].copy_from_slice(&src.octets());
+            out[16..20].copy_from_slice(&dst.octets());
+            recompute_ipv4_checksum(&mut out);
+            out[20] = 3; // destination unreachable
+            out[21] = 4; // fragmentation needed
+            out[26..28].copy_from_slice(&mtu.to_be_bytes());
+            out[28..28 + quote].copy_from_slice(&original[..quote]);
+            let sum = checksum(&out[20..]);
+            out[22..24].copy_from_slice(&sum.to_be_bytes());
+            Some(out)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let quote = original.len().min(1232);
+            let total = 40 + 8 + quote;
+            let mut out = vec![0u8; total];
+            out[0] = 0x60;
+            out[4..6].copy_from_slice(&((8 + quote) as u16).to_be_bytes());
+            out[6] = 58;
+            out[7] = 64;
+            out[8..24].copy_from_slice(&src.octets());
+            out[24..40].copy_from_slice(&dst.octets());
+            out[40] = 2; // packet too big
+            out[44..48].copy_from_slice(&(mtu as u32).to_be_bytes());
+            out[48..48 + quote].copy_from_slice(&original[..quote]);
+            let sum = checksum_v6(&src.octets(), &dst.octets(), 58, &out[40..]);
+            out[42..44].copy_from_slice(&sum.to_be_bytes());
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(rest) = chunks.remainder().first() {
+        sum += u16::from_be_bytes([*rest, 0]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn checksum_v6(src: &[u8; 16], dst: &[u8; 16], next: u8, payload: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in src.chunks_exact(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    for chunk in dst.chunks_exact(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    sum += (payload.len() as u32) >> 16;
+    sum += (payload.len() as u32) & 0xffff;
+    sum += next as u32;
+    let mut chunks = payload.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(rest) = chunks.remainder().first() {
+        sum += u16::from_be_bytes([*rest, 0]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// Decrement IPv4 TTL / IPv6 hop limit in place. Returns false if it would reach 0.
 pub fn decrement_ttl(packet: &mut [u8]) -> bool {
     match packet.first().map(|b| b >> 4) {
@@ -553,5 +641,35 @@ mod tests {
         let a = PacketInfo::parse(&first).unwrap();
         let b = PacketInfo::parse(&rest).unwrap();
         assert_eq!(flow_hash(&a), flow_hash(&b));
+    }
+    #[test]
+    fn builds_ipv4_packet_too_big() {
+        let mut orig = vec![0u8; 30];
+        orig[0] = 0x45;
+        orig[9] = 17;
+        orig[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        orig[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let err = icmp_too_big(&orig, 1200, "10.0.0.99".parse().unwrap()).unwrap();
+        assert_eq!(err[9], 1);
+        assert_eq!(err[20], 3);
+        assert_eq!(err[21], 4);
+        assert_eq!(u16::from_be_bytes([err[26], err[27]]), 1200);
+        assert_eq!(&err[16..20], &[10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn builds_ipv6_packet_too_big() {
+        let mut orig = vec![0u8; 60];
+        orig[0] = 0x60;
+        orig[6] = 17;
+        orig[8..24].copy_from_slice(&"fd00::1".parse::<Ipv6Addr>().unwrap().octets());
+        orig[24..40].copy_from_slice(&"fd00::2".parse::<Ipv6Addr>().unwrap().octets());
+        let err = icmp_too_big(&orig, 1280, "fd00::99".parse().unwrap()).unwrap();
+        assert_eq!(err[6], 58);
+        assert_eq!(err[40], 2);
+        assert_eq!(
+            u32::from_be_bytes([err[44], err[45], err[46], err[47]]),
+            1280
+        );
     }
 }
