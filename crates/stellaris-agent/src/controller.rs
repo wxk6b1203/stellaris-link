@@ -1397,16 +1397,41 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .iter()
             .map(|peer| (peer.id, peer.addr.clone()))
             .collect();
-        let node = crate::controller_raft::start_http_node(
-            model,
-            id,
-            bind,
-            peers,
-            Some(dir.clone()),
-            config.control.raft_secret.clone(),
-            config.control.raft_bootstrap,
-        )
-        .await?;
+        let tls = config
+            .control
+            .raft_tls_cert
+            .clone()
+            .zip(config.control.raft_tls_key.clone())
+            .map(|(cert, key)| crate::controller_raft::RaftTlsConfig {
+                cert: PathBuf::from(cert),
+                key: PathBuf::from(key),
+                ca: config.control.raft_tls_ca.clone().map(PathBuf::from),
+                insecure: config.control.raft_tls_insecure,
+            });
+        let node = if let Some(tls) = tls {
+            crate::controller_raft::start_http_node_tls(
+                model,
+                id,
+                bind,
+                peers,
+                Some(dir.clone()),
+                config.control.raft_secret.clone(),
+                config.control.raft_bootstrap,
+                tls,
+            )
+            .await?
+        } else {
+            crate::controller_raft::start_http_node(
+                model,
+                id,
+                bind,
+                peers,
+                Some(dir.clone()),
+                config.control.raft_secret.clone(),
+                config.control.raft_bootstrap,
+            )
+            .await?
+        };
         tracing::info!(dir = %dir.display(), id, addr = %node.address, "controller raft enabled");
         state.set_raft(Arc::new(node.raft), node.store);
         tokio::spawn(async move {

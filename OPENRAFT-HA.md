@@ -1,6 +1,6 @@
 # Openraft Controller HA — 详细设计（未实现）
 
-> 状态：H0 确定性模型 + H1 单节点持久化 + H2 3 节点 Raft/HTTP RPC/落盘 + controller API 写路径 + 3 controller 进程失败切换已实现；HTTPS/mTLS、snapshot 追平、真实多主机尚未完成。
+> 状态：H0 确定性模型 + H1 单节点持久化 + H2 3 节点 Raft/HTTP RPC/落盘 + controller API 写路径 + 3 controller 进程失败切换 + Raft TLS 已实现；mTLS、大 snapshot、真实多物理主机尚未完成。
 > 当前实现：单 controller + 多 controller active-active fanout（pre-Raft）+ signed snapshot + epoch/manifest + 持久化 ACK。
 > 目标：把 controller 从“内存状态 + fanout”升级为 **openraft 复制的确定性状态机**，提供 quorum、leader election、快照、成员变更和故障恢复。
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)。
@@ -527,6 +527,24 @@ OK: 3 macvlan controller raft join/LSA/snapshot/failover/partition-recovery work
 3 个 controller 容器各自使用真实 LAN IP，通过 macvlan 运行独立进程，
 并验证了旧 leader 断网后重新加入、降为 follower 并通过 `/v1/model` 追平 seq=2。
 验证了非 loopback 地址上的 Raft、join、LSA、snapshot 和 leader 失败切换。
+
+## 8.6 Raft TLS E2E
+
+脚本：
+
+```bash
+cargo build -p stellaris-agent --bin stellaris-controller
+./scripts/test-controller-raft-tls-3node.sh
+# OK: 3-controller raft TLS join/LSA/snapshot works.
+```
+
+验证：
+
+- 3 controller 进程
+- HTTPS Raft `/raft/append` / `/raft/vote` / `/raft/snapshot`
+- CA 校验
+- shared secret
+- join/LSA/snapshot
 
 ## 9. 迁移步骤
 

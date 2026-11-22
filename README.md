@@ -342,6 +342,14 @@ cargo build -p stellaris-agent --bin stellaris-controller
 # OK: 3-controller raft join/LSA/snapshot/failover works.
 ```
 
+### 21.6 Raft TLS E2E
+
+```bash
+cargo build -p stellaris-agent --bin stellaris-controller
+./scripts/test-controller-raft-tls-3node.sh
+# OK: 3-controller raft TLS join/LSA/snapshot works.
+```
+
 ### 22. API / controller TLS
 
 ```bash

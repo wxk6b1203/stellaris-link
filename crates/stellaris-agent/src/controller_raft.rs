@@ -42,6 +42,27 @@ pub struct CommandResult {
     pub epoch: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct RaftTlsConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub ca: Option<PathBuf>,
+    pub insecure: bool,
+}
+
+fn http_client(tls: Option<&RaftTlsConfig>) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(tls) = tls {
+        if tls.insecure {
+            builder = builder.danger_accept_invalid_certs(true);
+        } else if let Some(ca) = &tls.ca {
+            let pem = std::fs::read(ca)?;
+            builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
+        }
+    }
+    Ok(builder.build()?)
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct PersistedLog {
     log: BTreeMap<u64, String>,
@@ -713,6 +734,7 @@ async fn raft_vote(
 pub struct HttpFactory {
     client: reqwest::Client,
     secret: Option<Arc<String>>,
+    scheme: String,
 }
 
 pub struct HttpNetwork {
@@ -727,7 +749,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpFactory {
     async fn new_client(&mut self, _target: u64, node: &BasicNode) -> Self::Network {
         HttpNetwork {
             client: self.client.clone(),
-            base: format!("http://{}", node.addr),
+            base: format!("{}://{}", self.scheme, node.addr),
             secret: self.secret.clone(),
         }
     }
@@ -859,6 +881,32 @@ pub async fn start_http_node(
         secret,
         bootstrap,
         Arc::new(openraft::Config::default().validate()?),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_http_node_tls(
+    model: ControllerModel,
+    id: u64,
+    bind: std::net::SocketAddr,
+    peers: Vec<(u64, String)>,
+    dir: Option<PathBuf>,
+    secret: Option<String>,
+    bootstrap: bool,
+    tls: RaftTlsConfig,
+) -> anyhow::Result<HttpRaftNode> {
+    start_http_node_at(
+        model,
+        id,
+        bind,
+        peers,
+        dir,
+        secret,
+        bootstrap,
+        Arc::new(openraft::Config::default().validate()?),
+        Some(tls),
     )
     .await
 }
@@ -888,6 +936,7 @@ pub async fn start_http_node_with_snapshot_policy(
         secret,
         bootstrap,
         Arc::new(config.validate()?),
+        None,
     )
     .await
 }
@@ -902,6 +951,7 @@ async fn start_http_node_at(
     secret: Option<String>,
     bootstrap: bool,
     config: Arc<openraft::Config>,
+    tls: Option<RaftTlsConfig>,
 ) -> anyhow::Result<HttpRaftNode> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
@@ -922,15 +972,23 @@ async fn start_http_node_at(
     let log = Arc::new(log);
     let fresh = log.is_empty().await;
     let store = StateMachineStore::new(model, state_path);
-    let factory = HttpFactory {
-        client: reqwest::Client::new(),
-        secret: secret.clone().map(Arc::new),
-    };
+    let factory = http_factory(secret.clone(), tls.as_ref())?;
     let raft = Raft::new(id, config, factory, log, store.clone()).await?;
     let app = raft_router(raft.clone(), secret);
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let server = if let Some(tls) = tls {
+        let config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key).await?;
+        let listener = listener.into_std()?;
+        tokio::spawn(async move {
+            if let Ok(server) = axum_server::from_tcp_rustls(listener, config) {
+                let _ = server.serve(app.into_make_service()).await;
+            }
+        })
+    } else {
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        })
+    };
     if fresh && bootstrap {
         let mut members = BTreeMap::new();
         members.insert(id, BasicNode::new(address.to_string()));
@@ -1017,10 +1075,7 @@ async fn start_http_cluster_at(
         let log = Arc::new(log);
         fresh.push(log.is_empty().await);
         let store = StateMachineStore::new(model, state_path);
-        let factory = HttpFactory {
-            client: reqwest::Client::new(),
-            secret: secret.clone().map(Arc::new),
-        };
+        let factory = http_factory(secret.clone(), None)?;
         let raft = Raft::new(id, config.clone(), factory, log, store.clone()).await?;
         stores.push(store);
         rafts.write().await.insert(id, raft.clone());
@@ -1044,6 +1099,17 @@ async fn start_http_cluster_at(
         stores,
         servers,
         addresses: actual_addresses,
+    })
+}
+
+fn http_factory(
+    secret: Option<String>,
+    tls: Option<&RaftTlsConfig>,
+) -> anyhow::Result<HttpFactory> {
+    Ok(HttpFactory {
+        client: http_client(tls)?,
+        secret: secret.map(Arc::new),
+        scheme: if tls.is_some() { "https" } else { "http" }.to_string(),
     })
 }
 

@@ -118,6 +118,17 @@ pub struct ControlConfig {
     /// Initialize a pristine cluster with the configured peers.
     #[serde(default)]
     pub raft_bootstrap: bool,
+    /// Raft internal HTTPS certificate/key.
+    #[serde(default)]
+    pub raft_tls_cert: Option<String>,
+    #[serde(default)]
+    pub raft_tls_key: Option<String>,
+    /// CA used to verify peer Raft HTTPS servers.
+    #[serde(default)]
+    pub raft_tls_ca: Option<String>,
+    /// Development only: accept invalid Raft peer certificates.
+    #[serde(default)]
+    pub raft_tls_insecure: bool,
     /// Membership manifest lifetime in seconds.
     #[serde(default = "default_manifest_ttl")]
     pub manifest_ttl_secs: u64,
@@ -181,6 +192,10 @@ impl Default for ControlConfig {
             raft_peers: Vec::new(),
             raft_secret: None,
             raft_bootstrap: false,
+            raft_tls_cert: None,
+            raft_tls_key: None,
+            raft_tls_ca: None,
+            raft_tls_insecure: false,
             manifest_ttl_secs: default_manifest_ttl(),
             controller_keys: Vec::new(),
             controller_threshold: 1,
