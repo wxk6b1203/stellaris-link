@@ -357,7 +357,8 @@ gateway/exit 才能广告其他前缀
 - controller `control.members` allowlist / 每 member prefix grant；
 - member 侧 controller threshold（同一 payload 至少 N 个不同 controller 签名）；
 - member 侧对 LSA prefix 的 grant 强制（`lsa_authorized`）；
-- 一次性 join token：`POST /v1/join`，member `control.join_token` 自动申请；
+- 一次性 join token：`POST /v1/join`，member `control.join_token` 自动申请；token 支持 `expires_at`，过期/复用拒绝；
+- `POST /v1/revoke`：撤销 member，移除其 grant/LSA/ACK，generation+1；strict membership 下空 grant 不会退化为 allow-all；
 - 独立 signed membership manifest：`GET /v1/manifest`，member 校验 Ed25519/expiry 后更新 grants；
 - 未授权 LSA origin、overlay_ip、prefix、link target 被拒绝；
 - 测试：`demo-psk-join.sh`、`demo-iroh-controller.sh`、`join_token_admits_once_and_grants_prefix`。

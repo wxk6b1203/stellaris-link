@@ -141,6 +141,9 @@ impl Default for ControlConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JoinTokenConfig {
     pub token: String,
+    /// Unix timestamp after which the token is invalid.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
     #[serde(default)]
     pub prefixes: Vec<IpNet>,
     #[serde(default)]

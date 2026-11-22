@@ -29,7 +29,7 @@
 - [x] RoutePolicy engine（Accept/Deny/SetLocalPref/SetMetric/SetWeight），AZ region/zone 匹配。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
 - [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。
-- [ ] manifest threshold/多 controller 聚合；controller key set threshold 选择已实现。
+- [ ] manifest threshold/多 controller 聚合；controller key set threshold 选择已实现；join token 过期/撤销已实现。
 - [ ] ACL/QoS 审计日志、复杂整形。
 - [ ] 完整 controller（openraft quorum/leader election）、mDNS/广播发现、ACL/QoS 复杂整形/队列配置、多网络、Windows、macOS NAT。
 

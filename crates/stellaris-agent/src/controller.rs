@@ -39,6 +39,7 @@ pub struct ControllerState {
     acks_path: PathBuf,
     grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenConfig>>>,
+    strict_membership: bool,
     signing_key: Option<Arc<SigningKey>>,
     signer: Option<NodeId>,
     manifest_ttl: u64,
@@ -205,6 +206,8 @@ impl ControllerState {
             .iter()
             .map(|token| (token.token.clone(), token.clone()))
             .collect();
+        let strict_membership =
+            !config.control.members.is_empty() || !config.control.join_tokens.is_empty();
         Ok(Self {
             network,
             secret: config.control.secret.clone(),
@@ -214,6 +217,7 @@ impl ControllerState {
             acks_path,
             grants: Arc::new(RwLock::new(grants)),
             join_tokens: Arc::new(RwLock::new(join_tokens)),
+            strict_membership,
             signing_key: None,
             signer: None,
             manifest_ttl: config.control.manifest_ttl_secs,
@@ -375,10 +379,10 @@ impl ControllerState {
     }
 
     fn authorize_lsa(&self, lsa: &Lsa) -> Result<(), (u16, String)> {
-        let grants = self.grants.read().unwrap_or_else(|e| e.into_inner());
-        if grants.is_empty() {
+        if !self.strict_membership {
             return Ok(());
         }
+        let grants = self.grants.read().unwrap_or_else(|e| e.into_inner());
         let Some(grant) = grants.get(&lsa.origin) else {
             return Err((403, format!("member {} is not authorized", lsa.origin)));
         };
@@ -415,12 +419,16 @@ impl ControllerState {
         overlay: std::net::IpAddr,
         token: &str,
     ) -> Result<(), (u16, String)> {
+        let now = now_epoch();
         let join = self
             .join_tokens
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(token)
             .ok_or((403, "invalid or already used join token".to_string()))?;
+        if join.expires_at.is_some_and(|expires| now > expires) {
+            return Err((403, "join token expired".to_string()));
+        }
         let grant = ControllerMemberConfig {
             node_id: node.to_string(),
             overlay_ip: Some(overlay),
@@ -431,6 +439,29 @@ impl ControllerState {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(node, grant);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn revoke(&self, node: NodeId) -> Result<(), (u16, String)> {
+        let removed = self
+            .grants
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node)
+            .is_some();
+        if !removed {
+            return Err((404, "member not found".into()));
+        }
+        self.link_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(node);
+        self.acks
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node);
+        self.persist_acks();
         self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -528,6 +559,7 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/lsa", post(apply_lsa))
         .route("/v1/join", post(join))
         .route("/v1/manifest", get(manifest))
+        .route("/v1/revoke", post(revoke))
         .route("/v1/ack", post(ack))
         .with_state(state)
 }
@@ -634,6 +666,39 @@ async fn join(
         .into_response(),
         Err((code, message)) => (
             StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+            message,
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeRequest {
+    node_id: String,
+}
+
+async fn revoke(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeRequest>,
+) -> Response {
+    if !state.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match req.node_id.parse() {
+        Ok(node) => node,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")).into_response();
+        }
+    };
+    match state.revoke(node) {
+        Ok(()) => Json(json!({
+            "revoked": node.to_string(),
+            "generation": state.generation.load(Ordering::Relaxed),
+        }))
+        .into_response(),
+        Err((code, message)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
             message,
         )
             .into_response(),
@@ -1157,6 +1222,136 @@ prefixes = ["192.168.70.0/24"]
                     .header("x-stellaris-secret", "s3cret")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn revoke_removes_member_lsa_and_manifest_entry() {
+        let toml = r#"
+[node]
+name = "ctrl"
+role = "controller"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+epoch = 1
+
+[[control.join_tokens]]
+token = "join-once"
+prefixes = ["192.168.70.0/24"]
+"#;
+        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+        let app = router(state);
+        let node = "0101010101010101010101010101010101010101010101010101010101010101";
+        let join =
+            serde_json::json!({"node_id": node, "overlay_ip": "10.7.0.1", "token": "join-once"});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(join.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let lsa = serde_json::json!({
+            "origin": node, "seq": 1, "zone": null, "links": [],
+            "prefixes": [{"prefix":"10.7.0.1/32","metric":0}],
+            "overlay_ip": "10.7.0.1", "addrs": []
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/lsa")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(lsa.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let revoke = serde_json::json!({"node_id": node});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/revoke")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(revoke.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/lsa")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(lsa.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn expired_join_token_is_rejected() {
+        let toml = r#"
+[node]
+name = "ctrl"
+role = "controller"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+
+[[control.join_tokens]]
+token = "expired"
+expires_at = 1
+"#;
+        let state = ControllerState::from_config(&Config::from_toml(toml).unwrap()).unwrap();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+                            "overlay_ip": "10.7.0.1",
+                            "token": "expired"
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await

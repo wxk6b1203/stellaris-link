@@ -17,7 +17,7 @@
 - **CLI**：`stellaris status`、`peer list`、`route list/lookup/explain/add/delete/pin/unpin/drain/reset`。
 - **传输**：iroh 1.5（QUIC）静态 peer；direct/relay 路径与 RTT 可见；固定 UDP 端口，便于 LAN/实验环境直连。
 - **数据面**：TUN（Linux/macOS）+ 16 字节 MeshHeader；IPv4 overlay；TTL/转发/anti-spoof；subnet gateway（a→b→c）；初始 MTU 1100 + 自适应；需要 root/CAP_NET_ADMIN。
-- **入网安全**：`network.auth.mode = "psk"` 双向 HMAC challenge/response + 可选 allowlist；controller snapshot 支持 Ed25519 签名；`control.members` 支持 allowlist/prefix grant；支持一次性 `control.join_token` → `POST /v1/join`；member 侧 LSA 前缀 grant 强制、controller threshold、独立 `GET /v1/manifest` Ed25519 signed membership manifest 已实现。
+- **入网安全**：`network.auth.mode = "psk"` 双向 HMAC challenge/response + 可选 allowlist；controller snapshot 支持 Ed25519 签名；`control.members` 支持 allowlist/prefix grant；支持一次性 `control.join_token` → `POST /v1/join`；member 侧 LSA 前缀 grant 强制、controller threshold、独立 `GET /v1/manifest` Ed25519 signed membership manifest、`POST /v1/revoke` 撤销已实现。
 - **RoutePolicy**：配置化 policy engine（Accept/Deny/SetLocalPref/SetMetric/SetAdminDistance/SetWeight），在 RIB→FIB 前执行；AZ 用 `region`/`zone` 匹配。
 - **测试**：FIB/路由/持久化/报文解析/数据面决策/ACL/QoS/API 鉴权/controller 签名/SPF 单元测试；`demo-two-node.sh` 双节点 iroh；`docker-two-node-tun.sh` 双容器 TUN；`docker-subnet-gateway.sh` a→b→c 1000B ping；`demo-linkstate.sh`/`demo-distributed-linkstate.sh` 自动路由与 `TEST_FAILOVER=1` 撤路；`demo-iroh-controller.sh` iroh control；`demo-controller-discovery.sh` controller 自动发现成员。
 
