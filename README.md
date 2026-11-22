@@ -350,6 +350,15 @@ cargo build -p stellaris-agent --bin stellaris-controller
 # OK: 3-controller raft TLS join/LSA/snapshot works.
 ```
 
+### 21.6 Public exit + NAT44
+
+```bash
+sudo BIN=./target/release/stellaris-agent ./scripts/test-linux-netns-exit-nat.sh
+# OK: public exit + NAT44 works.
+```
+
+A 通过 exit B 访问 192.0.2.2；B 安装 MASQUERADE 并转发。
+
 ### 21.7 Dataplane IPv6 基础
 
 - `node.overlay_ip` / `network.cidr` 可为 IPv6

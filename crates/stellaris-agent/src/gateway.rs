@@ -46,8 +46,6 @@ pub fn ensure_nat_v6(overlay: &str, tun: &str) -> anyhow::Result<()> {
 #[cfg(any(target_os = "linux", test))]
 fn nat_rule_args(overlay: &str, tun: &str) -> Vec<String> {
     vec![
-        "-t".into(),
-        "nat".into(),
         "POSTROUTING".into(),
         "-s".into(),
         overlay.into(),
@@ -63,7 +61,7 @@ fn nat_rule_args(overlay: &str, tun: &str) -> Vec<String> {
 fn ensure_nat_with(binary: &str, overlay: &str, tun: &str) -> anyhow::Result<()> {
     let rule = nat_rule_args(overlay, tun);
     let check = std::process::Command::new(binary)
-        .arg("-C")
+        .args(["-t", "nat", "-C"])
         .args(&rule)
         .status()
         .with_context(|| format!("run {binary} -C (is {binary} installed?)"))?;
@@ -71,7 +69,7 @@ fn ensure_nat_with(binary: &str, overlay: &str, tun: &str) -> anyhow::Result<()>
         return Ok(());
     }
     let add = std::process::Command::new(binary)
-        .arg("-A")
+        .args(["-t", "nat", "-A"])
         .args(&rule)
         .status()
         .with_context(|| format!("run {binary} -A"))?;
@@ -94,10 +92,9 @@ mod tests {
     #[test]
     fn nat_rule_has_chain_before_match() {
         let args = nat_rule_args("fd00:115::/64", "stellaris0");
-        assert_eq!(args[0], "-t");
-        assert_eq!(args[2], "POSTROUTING");
-        assert_eq!(args[3], "-s");
-        assert_eq!(args[4], "fd00:115::/64");
+        assert_eq!(args[0], "POSTROUTING");
+        assert_eq!(args[1], "-s");
+        assert_eq!(args[2], "fd00:115::/64");
         assert!(args.windows(2).any(|w| w == ["!", "-o"]));
         assert_eq!(args.last().map(String::as_str), Some("MASQUERADE"));
     }
