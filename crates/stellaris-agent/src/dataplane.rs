@@ -577,7 +577,8 @@ fn route_outbound_priority(
     let priority = policy.qos_priority(&info);
     let class = policy.qos_class_index(&info);
     let mut packet = packet.to_vec();
-    wire::clamp_tcp_mss(&mut packet, state.config.dataplane.mtu.min(1100));
+    let mtu = path_mtu(state, peer.as_ref(), &packet);
+    wire::clamp_tcp_mss(&mut packet, mtu);
     let header = MeshHeader::new(state.network, 64, flow_hash(&info));
     let mut frame = Vec::with_capacity(HEADER_LEN + packet.len());
     frame.extend_from_slice(&header.encode());
@@ -620,6 +621,20 @@ fn mtu_for_packet(state: &AgentState, packet: &[u8]) -> u16 {
     } else {
         state.config.dataplane.mtu.min(1100)
     }
+}
+
+fn path_mtu(state: &AgentState, peer: Option<&crate::PeerState>, packet: &[u8]) -> u16 {
+    let v6 = packet.first().is_some_and(|b| b >> 4 == 6);
+    let configured = if v6 {
+        state.config.dataplane.mtu.max(1280)
+    } else {
+        state.config.dataplane.mtu.min(1100)
+    };
+    let path = peer
+        .and_then(|peer| peer.mtu)
+        .map(|mtu| mtu.saturating_sub(HEADER_LEN as u16));
+    path.map_or(configured, |mtu| configured.min(mtu))
+        .max(if v6 { 1280 } else { 576 })
 }
 
 fn too_big_action(state: &AgentState, packet: &[u8]) -> Option<InboundAction> {
@@ -708,7 +723,9 @@ pub fn decide_inbound(
 
     if is_local || is_gateway {
         let mut delivered = payload.to_vec();
-        wire::clamp_tcp_mss(&mut delivered, state.config.dataplane.mtu.min(1100));
+        let sender = state.peers.get(&from);
+        let mtu = path_mtu(state, sender.as_ref(), &delivered);
+        wire::clamp_tcp_mss(&mut delivered, mtu);
         if policy.apply_qos(&mut delivered, &info) == QosVerdict::RateLimited {
             crate::stats::Stats::inc(&state.stats.qos_rate_limited);
             return InboundAction::Drop("qos rate limit");
@@ -718,7 +735,6 @@ pub fn decide_inbound(
 
     // Transit: decrement TTL and forward if a route exists.
     let mut forwarded = payload.to_vec();
-    wire::clamp_tcp_mss(&mut forwarded, state.config.dataplane.mtu.min(1100));
     if !decrement_ttl(&mut forwarded) {
         return InboundAction::Drop("ttl expired");
     }
@@ -735,6 +751,9 @@ pub fn decide_inbound(
     if next.node == state.node_id {
         return InboundAction::Drop("transit loop");
     }
+    let next_peer = state.peers.get(&next.node);
+    let mtu = path_mtu(state, next_peer.as_ref(), &forwarded);
+    wire::clamp_tcp_mss(&mut forwarded, mtu);
     let mut frame = Vec::with_capacity(HEADER_LEN + forwarded.len());
     frame.extend_from_slice(&header.encode());
     frame.extend_from_slice(&forwarded);
@@ -1072,6 +1091,31 @@ overlay_ip = "10.7.0.2"
             InboundAction::Deliver(p)
         );
     }
+    #[test]
+    fn path_mtu_limits_clamped_mss() {
+        let state = state();
+        state
+            .peers
+            .mark(&node(2), true, Some("direct".into()), Some(5), Some(1100));
+        let mut p = vec![0u8; 44];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&44u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&[10, 7, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 7, 0, 2]);
+        p[32] = 6 << 4;
+        p[40] = 2;
+        p[41] = 4;
+        p[42..44].copy_from_slice(&1460u16.to_be_bytes());
+        let (_, frame) = route_outbound(&state, &p).unwrap();
+        // path MTU 1100 - mesh header 16 = 1084; MSS = 1084 - 40.
+        assert_eq!(
+            u16::from_be_bytes([frame[HEADER_LEN + 42], frame[HEADER_LEN + 43]]),
+            1044
+        );
+    }
+
     #[test]
     fn ipv6_outbound_uses_fib() {
         let state = state_v6();
