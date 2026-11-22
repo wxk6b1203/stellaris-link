@@ -63,6 +63,9 @@ pub struct QosConfig {
     /// Egress priority queue depth (default 4096).
     #[serde(default)]
     pub queue_depth: Option<usize>,
+    /// Optional per-priority queue depth cap.
+    #[serde(default)]
+    pub queue_depth_per_priority: Option<usize>,
     #[serde(default)]
     pub classes: Vec<QosClass>,
 }

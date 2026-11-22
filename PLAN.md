@@ -61,6 +61,7 @@
 - [x] peer `advertised` 自动安装路由，public exit 无手写 route。
 - [x] IPv4/IPv6 分片解析与稳定 flow hash。
 - [x] 超大包 ICMPv4 Fragmentation Needed / ICMPv6 Packet Too Big。
+- [x] per-priority egress queue depth + queue drop counter。
 - [x] controller LSA 状态持久化（30s TTL 内重启恢复）。
 - [x] 数据面 source grant 强制（member/transit capability）。
 - [x] 多网络进程级隔离 + overlay CIDR 校验 + 设计文档；不同 network id 同 PSK 拒绝。

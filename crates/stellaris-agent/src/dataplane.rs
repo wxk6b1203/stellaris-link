@@ -90,8 +90,10 @@ pub async fn start(
     let (egress_tx, egress_rx) = mpsc::channel::<EgressFrame>(queue_depth);
     {
         let transport = transport.clone();
+        let per_priority = state.config.qos.queue_depth_per_priority;
+        let stats = state.stats.clone();
         tokio::spawn(async move {
-            egress_worker(egress_rx, transport, queue_depth).await;
+            egress_worker(egress_rx, transport, queue_depth, per_priority, stats).await;
         });
     }
     {
@@ -362,21 +364,34 @@ async fn egress_worker(
     mut rx: mpsc::Receiver<EgressFrame>,
     transport: Arc<IrohTransport>,
     queue_depth: usize,
+    per_priority_depth: Option<usize>,
+    stats: Arc<crate::stats::Stats>,
 ) {
     let mut queue = BinaryHeap::new();
+    let mut by_priority: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    let push = |queue: &mut BinaryHeap<EgressFrame>,
+                counts: &mut std::collections::BTreeMap<i32, usize>,
+                frame: EgressFrame| {
+        let current = counts.get(&frame.priority).copied().unwrap_or(0);
+        let full_priority = per_priority_depth.is_some_and(|cap| current >= cap);
+        if queue.len() >= queue_depth || full_priority {
+            crate::stats::Stats::inc(&stats.queue_dropped);
+            return;
+        }
+        *counts.entry(frame.priority).or_default() += 1;
+        queue.push(frame);
+    };
     loop {
         if queue.is_empty() {
             let Some(frame) = rx.recv().await else {
                 break;
             };
-            queue.push(frame);
+            push(&mut queue, &mut by_priority, frame);
         }
         tokio::select! {
             frame = rx.recv() => {
                 if let Some(frame) = frame {
-                    if queue.len() < queue_depth {
-                        queue.push(frame);
-                    }
+                    push(&mut queue, &mut by_priority, frame);
                 } else {
                     while let Some(frame) = queue.pop() {
                         if let Err(e) = transport.send(frame.next, frame.frame).await {
@@ -387,6 +402,9 @@ async fn egress_worker(
                 }
             }
             Some(frame) = async { queue.pop() } => {
+                if let Some(count) = by_priority.get_mut(&frame.priority) {
+                    *count = count.saturating_sub(1);
+                }
                 if let Err(e) = transport.send(frame.next, frame.frame).await {
                     debug!(peer = %frame.next.short(), error = %e, "egress send failed");
                 }
