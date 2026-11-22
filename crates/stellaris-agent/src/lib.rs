@@ -311,16 +311,20 @@ via = "c"
             .lookup("192.168.50.1".parse().unwrap())
             .unwrap();
         assert_eq!(entry.next_hops[0].node, NodeId::new([2u8; 32]));
-        let zone = &state
+        let primary = state
             .routes
             .routes(stellaris_routing::RouteView::Rib)
             .into_iter()
             .find(|r| {
                 r.prefix.to_string() == "192.168.50.0/24" && r.next_hop == NodeId::new([2u8; 32])
             })
-            .unwrap()
-            .attrs
-            .zone;
-        assert_eq!(zone.as_deref(), Some("az-a"));
+            .unwrap();
+        assert_eq!(primary.attrs.zone.as_deref(), Some("az-a"));
+        state.routes.delete(primary.id, false).unwrap();
+        let failover = state
+            .routes
+            .lookup("192.168.50.1".parse().unwrap())
+            .unwrap();
+        assert_eq!(failover.next_hops[0].node, NodeId::new([3u8; 32]));
     }
 }
