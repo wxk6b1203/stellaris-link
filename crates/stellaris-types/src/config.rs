@@ -689,6 +689,18 @@ impl Config {
                     class.name
                 )));
             }
+            if class.queue_depth == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "qos class {} queue_depth must be > 0",
+                    class.name
+                )));
+            }
+            if class.queue_bytes == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "qos class {} queue_bytes must be > 0",
+                    class.name
+                )));
+            }
         }
         if self.routing.ecmp_max == 0 {
             return Err(ConfigError::Invalid("routing.ecmp_max must be > 0".into()));

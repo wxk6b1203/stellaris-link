@@ -105,6 +105,12 @@ pub struct QosClass {
     /// Optional byte burst (defaults to rate_bps).
     #[serde(default)]
     pub burst_bytes: Option<u32>,
+    /// Optional queue packet cap for this class.
+    #[serde(default)]
+    pub queue_depth: Option<usize>,
+    /// Optional queue byte cap for this class.
+    #[serde(default)]
+    pub queue_bytes: Option<usize>,
 }
 
 impl AclRule {

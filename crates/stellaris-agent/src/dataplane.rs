@@ -93,6 +93,13 @@ pub async fn start(
         let per_priority = state.config.qos.queue_depth_per_priority;
         let queue_bytes = state.config.qos.queue_bytes;
         let queue_bytes_per_priority = state.config.qos.queue_bytes_per_priority;
+        let class_caps: Vec<(Option<usize>, Option<usize>)> = state
+            .config
+            .qos
+            .classes
+            .iter()
+            .map(|class| (class.queue_depth, class.queue_bytes))
+            .collect();
         let stats = state.stats.clone();
         tokio::spawn(async move {
             egress_worker(
@@ -102,6 +109,7 @@ pub async fn start(
                 per_priority,
                 queue_bytes,
                 queue_bytes_per_priority,
+                class_caps,
                 stats,
             )
             .await;
@@ -348,6 +356,7 @@ struct EgressFrame {
     next: stellaris_types::NodeId,
     frame: Bytes,
     priority: i32,
+    class: Option<usize>,
     sequence: u64,
 }
 
@@ -371,6 +380,7 @@ impl PartialOrd for EgressFrame {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn egress_worker(
     mut rx: mpsc::Receiver<EgressFrame>,
     transport: Arc<IrohTransport>,
@@ -378,16 +388,22 @@ async fn egress_worker(
     per_priority_depth: Option<usize>,
     queue_bytes: Option<usize>,
     queue_bytes_per_priority: Option<usize>,
+    class_caps: Vec<(Option<usize>, Option<usize>)>,
     stats: Arc<crate::stats::Stats>,
 ) {
     let mut queue = BinaryHeap::new();
     let mut by_priority: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
     let mut bytes_by_priority: std::collections::BTreeMap<i32, usize> =
         std::collections::BTreeMap::new();
+    let mut by_class: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut bytes_by_class: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
     let mut queued_bytes = 0usize;
     let push = |queue: &mut BinaryHeap<EgressFrame>,
                 counts: &mut std::collections::BTreeMap<i32, usize>,
                 byte_counts: &mut std::collections::BTreeMap<i32, usize>,
+                class_counts: &mut std::collections::BTreeMap<usize, usize>,
+                class_bytes: &mut std::collections::BTreeMap<usize, usize>,
                 queued_bytes: &mut usize,
                 frame: EgressFrame| {
         let current = counts.get(&frame.priority).copied().unwrap_or(0);
@@ -397,12 +413,29 @@ async fn egress_worker(
         let full_priority_bytes =
             queue_bytes_per_priority.is_some_and(|cap| current_bytes + frame_bytes > cap);
         let full_bytes = queue_bytes.is_some_and(|cap| *queued_bytes + frame_bytes > cap);
-        if queue.len() >= queue_depth || full_priority || full_priority_bytes || full_bytes {
+        let class_full = frame.class.is_some_and(|class| {
+            class_caps.get(class).is_some_and(|(depth, bytes)| {
+                depth.is_some_and(|cap| class_counts.get(&class).copied().unwrap_or(0) >= cap)
+                    || bytes.is_some_and(|cap| {
+                        class_bytes.get(&class).copied().unwrap_or(0) + frame_bytes > cap
+                    })
+            })
+        });
+        if queue.len() >= queue_depth
+            || full_priority
+            || full_priority_bytes
+            || full_bytes
+            || class_full
+        {
             crate::stats::Stats::inc(&stats.queue_dropped);
             return;
         }
         *counts.entry(frame.priority).or_default() += 1;
         *byte_counts.entry(frame.priority).or_default() += frame_bytes;
+        if let Some(class) = frame.class {
+            *class_counts.entry(class).or_default() += 1;
+            *class_bytes.entry(class).or_default() += frame_bytes;
+        }
         *queued_bytes += frame_bytes;
         queue.push(frame);
     };
@@ -415,6 +448,8 @@ async fn egress_worker(
                 &mut queue,
                 &mut by_priority,
                 &mut bytes_by_priority,
+                &mut by_class,
+                &mut bytes_by_class,
                 &mut queued_bytes,
                 frame,
             );
@@ -426,6 +461,8 @@ async fn egress_worker(
                 &mut queue,
                 &mut by_priority,
                 &mut bytes_by_priority,
+                &mut by_class,
+                &mut bytes_by_class,
                 &mut queued_bytes,
                 frame,
             );
@@ -444,6 +481,14 @@ async fn egress_worker(
                 }
                 if let Some(bytes) = bytes_by_priority.get_mut(&frame.priority) {
                     *bytes = bytes.saturating_sub(frame.frame.len());
+                }
+                if let Some(class) = frame.class {
+                    if let Some(count) = by_class.get_mut(&class) {
+                        *count = count.saturating_sub(1);
+                    }
+                    if let Some(bytes) = bytes_by_class.get_mut(&class) {
+                        *bytes = bytes.saturating_sub(frame.frame.len());
+                    }
                 }
                 queued_bytes = queued_bytes.saturating_sub(frame.frame.len());
                 if let Err(e) = transport.send(frame.next, frame.frame).await {
@@ -466,7 +511,8 @@ async fn outbound_loop(
         if n == 0 {
             continue;
         }
-        let Some((next, frame, priority)) = route_outbound_priority(&state, &buf[..n]) else {
+        let Some((next, frame, priority, class)) = route_outbound_priority(&state, &buf[..n])
+        else {
             continue;
         };
         sequence = sequence.wrapping_add(1);
@@ -474,6 +520,7 @@ async fn outbound_loop(
             next,
             frame,
             priority,
+            class,
             sequence,
         };
         if egress_tx.try_send(egress).is_err() {
@@ -487,13 +534,13 @@ pub fn route_outbound(
     state: &AgentState,
     packet: &[u8],
 ) -> Option<(stellaris_types::NodeId, Bytes)> {
-    route_outbound_priority(state, packet).map(|(node, frame, _)| (node, frame))
+    route_outbound_priority(state, packet).map(|(node, frame, _, _)| (node, frame))
 }
 
 fn route_outbound_priority(
     state: &AgentState,
     packet: &[u8],
-) -> Option<(stellaris_types::NodeId, Bytes, i32)> {
+) -> Option<(stellaris_types::NodeId, Bytes, i32, Option<usize>)> {
     let info = PacketInfo::parse(packet)?;
     let local = state.config.node.overlay_ip?;
     if info.dst == local {
@@ -528,6 +575,7 @@ fn route_outbound_priority(
         return None;
     }
     let priority = policy.qos_priority(&info);
+    let class = policy.qos_class_index(&info);
     let mut packet = packet.to_vec();
     wire::clamp_tcp_mss(&mut packet, state.config.dataplane.mtu.min(1100));
     let header = MeshHeader::new(state.network, 64, flow_hash(&info));
@@ -538,7 +586,7 @@ fn route_outbound_priority(
         crate::stats::Stats::inc(&state.stats.qos_rate_limited);
         return None;
     }
-    Some((next.node, Bytes::from(frame), priority))
+    Some((next.node, Bytes::from(frame), priority, class))
 }
 
 async fn handle_inbound(
@@ -903,6 +951,7 @@ overlay_ip = "10.7.0.1"
                 next: node(1),
                 frame: Bytes::new(),
                 priority,
+                class: None,
                 sequence,
             });
         }

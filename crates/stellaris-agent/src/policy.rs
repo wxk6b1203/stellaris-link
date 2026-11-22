@@ -253,7 +253,7 @@ impl Policy {
         }
     }
 
-    fn qos_class_index(&self, info: &PacketInfo) -> Option<usize> {
+    pub fn qos_class_index(&self, info: &PacketInfo) -> Option<usize> {
         if !self.file.qos.enabled {
             return None;
         }
