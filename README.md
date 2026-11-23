@@ -597,3 +597,5 @@ export BIN=/opt/stellaris/stellaris-agent
 - direct path -> relay path 切换
 - 双网卡 direct path failover（.162 → .164）
 - 跨批次公网 direct UDP / relay
+- 深圳↔上海 25ms 公网 TUN overlay + 2000-byte 分片 ping
+- 深圳/上海 3 controller 公网 quorum + mTLS + failover

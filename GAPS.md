@@ -90,6 +90,10 @@ cargo test                                                 110 passed
 | 批2 双网卡 direct path failover | ✅ `.162:5911` → `.164:5911` |
 | 批1↔批2 公网 direct UDP | ✅ |
 | 批1↔批2 公网 relay | ✅ |
+| 深圳↔上海 公网 TUN overlay（25ms RTT） | ✅ 0% loss |
+| 深圳↔上海 2000-byte 分片 ping | ✅ 0% loss |
+| 深圳/上海 3 controller 公网 quorum + mTLS + failover | ✅ |
+| Docker host-network + TUN（容器内 agent） | ✅ 手测 |
 
 双网卡注意事项：
 
@@ -103,7 +107,23 @@ cargo test                                                 110 passed
 - `scripts/test-real-crossbatch-direct.sh`
 - `scripts/test-real-crossbatch-relay.sh`
 
-### 2.4 之前已验证（本轮未重复跑）
+### 2.4 Docker 与 PMTUD 现状
+
+Docker：
+
+- 7 台主机 Docker 29.10.0 可用
+- `docker pull alpine:latest`、`debian:bookworm-slim` 成功
+- 容器化 agent（`--network host --cap-add=NET_ADMIN --device /dev/net/tun` + 宿主二进制 + Debian slim）实测 TUN + 2000-byte ping 通过
+- 标准 `docker/runtime.Dockerfile` 的 `apt-get` 在云主机上极慢/卡住，未完成镜像构建；Docker TUN 双容器脚本未复跑
+
+PMTUD：
+
+- 已修：peer MTU 未知时不再回退到 1100，使用配置 MTU
+- 未完成：手工把 TUN MTU 提到 1500 后，1450-byte DF 包在源端被静默丢弃，未收到本端/下游 ICMP PTB
+- 现有覆盖：peer path MTU、MSS clamp、入站 oversized PTB、TUN 自适应
+- 缺口：**源端 oversized DF 包的 PTB/route MTU 处理**
+
+### 2.5 之前已验证（本轮未重复跑）
 
 - macvlan 真实 LAN 3 controller + mTLS + partition recovery
 - Raft 本机 3 节点 + TLS/mTLS
@@ -121,13 +141,13 @@ cargo test                                                 110 passed
 |---|---|---|
 | 强制 multipath | ❌ | 只验证 direct→relay；没有双 direct/双 relay 同时可用与路径选择测试 |
 | 3/3 全路径 roaming | ⚠️ | 批1 最后一次一个 peer relay、一个 direct；脚本仍只断言一个 peer |
-| 完整 PMTUD | ❌ | 没有逐跳 MTU 递减、PTB 黑洞、TCP MSS 抓包验证 |
+| 完整 PMTUD | ❌ | 源端超大 DF 包会静默丢；缺 route MTU/源端 PTB；未做逐跳 MTU 递减 |
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ❌ | 三台同 VPC，只走私网；没有公网入站/跨 NAT 测试 |
 | 磁盘满/撕裂写 | ❌ | 只读目录测试已做；没有 ENOSPC/partially written log |
 | snapshot 跨进程完整续传 | ⚠️ | begin/chunk 重试、TTL/abort 已做；没有 agent/controller 重启后续传 |
 | 真实物理跨地域 | ❌ | 同 VPC 低 RTT；没有跨 region/高延迟 |
-| Docker 测试复跑 | ⚠️ | 新主机 Docker 可用且 pull 成功；Docker 功能测试未逐项复跑 |
+| Docker 测试复跑 | ⚠️ | Docker pull/容器内 agent 手测通过；标准 Dockerfile apt 构建未完成 |
 | macOS NAT/pf、Windows | ❌ | 只有 Linux NAT |
 | tracing/dashboard/打包 | ❌ | 未实现 |
 

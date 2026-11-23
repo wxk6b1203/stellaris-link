@@ -617,10 +617,12 @@ async fn handle_inbound(
 
 fn path_mtu(state: &AgentState, peer: Option<&crate::PeerState>, packet: &[u8]) -> u16 {
     let v6 = packet.first().is_some_and(|b| b >> 4 == 6);
+    // When no peer path MTU is known yet, use the configured overlay MTU.
+    // The old hard-coded 1100 fallback caused bogus PTB values during startup.
     let configured = if v6 {
         state.config.dataplane.mtu.max(1280)
     } else {
-        state.config.dataplane.mtu.min(1100)
+        state.config.dataplane.mtu
     };
     let path = peer
         .and_then(|peer| peer.mtu)
