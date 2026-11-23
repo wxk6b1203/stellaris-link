@@ -74,6 +74,7 @@
 - 开 Raft debug/tracing
 - 查 log/term/vote 状态
 - 是否 follower 重启后 log 落后导致无法赢得选举
+- 是否测试脚本在重启后错误地杀掉/未启动节点
 - 是否 rolling restart 顺序/选举超时需要调整
 
 ## 3.1 其他后续

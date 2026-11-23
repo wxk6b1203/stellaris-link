@@ -145,7 +145,14 @@ restart leader 2:
 - 80 秒内未选出新 leader
 - 测试失败
 
-日志只有启动 INFO，没有 Raft election/error 细节；需要打开 Raft debug/tracing 才能定位。
+打开 Raft debug 后：
+
+- node1：`Follower, term 728, vote <T728-N3:->, last_log 5`
+- node3：`Candidate, term 736, last_log 5`
+- node3 反复向 node1/node2 发 `SendVote`
+- 日志中出现 `Connection refused` 到 `https://120.77.233.189:5701` / `https://8.153.183.185:5701`
+
+需要排除是测试脚本杀死/未启动节点，还是 Raft 状态/选举真实问题。
 
 这是一个真实问题：**在 follower 已被重启的情况下，随后重启 leader 可能导致剩余节点无法选出 leader**。需要进一步查 Raft 状态/日志/选举。
 
