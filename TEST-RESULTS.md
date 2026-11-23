@@ -109,7 +109,7 @@ snapshot_transfer_survives_http_restart
 - 仅验证 controller HTTP server 重启，不是整个 Raft 集群滚动重启
 - TTL 从进程重启后重新计时
 
-### 3.6 三地 controller 滚动重启：失败
+### 3.6 三地 controller 滚动重启：通过
 
 环境：
 
@@ -119,7 +119,19 @@ snapshot_transfer_survives_http_restart
 
 公网端口 5701/5801 + mTLS。
 
-过程：
+关键修正：
+
+```text
+STELLARIS_RAFT_ELECTION_TIMEOUT_MS=1000
+```
+
+默认 150ms 选举超时对跨地域 vote RPC 太短，日志里出现：
+
+```text
+timeout after 150ms when Vote 3->2
+```
+
+把 election timeout 提到 1000ms 后：
 
 ```text
 initial leader=1
@@ -130,44 +142,28 @@ restart follower 2:
   snapshot members ok
 
 restart follower 3:
-  leader after follower 1=2
+  leader after follower 1=1
   snapshot members ok
 
-restart leader 2:
-  80s 内没有新 leader
+restart leader 1:
+  new leader=3
+  snapshot members ok
+
+OK: cross-region 3-controller rolling restart works.
 ```
 
 结果：
 
-- follower 2/3 单独重启后仍可读写
-- follower 3 重启过程中 leader 曾从 1 切到 2
-- kill leader 2 后，node1/node3 都返回 `leader: null`
-- 80 秒内未选出新 leader
-- 测试失败
+- follower 逐个重启通过
+- leader 最后重启通过
+- 新 leader 选出
+- 旧 leader 重启后重新加入
+- 成员/snapshot 可读
 
-打开 Raft debug 后：
+限制：
 
-- node1：`Follower, term 728, vote <T728-N3:->, last_log 5`
-- node3：`Candidate, term 736, last_log 5`
-- node3 反复向 node1/node2 发 `SendVote`
-- 日志中出现 `Connection refused` 到 `https://120.77.233.189:5701` / `https://8.153.183.185:5701`
-
-失败后保存的 raft-log/state：
-
-```text
-node1:
-  last_applied: T22-N2 index 5
-  vote: T123-N3
-node3:
-  last_applied: T22-N2 index 5
-  vote: T125-N3
-```
-
-同时从 node3 直连 node1:5701 是通的，node2 已停。
-
-说明 node1 已经给 node3 投过票，但 node3 仍反复升 term，选举没有收敛。需要继续查 vote RPC 返回/选举实现。
-
-这是一个真实问题：**在 follower 已被重启的情况下，随后重启 leader 可能导致剩余节点无法选出 leader**。需要进一步查 Raft 状态/日志/选举。
+- 选举超时目前用环境变量覆盖，尚未暴露正式 TOML 配置
+- 本轮滚动重启没有制造大 snapshot 传输；snapshot transfer 重启续传仍是单独单测验证
 
 ### 3.7 仍未验证
 

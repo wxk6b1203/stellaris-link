@@ -219,7 +219,7 @@ PMTUD：
 
 ### 4.3 Controller HA
 
-- **三地滚动重启失败**：followers 重启后，kill leader 后 node1/node3 80s 内无 leader；需要 Raft debug/election 诊断。
+- **三地滚动重启已通过**：默认 150ms election timeout 对跨地域 vote RPC 太短；设置 1000ms 后 follower/leader 滚动重启通过。正式 TOML 配置待补。
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。

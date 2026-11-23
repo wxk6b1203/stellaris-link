@@ -6,11 +6,12 @@ IP1="${H1##*@}"; IP2="${H2##*@}"; IP3="${H3##*@}"
 BIN="${BIN:-/opt/stellaris/stellaris-controller}"
 DIR="${DIR:-/opt/stellaris/rolling-ha}"
 SECRET="controller-secret"; RAFT_SECRET="raft-secret"
+ELECTION_MS="${ELECTION_MS:-1000}"
 NODE="0101010101010101010101010101010101010101010101010101010101010101"
 C_PORT=5801; R_PORT=5701
 hosts=("$H1" "$H2" "$H3"); ips=("$IP1" "$IP2" "$IP3")
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/stellaris-rolling-ha.XXXXXX")"
-cleanup(){ for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "for f in $DIR/*.pid; do [ -f \"\$f\" ] && kill \$(cat \"\$f\") 2>/dev/null || true; done" 2>/dev/null || true; done; rm -rf "$TMP"; }
+cleanup(){ for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "for f in $DIR/*.pid; do [ -f \"\$f\" ] && kill \$(cat \"\$f\") 2>/dev/null || true; done; pkill -9 -f '[c]trl[1-3].toml' 2>/dev/null || true" 2>/dev/null || true; done; rm -rf "$TMP"; }
 trap cleanup EXIT
 for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "pkill -9 -f '[s]tellaris-controller --config $DIR/ctrl' 2>/dev/null || true; rm -rf $DIR; mkdir -p $DIR/tls"; done
 ssh -o BatchMode=yes "$H1" "cd $DIR/tls && \
@@ -59,10 +60,10 @@ token = "join-roll"
 prefixes = ["192.168.251.0/24"]
 TOML
   scp -q -o BatchMode=yes "$TMP/ctrl$((i+1)).toml" "${hosts[$i]}:$DIR/ctrl$((i+1)).toml"
-  ssh -o BatchMode=yes "${hosts[$i]}" "mkdir -p $DIR/n$((i+1))/state $DIR/n$((i+1))/raft; cd $DIR; nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"
+  ssh -o BatchMode=yes "${hosts[$i]}" "mkdir -p $DIR/n$((i+1))/state $DIR/n$((i+1))/raft; cd $DIR; STELLARIS_RAFT_ELECTION_TIMEOUT_MS=$ELECTION_MS nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"
 done
 status(){ ssh -o BatchMode=yes "${hosts[$1]}" "curl -fsS --max-time 3 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/status'"; }
-start_node(){ local i=$1; ssh -o BatchMode=yes "${hosts[$i]}" "cd $DIR; nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"; }
+start_node(){ local i=$1; ssh -o BatchMode=yes "${hosts[$i]}" "cd $DIR; STELLARIS_RAFT_ELECTION_TIMEOUT_MS=$ELECTION_MS nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"; }
 find_leader(){ L=""; for _ in $(seq 1 120); do for i in 0 1 2; do if status "$i" >/dev/null 2>&1; then L=$(status "$i" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("leader") or "")'); [[ -n "$L" ]] && return 0; fi; done; sleep 0.5; done; return 1; }
 snapshot_ok(){ local i=$1; ssh -o BatchMode=yes "${hosts[$i]}" "curl -fsS -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/snapshot?node=$NODE'" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("snapshot members ok")'; }
 wait_all(){ for _ in $(seq 1 120); do local ok=1; for j in 0 1 2; do status "$j" >/dev/null 2>&1 || ok=0; done; [[ "$ok" == 1 ]] && return 0; sleep 0.5; done; return 1; }

@@ -58,24 +58,28 @@
 
 ---
 
-## 3. 三地 rolling restart 失败（高优先级）
+## 3. 三地 rolling restart：已通过，配置待产品化
 
-环境：Shenzhen/Shanghai/Chengdu 各一个 controller，公网 5701/5801 + mTLS。
+已用 Shenzhen/Shanghai/Chengdu 三地公网 + mTLS 跑通：
 
-现象：
+- follower 逐个重启
+- leader 最后重启
+- 新 leader 选出
+- 旧 leader 重新加入
 
-- follower 2/3 重启后仍可写
-- follower 3 重启时 leader 从 1 切到 2
-- kill leader 2 后，node1/node3 都 `leader:null`
-- 80s 无新 leader
+根因：默认 `election_timeout_min=150ms` 对跨地域 vote RPC 太短，出现 `timeout after 150ms when Vote`；设置：
 
-需要：
+```text
+STELLARIS_RAFT_ELECTION_TIMEOUT_MS=1000
+```
 
-- 开 Raft debug/tracing
-- 已观察到：node1 vote T123-N3，node3 vote T125-N3，两者 last_applied 都是 T22-N2/index5；node3 可 TCP 连到 node1，但仍反复选举
-- 是否 follower 重启后 log 落后导致无法赢得选举
-- 是否测试脚本在重启后错误地杀掉/未启动节点
-- 是否 rolling restart 顺序/选举超时需要调整
+后通过。
+
+仍需：
+
+- 把选举超时暴露为正式 TOML 配置，而不是仅环境变量
+- 在滚动重启期间制造 >4MiB snapshot transfer，验证真实 transfer 续传
+- 观测 WAN 丢包/抖动下的选举稳定性
 
 ## 3.1 其他后续
 

@@ -1419,6 +1419,36 @@ async fn raft_server_config(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn raft_timing_config(config: Arc<openraft::Config>) -> Arc<openraft::Config> {
+    let Ok(raw) = std::env::var("STELLARIS_RAFT_ELECTION_TIMEOUT_MS") else {
+        return config;
+    };
+    let Ok(min) = raw.parse::<u64>() else {
+        tracing::warn!(value = %raw, "invalid STELLARIS_RAFT_ELECTION_TIMEOUT_MS");
+        return config;
+    };
+    let min = min.max(50);
+    let mut adjusted = (*config).clone();
+    adjusted.election_timeout_min = min;
+    adjusted.election_timeout_max = min.saturating_mul(2);
+    adjusted.heartbeat_interval = (min / 4).max(10);
+    match adjusted.validate() {
+        Ok(config) => {
+            tracing::info!(
+                election_timeout_min = min,
+                election_timeout_max = min.saturating_mul(2),
+                "adjusted raft election timing"
+            );
+            Arc::new(config)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "adjusting raft election timing failed");
+            config
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn start_http_node_at(
     model: ControllerModel,
     id: u64,
@@ -1430,6 +1460,7 @@ async fn start_http_node_at(
     config: Arc<openraft::Config>,
     tls: Option<RaftTlsConfig>,
 ) -> anyhow::Result<HttpRaftNode> {
+    let config = raft_timing_config(config);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
     let address = peers
