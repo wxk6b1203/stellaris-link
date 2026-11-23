@@ -107,7 +107,34 @@ cargo test                                                 111 passed
 - `scripts/test-real-crossbatch-direct.sh`
 - `scripts/test-real-crossbatch-relay.sh`
 
-### 2.4 Docker 与 PMTUD 现状
+### 2.4 成都 netns PMTUD 实验
+
+主机：47.109.58.88，4C/8G，Ubuntu 6.8。
+
+拓扑：
+
+```text
+a --1500-- r1 --1400-- r2 --1300-- b
+```
+
+实测：
+
+| 测试 | 结果 |
+|---|---|
+| agent underlay path MTU / TUN | 1224 / 1176 |
+| 2000-byte overlay ping | 0% loss |
+| 2 MiB TCP over overlay | 2,097,152 bytes |
+| tracepath 逐跳 | pmtu 1400 → 1300 |
+| 1450-byte DF | R1 回 PTB 1400 |
+| 1378-byte DF | R2 回 PTB 1300 |
+| R2 丢 PTB 黑洞 | 100% loss，无 1300 PTB |
+| 恢复 PTB | 1300 PTB，1272-byte ping 通过 |
+
+脚本：
+
+- `scripts/test-netns-pmtud-lab.sh`
+
+### 2.5 Docker 与 PMTUD 现状
 
 Docker：
 
@@ -142,7 +169,7 @@ PMTUD：
 |---|---|---|
 | 强制 multipath | ❌ | 只验证 direct→relay；没有双 direct/双 relay 同时可用与路径选择测试 |
 | 3/3 全路径 roaming | ⚠️ | 批1 最后一次一个 peer relay、一个 direct；脚本仍只断言一个 peer |
-| 完整 PMTUD | ⚠️ | source PTB + TCP MSS + TUN 自适应已验证；真实下游 PTB 黑洞/逐跳 MTU 未测 |
+| 完整 PMTUD | ✅ | netns 1500/1400/1300 + tracepath + PTB 黑洞/恢复已跑通 |
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ❌ | 三台同 VPC，只走私网；没有公网入站/跨 NAT 测试 |
 | 磁盘满/撕裂写 | ❌ | 只读目录测试已做；没有 ENOSPC/partially written log |
