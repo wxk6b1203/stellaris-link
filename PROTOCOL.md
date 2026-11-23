@@ -555,9 +555,7 @@ Member 配置：
 
 ```toml
 [control]
-url = "http://127.0.0.1:7800"   # 单 controller
-# 或多个 active-active controller：
-# urls = ["http://10.0.0.1:7800", "http://10.0.0.2:7800"]
+url = "http://127.0.0.1:7800"   # 单入口；后端可以是 Raft leader/负载均衡
 secret = "change-me"
 ```
 

@@ -205,9 +205,8 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     } else {
         (None, None)
     };
-    let control_configured = state.config.control.url.is_some()
-        || !state.config.control.urls.is_empty()
-        || state.config.control.endpoint_id.is_some();
+    let control_configured =
+        state.config.control.url.is_some() || state.config.control.endpoint_id.is_some();
     let want_transport = state.config.dataplane.enabled
         || !state.config.peers.is_empty()
         || control_configured
@@ -247,20 +246,13 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
         tracing::info!("dataplane/transport disabled; API-only mode");
     }
 
-    if state.config.control.url.is_some()
-        || !state.config.control.urls.is_empty()
-        || state.config.control.endpoint_id.is_some()
-    {
+    if state.config.control.url.is_some() || state.config.control.endpoint_id.is_some() {
         let state = state.clone();
-        let urls = if state.config.control.urls.is_empty() {
-            state.config.control.url.clone().into_iter().collect()
-        } else {
-            state.config.control.urls.clone()
-        };
+        let base = state.config.control.url.clone();
         let secret = state.config.control.secret.clone();
         let transport = transport_handle.clone();
         tokio::spawn(async move {
-            control_client::run(state, urls, secret, transport).await;
+            control_client::run(state, base, secret, transport).await;
         });
     }
 

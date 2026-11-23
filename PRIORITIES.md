@@ -1,6 +1,6 @@
 # 优先级评估与下一步路线
 
-> 版本：2026-11-22
+> 版本：2026-11-23
 > 关联：[OPENRAFT-HA.md](OPENRAFT-HA.md)、[PLAN.md](PLAN.md)、[README.md](README.md)
 > 目的：在继续加功能前，先判断什么最该做、什么可以等。
 
@@ -33,16 +33,16 @@
 
 | 能力 | 状态 | 主要缺口 |
 |---|---|---|
-| L3 overlay / TUN | 可用 | IPv4 only；macOS 未回归；无 IPv6 分片 |
-| iroh 传输 | 可用 | 默认公共 relay；无应用层成员认证 |
-| link-state/SPF | 可用 | UDP/mDNS discovery、static seed、controller；无跨区拓扑优化 |
+| L3 overlay / TUN | 可用 | IPv4/IPv6；应用层重组/完整 PMTUD 未做；macOS NAT 未做 |
+| iroh 传输 | 可用 | direct/relay、relay failover、PSK 成员认证；multipath 强制测试待做 |
+| link-state/SPF | 可用 | UDP/mDNS discovery、static seed、controller；跨区拓扑优化待做 |
 | controller | 可用 | openraft 3 节点 + HTTP/mTLS + snapshot + failover |
-| ACL | 可用 | 配置/API/UI；无 counters/日志审计 |
-| QoS | 可用 | DSCP + token bucket + 优先级队列；无整形/队列配置 |
+| ACL | 可用 | counters/审计/每规则命中已做；UI 待扩展 |
+| QoS | 可用 | DSCP + token bucket + 全局/per-priority/per-class queue depth/bytes |
 | AZ | 可用 | 同 zone pref + cross-zone penalty；无 policy engine/故障域 |
-| 安全 | 可用 | PSK/Ed25519、TLS、RBAC、轮换、持久化；openraft/quorum 待做 |
+| 安全 | 可用 | PSK/Ed25519/TLS/mTLS/RBAC/轮换/持久化/openraft quorum；审计待做 |
 | 多网络 | 可用 | 进程级隔离 + 单进程多 runtime；共享 endpoint 待做 |
-| 真实主机测试 | 可用 | 3 节点 controller+TUN 0% loss；chaos/规模待做 |
+| 真实主机测试 | 可用 | 真实物理三主机 HA/overlay/IPv6/roaming；公共 NAT/大规模待做 |
 | 可观测性 | 可用 | metrics/audit/每规则命中；tracing/dashboard 待做 |
 
 ---
@@ -58,7 +58,7 @@
 | **P1** | 多网络/多租户隔离 | 高 | 无法一个 agent 接入多个 overlay；产品能力缺失 | L | NetworkId/FIB/TUN | **完成：进程级隔离 + 单进程多 runtime + 凭证隔离测试** |
 | **P1** | ACL/QoS 生产化 | 中高 | 无法定位丢包；队列满静默丢；无 SLA | M | 现有 policy | **完成：queue_depth/counters/byte shaping/审计/每规则命中** |
 | **P1** | RoutePolicy/AZ 高级策略 | 中 | `RoutePolicy` 已执行；无故障域自动 failover | M | 状态机/策略引擎 | **完成：policy engine + AZ region + failover 测试** |
-| **P2** | openraft HA | 高（长期） | 单 controller/ fanout 无 split-brain 保护 | XL | P0 安全 + 确定性状态机 | **完成：3 节点/mTLS/failover/partition/crash** |
+| **P2** | openraft HA | 高（长期） | 单 controller 无 split-brain 保护 | XL | P0 安全 + 确定性状态机 | **完成：3 节点/mTLS/failover/partition/crash** |
 | **P2** | mDNS | 中 | 部署便利性 | M | P1 | **完成：Docker bridge + macvlan 物理 LAN 验证** |
 | **P2** | 共享 endpoint 多网络 / tracing | 中 | 可观测性和部署增强 | L | P1 | 后续增强 |
 | **P2** | metrics/audit/tracing | 中高 | 线上不可观测、不可审计 | M | 无 | **metrics + ACL audit 已做；tracing 待做** |
@@ -113,46 +113,34 @@ Raft 保证“副本一致”，不保证“写入合法”。所以先做：
 
 ---
 
-## 6. 建议的两周计划
+## 6. 后续硬化计划
 
-### Sprint A（P0）
+已完成：
 
-- Day 1-3：成员认证/Hello + 控制帧签名
-- Day 3-5：前缀授权 + controller key 签名（替代 shared HMAC 过渡）
-- Day 5-8：3 netns/3 主机真实集群测试
-- Day 8-10：失败注入 + 文档 + CI
+- controller openraft HA + mTLS + 真实物理三主机
+- IPv4/IPv6 overlay、NAT44/66、public exit
+- MSS/peer MTU/ICMP PTB、fragment ACL
+- relay failover、per-class queue
 
-### Sprint B（P1）
+剩余：
 
-- bootstrap/discovery（先 UDP broadcast/mDNS 选一个）
-- ACL/QoS counters + queue depth 配置
-- 多网络设计/原型（每网络独立 FIB/TUN/ACL）
-
-### 之后
-
-- openraft HA（按 [OPENRAFT-HA.md](OPENRAFT-HA.md) Phase 0→3）
-- 可观测性/打包/Windows
+1. 完整 PMTUD 状态机 / 应用层 fragment reassembly
+2. 强制 multipath（双接口/双路径）
+3. 磁盘满/撕裂写注入
+4. 公网 NAT/安全组矩阵
+5. Windows/macOS NAT、打包/service/upgrade、tracing/UI
 
 ---
 
-## 7. 如果一定要先做 openraft
+## 7. 当前重点
 
-可以，但请接受两个前置条件：
+**先把真实网络矩阵补齐，再扩平台。**
 
-1. 先做 `ControllerModel`/`Command` 确定性重构（1～2 周）；
-2. 至少做 controller 间身份认证（不能只靠 shared HMAC）。
-
-否则建议把 HA 目标拆成：
-
-- H0：确定性状态机（无 Raft）
-- H1：单节点 openraft shadow
-- H2：3 节点 Raft
-- H3：cutover + chaos
-
-每一步都可验收，不会出现“写了很多 Raft 代码但没人敢上线”。
+- 真实物理三主机已验证同 VPC 私网；下一步是跨 NAT/公网。
+- 数据面不要在没有 PMTUD/重组结论前宣称“生产完成”。
 
 ---
 
 ## 8. 一句话
 
-**先让系统“可信、可观测、可在真实网络工作”，再让它“高可用”。**
+**controller HA 已完成；剩余工作主要是数据面边界和跨平台验证。**

@@ -82,7 +82,7 @@ pub struct ControlConfig {
     /// Controller base URL for members (MVP: HTTP).
     #[serde(default)]
     pub url: Option<String>,
-    /// Multiple controllers for active-active fanout (HTTP MVP).
+    /// Deprecated: active-active fanout was removed. Non-empty is rejected.
     #[serde(default)]
     pub urls: Vec<String>,
     /// Controller listen address (controller role).
@@ -143,7 +143,7 @@ pub struct ControlConfig {
     /// Trusted controller NodeIds for verifying Ed25519 snapshots.
     #[serde(default)]
     pub controller_keys: Vec<String>,
-    /// Minimum distinct controller signatures for a snapshot (default 1).
+    /// Deprecated: fanout threshold was removed; only 1 is accepted.
     #[serde(default = "default_controller_threshold")]
     pub controller_threshold: usize,
     /// Optional controller-side member allowlist / prefix grants.
@@ -385,12 +385,12 @@ fn default_cross_zone_penalty() -> u32 {
     20
 }
 
-fn default_controller_threshold() -> usize {
-    1
-}
-
 fn default_true() -> bool {
     true
+}
+
+fn default_controller_threshold() -> usize {
+    1
 }
 
 fn default_manifest_ttl() -> u64 {
@@ -554,18 +554,6 @@ impl Config {
                 "control.manifest_ttl_secs must be > 0".into(),
             ));
         }
-        if self.control.controller_threshold == 0 {
-            return Err(ConfigError::Invalid(
-                "control.controller_threshold must be > 0".into(),
-            ));
-        }
-        if !self.control.controller_keys.is_empty()
-            && self.control.controller_threshold > self.control.controller_keys.len()
-        {
-            return Err(ConfigError::Invalid(
-                "control.controller_threshold exceeds controller_keys".into(),
-            ));
-        }
         for key in &self.control.controller_keys {
             key.parse::<NodeId>()
                 .map_err(|e| ConfigError::Invalid(format!("control.controller_keys: {e}")))?;
@@ -608,9 +596,15 @@ impl Config {
                 "control.tls_cert and control.tls_key must be set together".into(),
             ));
         }
-        if self.control.raft_dir.is_some() && !self.control.urls.is_empty() {
+        if !self.control.urls.is_empty() {
             return Err(ConfigError::Invalid(
-                "control.raft_dir and control.urls (legacy fanout) are mutually exclusive".into(),
+                "control.urls (legacy fanout) was removed; use a single control.url in front of Raft"
+                    .into(),
+            ));
+        }
+        if self.control.controller_threshold != 1 {
+            return Err(ConfigError::Invalid(
+                "control.controller_threshold (legacy fanout) was removed".into(),
             ));
         }
         let mut join_tokens = HashSet::new();
@@ -859,11 +853,11 @@ cidr = "10.7.0.0/16"
 }
 
 #[cfg(test)]
-mod raft_mode_tests {
+mod deprecated_control_tests {
     use super::*;
 
     #[test]
-    fn raft_mode_rejects_legacy_fanout() {
+    fn legacy_fanout_urls_are_rejected() {
         let toml = r#"
 [node]
 name = "c"
@@ -874,8 +868,22 @@ name = "demo"
 cidr = "10.7.0.0/16"
 [control]
 secret = "s"
-raft_dir = "/tmp/stellaris-raft-config-test/raft"
 urls = ["http://127.0.0.1:7800"]
+"#;
+        assert!(Config::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn legacy_fanout_threshold_is_rejected() {
+        let toml = r#"
+[node]
+name = "a"
+overlay_ip = "10.7.0.1"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[control]
+controller_threshold = 2
 "#;
         assert!(Config::from_toml(toml).is_err());
     }

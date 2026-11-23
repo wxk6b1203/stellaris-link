@@ -2,31 +2,33 @@
 
 **A fully controllable, Rust-native L3 overlay network with optional control plane, per-node route query, and route adjustment.**
 
-> 状态：**P0/P1 MVP 已完成**（2026-11-22）。成员/前缀授权、controller 签名与 threshold、真实 3 节点 controller+TUN、UDP discovery、多网络进程级隔离、ACL/QoS counters/整形/审计、RoutePolicy/AZ 均已落地。openraft HA 属 P2，设计见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
+> 状态：**controller HA + P1 数据面生产化基线已完成**（2026-11-23）。3 节点 openraft/mTLS/快照/故障恢复、真实物理三主机 HA、IPv4/IPv6 overlay、NAT44/66、public exit、MSS/MTU/PTB、fragment ACL、relay failover、per-class queue 均已落地。设计记录见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。
 
 ## MVP 已实现
 
 - **路由引擎**：Intent / RIB / FIB 四层；LPM、admin distance、local_pref、metric、ECMP、pin、drain、reset、dry-run、generation、持久化。
 - **HTTP API**：`/v1/status`、`/v1/peers`、`/v1/routes`、`/v1/routes/lookup`、`/v1/routes/explain`、`/v1/routes/pin`、`/v1/routes/drain`、`/v1/routes/reset`、`/v1/routes/{id}`。
-- **controller**：`stellaris-controller` 下发 network-scope 静态路由与 link-state 计算路由；snapshot 带 epoch、member manifest（含 underlay addrs）、HMAC-SHA256 签名；member 校验后应用、自动发现/连接成员、回 ACK（ACK 持久化）；支持 **HTTP**、**iroh control protocol**，以及多 controller **active-active fanout（pre-Raft）**。
+- **controller**：openraft 3 节点 HA；HTTP Raft RPC + mTLS；snapshot/manifest 带 epoch、member、underlay addrs；leader failover、partition recovery、crash recovery；member 通过单个 controller URL 或 iroh control 接入，Raft 内部负责复制。
 - **Link-state 自动路由**：两种模式：① member 通过 iroh control stream 直接洪泛 LSA，节点本地 SPF；② controller 汇聚 LSA 并按节点计算。LSA 带 underlay `addrs`，节点会自动发现并连接新 peer；link metric 使用当前 RTT（每 5s 刷新 LSA）+ 跨 AZ penalty；LSA 30s 过期；等代价路径生成 ECMP；Ping/Pong heartbeat（2s/7s）自动撤回故障链路。
 - **ACL/QoS**：ACL allow/deny（方向、五元组、peer、zone、优先级）；QoS 按类设置 DSCP + 包速率/字节速率 token-bucket（`rate_pps/rate_bps`）+ egress 优先级队列（`qos.queue_depth` 可配，默认 4096）；`/v1/status` 暴露 ACL/QoS/转发 counters 和每 ACL 规则命中数 `acl_hits`；`/metrics` 提供 Prometheus counters/gauges；ACL 拒绝写 `stellaris_audit` 日志；可通过 `GET/PUT /v1/policy` 动态更新并持久化到 `state_dir/policy.json`；在 TUN 收发包路径执行。
 - **AZ 选路**：`zone` 标签 + 同 AZ `local_pref` 加成 + 跨 AZ link penalty（`routing.cross_zone_penalty`），`explain` 可见 zone。
 - **事件驱动 OS 路由**：RouteEngine 通过 `watch` 通知；非 overlay 前缀变更立即 reconcile，30s fallback。
 - **CLI**：`stellaris status`、`peer list`、`route list/lookup/explain/add/delete/pin/unpin/drain/reset`。
 - **传输**：iroh 1.5（QUIC）静态 peer；direct/relay 路径与 RTT 可见；固定 UDP 端口，便于 LAN/实验环境直连。
-- **数据面**：TUN（Linux/macOS）+ 16 字节 MeshHeader；IPv4 overlay；TTL/转发/anti-spoof；subnet gateway（a→b→c）；初始 MTU 1100 + 自适应；需要 root/CAP_NET_ADMIN。
+- **数据面**：TUN（Linux/macOS）+ 16 字节 MeshHeader；IPv4 + IPv6 overlay；TTL/转发/anti-spoof；subnet gateway；NAT44/NAT66 public exit；fragment 解析/ACL；TCP MSS clamp、peer path MTU、ICMPv4/v6 PTB；初始 MTU 1100 + 自适应；需要 root/CAP_NET_ADMIN。
 - **API/控制面**：非 loopback `api.bind` 必须配置 `api.token`；`api.read_token` 只允许读操作，写操作仍需要 admin token；`api.previous_tokens` / `control.previous_secrets` 支持轮换窗口；controller 可配置 `control.leader_id`，非 leader 拒绝写入；非 loopback `control.bind`/controller iroh 必须配置 `control.secret`。
-- **入网安全**：`network.auth.mode = "psk"` 双向 HMAC challenge/response + 可选 allowlist；controller snapshot 支持 Ed25519 签名；`control.members` 支持 allowlist/prefix grant；支持一次性 `control.join_token` → `POST /v1/join`；member 侧 LSA 前缀 grant 强制、数据面 source grant 强制（transit capability）、controller threshold、signed manifest/threshold、`POST /v1/revoke` 已实现。
+- **入网安全**：`network.auth.mode = "psk"` 双向 HMAC challenge/response + 可选 allowlist；controller snapshot 支持 Ed25519 签名；`control.members` 支持 allowlist/prefix grant；一次性 `control.join_token` → `POST /v1/join`；member 侧 LSA 前缀 grant 强制、数据面 source grant 强制（transit capability）、`POST /v1/revoke`；join token 配置 hash 入 Raft，配置不一致 join 409。
 - **RoutePolicy**：配置化 policy engine（Accept/Deny/SetLocalPref/SetMetric/SetAdminDistance/SetWeight），在 RIB→FIB 前执行；AZ 用 `region`/`zone` 匹配。
-- **测试**：FIB/路由/持久化/报文解析/数据面决策/ACL/QoS/API 鉴权/controller 签名/SPF 单元测试；`demo-two-node.sh` 双节点 iroh；`docker-two-node-tun.sh` 双容器 TUN；`docker-subnet-gateway.sh` a→b→c 1000B ping；`demo-linkstate.sh`/`demo-distributed-linkstate.sh` 自动路由与 `TEST_FAILOVER=1` 撤路；`demo-iroh-controller.sh` iroh control；`demo-controller-discovery.sh` controller 自动发现成员。
+- **测试**：FIB/路由/持久化/报文解析/数据面决策/ACL/QoS/API 鉴权/controller 签名/SPF 单元测试；`demo-two-node.sh` 双节点 iroh；`docker-two-node-tun.sh` 双容器 TUN；`docker-subnet-gateway.sh` a→b→c 1000B ping；`demo-linkstate.sh`/`demo-distributed-linkstate.sh` 自动路由与 `TEST_FAILOVER=1` 撤路；`demo-iroh-controller.sh` iroh control；`demo-controller-discovery.sh` controller 自动发现成员；`test-real-3host-ha.sh` / `test-real-3host-overlay.sh` / `test-real-3host-ipv6.sh` / `test-real-3host-roaming.sh` 真实物理三主机 HA、IPv4/IPv6、roaming。
 
-## 未实现（下一步）
+## 尚未实现（剩余硬化）
 
-- 完整 controller：openraft quorum/leader election（当前 HTTP/iroh + 多 controller fanout + HMAC + epoch/manifest + 持久化 ACK）。
-- 初始 seed 仍来自静态 peer 配置；LSA 会自动发现/连接新 peer，但没有 mDNS/广播发现。
-- ACL/QoS 的真实队列/整形（当前有 API + token-bucket rate limit + DSCP + 优先级队列，队列深度 4096）。
+- 真实物理三主机 controller/overlay 已完成；真实物理 **多路径/公网 NAT** 仍待覆盖。
+- 完整 PMTUD 状态机（现有 peer path MTU + MSS + ICMP PTB）。
+- 应用层 fragment reassembly（当前依赖目的端内核重组）。
+- 强制 multipath（已有 direct→relay roaming）。
+- 磁盘满/撕裂写注入（只读磁盘已测）。
 - 多网络、Windows、低功耗 gateway/leaf、macOS NAT。
 
 ## 快速开始
@@ -131,7 +133,7 @@ curl -X POST http://127.0.0.1:7800/v1/routes \
   -d '{"prefix":"10.99.0.0/16","via":"0202020202020202020202020202020202020202020202020202020202020202","metric":5}'
 ```
 
-当前限制：HTTP/iroh 都已支持，shared secret/HMAC + epoch/manifest + 持久化 ACK；仍无 openraft HA；peer 仍靠静态配置。
+当前限制：HTTP/iroh 都已支持；controller 使用 openraft quorum；peer 初始仍靠静态配置。
 
 ### 7. controller 自动发现成员（无静态 peer）
 
@@ -146,21 +148,25 @@ curl -X POST http://127.0.0.1:7800/v1/routes \
 - member 从 snapshot 自动 `add_peer` 并建立 iroh 连接
 - 脚本检查 `peer list` 出现 `auto-*` 且 `connected: true`
 
-### 8. 多 controller active-active fanout（pre-Raft）
+### 8. Raft controller HA（真实三节点）
 
 ```bash
-./scripts/demo-controller-ha.sh
+# 本机 3 进程 Raft
+./scripts/test-controller-raft-3node.sh
+
+# 真实 LAN macvlan 3 controller + mTLS
+PARENT=eth0 SUBNET=... ./scripts/test-docker-controller-raft-macvlan.sh
 ```
 
-member 配置多个 HTTP controller：
+member 只配置一个入口：
 
 ```toml
 [control]
-urls = ["http://10.0.0.1:7800", "http://10.0.0.2:7800"]
+url = "http://10.0.0.1:7800"
 secret = "change-me"
 ```
 
-member 会把 LSA 发给所有 controller、从最新 snapshot 应用、并向所有 controller 回 ACK；单个 controller 挂掉不影响 member。当前是 **active-active fanout，不是 Raft consensus**；openraft HA 是下一步。
+controller 集群内部通过 `raft_peers` + mTLS 复制。旧 `control.urls` active-active fanout 已移除；配置中出现会直接报错。
 
 ### 9. iroh controller demo（不需要 HTTP 轮询）
 
@@ -444,12 +450,13 @@ tls_ca = "/path/ca.pem"
 
 TLS 只保护 HTTP 控制面；认证仍走 API token / `control.secret`。证书需使用 CA 签发的 server cert，不要把 CA 证书直接当 leaf 使用。
 
-### 23. 多 controller threshold
+### 23. 旧 fanout/threshold 已移除
 
-```bash
-./scripts/demo-controller-threshold.sh
-# OK: member applied a 2-controller threshold snapshot.
-```
+`control.urls` 和 `control.controller_threshold` 不再是有效配置：
+
+- 非空 `control.urls` 会配置报错
+- `control.controller_threshold != 1` 会配置报错
+- 多 controller 一致性由 openraft 负责
 
 ### 24. 真正的 TUN overlay（两台机器，需要 root）
 
@@ -514,12 +521,13 @@ examples/               # 示例 TOML
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 完整实现架构与后续模块 |
 | [PROTOCOL.md](PROTOCOL.md) | 控制协议/API/MeshHeader |
 | [PLAN.md](PLAN.md) | 里程碑、Epic、第一 sprint |
+| [GAPS.md](GAPS.md) | 能力/测试审计与未验证项 |
 | [ADVANCED-ROUTING.md](ADVANCED-ROUTING.md) | 静态路由、AZ 分段、subnet gateway 设计 |
 | [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
 | [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) | 入网、成员授权、前缀授权设计 |
 | [MULTI-NETWORK.md](MULTI-NETWORK.md) | 多网络隔离与单进程多网络设计 |
 | [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md) | 真实局域网 mDNS 验证记录 |
-| [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 详细设计（未实现） |
+| [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 设计与实现记录 |
 | [examples/policy.toml](examples/policy.toml) | ACL/QoS 配置示例 |
 | [scripts/demo-linkstate.sh](scripts/demo-linkstate.sh) | controller-mediated link-state 演示 |
 | [scripts/demo-distributed-linkstate.sh](scripts/demo-distributed-linkstate.sh) | 分布式 LSA/SPF 演示 |
@@ -529,13 +537,13 @@ examples/               # 示例 TOML
 
 ## 已知限制
 
-- controller 支持 HTTP/iroh + 多 controller fanout（HMAC + epoch/manifest + 持久化 ACK），但无 openraft quorum/leader election；peer 初始仍靠静态配置。
-- 数据面 IPv4 overlay；IPv6 路由类型已支持但 TUN 数据面未启用。
-- 初始 bootstrap 仍需要 controller URL 或静态 peer；之后可由 controller manifest/LSA `overlay_ip/addrs` 自动发现/连接；没有 mDNS 发现/HA。
+- controller 已完成 openraft quorum/leader election/mTLS/snapshot/failover；member 入口仍是单 URL（可指向 LB/任一 controller）。旧 fanout 已移除。
+- 数据面 IPv4/IPv6 overlay 已启用；应用层 fragment reassembly/完整 PMTUD 状态机仍未实现。
+- 初始 bootstrap 仍需要 controller URL 或静态 peer；之后可由 controller manifest/LSA `overlay_ip/addrs` 自动发现/连接。
 - `scope=network` 已支持（MVP HTTP controller）；本地 `scope=local` 仍用于实验/紧急路由。
-- ACL/QoS 支持 API 动态更新 + token-bucket rate limit + DSCP；没有 UI、队列/整形。anti-spoof 允许 peer 自身 overlay IP + 它广告的前缀；subnet gateway 的 NAT 目前仅 Linux（macOS 待做），且 NAT 规则退出清理/owner 管理待完善。
-- **没有应用层成员认证/Hello 握手**：任何知道 endpoint id/ALPN 的 iroh 节点都能建立 QUIC 连接；数据包会被 anti-spoof 丢掉，但不要把这个 MVP 暴露在不可信网络。
-- iroh 使用默认公共 relay；生产应改 `RelayMode::Custom` 自建 relay。
+- ACL/QoS 支持 API 动态更新 + token-bucket + per-priority/per-class queue depth/bytes + DSCP；没有 UI。anti-spoof 允许 peer 自身 overlay IP + 它广告的前缀；subnet gateway 的 NAT66 目前仅 Linux（macOS 待做）。
+- **控制帧没有 per-member 签名/Hello 挑战**：iroh 连接有 `network.auth.mode = "psk"` 双向认证，但控制帧本身没有逐成员签名；不要把这个 MVP 直接暴露在不可信网络。
+- iroh 默认公共 relay 已验证 failover；生产建议自建 relay。
 - 没有做安全审计；MVP 仅用于开发/实验。
 
 ## 贡献

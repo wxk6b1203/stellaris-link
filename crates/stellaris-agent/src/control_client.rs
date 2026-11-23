@@ -2,7 +2,6 @@
 //!
 //! Both transports carry the same signed snapshot / LSA / ACK data model.
 
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -10,7 +9,6 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
     endpoint::presets,
 };
-use sha2::{Digest, Sha256};
 use stellaris_linkstate::{Link, Lsa, Prefix};
 use stellaris_types::NodeId;
 
@@ -21,29 +19,25 @@ use crate::transport::IrohTransport;
 
 pub async fn run(
     state: AgentState,
-    urls: Vec<String>,
+    base: Option<String>,
     secret: Option<String>,
     transport: Option<std::sync::Arc<IrohTransport>>,
 ) {
     if state.config.control.endpoint_id.is_some() {
         run_iroh(state, secret, transport).await;
-    } else {
-        run_http(state, urls, secret, transport).await;
+    } else if let Some(base) = base {
+        run_http(state, base, secret, transport).await;
     }
 }
 
 async fn run_http(
     state: AgentState,
-    urls: Vec<String>,
+    base: String,
     secret: Option<String>,
     transport: Option<std::sync::Arc<IrohTransport>>,
 ) {
-    let bases: Vec<String> = urls
-        .into_iter()
-        .map(|url| url.trim_end_matches('/').to_string())
-        .filter(|url| !url.is_empty())
-        .collect();
-    if bases.is_empty() {
+    let base = base.trim_end_matches('/').to_string();
+    if base.is_empty() {
         return;
     }
     let client = match http_client(&state.config) {
@@ -60,81 +54,73 @@ async fn run_http(
     let mut seq = 0u64;
     loop {
         if !joined && state.config.control.join_token.is_some() {
-            joined = try_join(&client, &bases, &state, secret.as_deref()).await;
+            joined = try_join(&client, &base, &state, secret.as_deref()).await;
         }
         if !state.config.control.controller_keys.is_empty()
             && last_manifest.elapsed() >= Duration::from_secs(10)
-            && try_manifest(&client, &bases, &state, secret.as_deref()).await
+            && try_manifest(&client, &base, &state, secret.as_deref()).await
         {
             last_manifest = Instant::now();
         }
         if last_lsa.elapsed() >= Duration::from_secs(10) {
             seq = seq.max(now_seq());
             let lsa = local_lsa(&state, seq);
-            let mut accepted = false;
-            for base in &bases {
-                let mut request = client.post(format!("{base}/v1/lsa"));
-                if let Some(secret) = &secret {
-                    request = request.header("x-stellaris-secret", secret);
-                }
-                match request.json(&lsa).send().await {
-                    Ok(response) if response.status().is_success() => accepted = true,
-                    Ok(response) => {
-                        tracing::debug!(base, status = %response.status(), "controller rejected LSA")
-                    }
-                    Err(e) => tracing::debug!(base, error = ?e, "controller LSA unreachable"),
-                }
-            }
-            if accepted {
-                last_lsa = Instant::now();
-            }
-        }
-
-        let mut snapshots: Vec<Snapshot> = Vec::new();
-        for base in &bases {
-            let mut request = client.get(format!("{base}/v1/snapshot?node={}", state.node_id));
+            let mut request = client.post(format!("{base}/v1/lsa"));
             if let Some(secret) = &secret {
                 request = request.header("x-stellaris-secret", secret);
             }
-            match request.send().await {
+            match request.json(&lsa).send().await {
                 Ok(response) if response.status().is_success() => {
-                    match response.json::<Snapshot>().await {
-                        Ok(snapshot) => {
-                            if verify_snapshot(&state, secret.as_deref(), &snapshot) {
-                                snapshots.push(snapshot);
-                            } else {
-                                tracing::warn!(base, "controller snapshot rejected");
-                            }
-                        }
-                        Err(e) => tracing::warn!(base, error = %e, "invalid controller snapshot"),
-                    }
+                    last_lsa = Instant::now();
                 }
                 Ok(response) => {
-                    tracing::warn!(base, status = %response.status(), "controller snapshot rejected")
+                    tracing::debug!(%base, status = %response.status(), "controller rejected LSA")
                 }
-                Err(e) => tracing::debug!(base, error = ?e, "controller unreachable"),
+                Err(e) => tracing::debug!(%base, error = ?e, "controller LSA unreachable"),
             }
         }
 
-        if let Some(snapshot) = select_threshold(&state, snapshots)
+        let mut snapshot = None;
+        let mut request = client.get(format!("{base}/v1/snapshot?node={}", state.node_id));
+        if let Some(secret) = &secret {
+            request = request.header("x-stellaris-secret", secret);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Snapshot>().await {
+                    Ok(candidate) => {
+                        if verify_snapshot(&state, secret.as_deref(), &candidate) {
+                            snapshot = Some(candidate);
+                        } else {
+                            tracing::warn!(%base, "controller snapshot rejected");
+                        }
+                    }
+                    Err(e) => tracing::warn!(%base, error = %e, "invalid controller snapshot"),
+                }
+            }
+            Ok(response) => {
+                tracing::warn!(%base, status = %response.status(), "controller snapshot rejected")
+            }
+            Err(e) => tracing::debug!(%base, error = ?e, "controller unreachable"),
+        }
+
+        if let Some(snapshot) = snapshot
             && let Some((generation, epoch)) =
                 apply_verified_snapshot(&state, snapshot, last_generation, transport.as_ref())
         {
             last_generation = generation;
-            for base in &bases {
-                let mut ack = client.post(format!("{base}/v1/ack"));
-                if let Some(secret) = &secret {
-                    ack = ack.header("x-stellaris-secret", secret);
-                }
-                let _ = ack
-                    .json(&serde_json::json!({
-                        "node": state.node_id.to_string(),
-                        "generation": generation,
-                        "epoch": epoch,
-                    }))
-                    .send()
-                    .await;
+            let mut ack = client.post(format!("{base}/v1/ack"));
+            if let Some(secret) = &secret {
+                ack = ack.header("x-stellaris-secret", secret);
             }
+            let _ = ack
+                .json(&serde_json::json!({
+                    "node": state.node_id.to_string(),
+                    "generation": generation,
+                    "epoch": epoch,
+                }))
+                .send()
+                .await;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -236,7 +222,6 @@ async fn run_iroh(
             match request(&conn, &req).await {
                 Ok(Response::Snapshot { snapshot }) => {
                     if verify_snapshot(&state, secret.as_deref(), &snapshot)
-                        && let Some(snapshot) = select_threshold(&state, vec![snapshot])
                         && let Some((generation, epoch)) = apply_verified_snapshot(
                             &state,
                             snapshot,
@@ -292,7 +277,7 @@ fn http_client(config: &stellaris_types::Config) -> anyhow::Result<reqwest::Clie
 
 async fn try_manifest(
     client: &reqwest::Client,
-    bases: &[String],
+    base: &str,
     state: &AgentState,
     secret: Option<&str>,
 ) -> bool {
@@ -300,72 +285,43 @@ async fn try_manifest(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut verified: Vec<(crate::controller::MembershipManifest, NodeId)> = Vec::new();
-    for base in bases {
-        let mut request = client.get(format!("{base}/v1/manifest"));
-        if let Some(secret) = secret {
-            request = request.header("x-stellaris-secret", secret);
-        }
-        match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                match response
-                    .json::<crate::controller::MembershipManifest>()
-                    .await
-                {
-                    Ok(manifest) => {
-                        if let Some(controller) = verify_manifest(state, &manifest, now) {
-                            verified.push((manifest, controller));
-                        }
+    let mut request = client.get(format!("{base}/v1/manifest"));
+    if let Some(secret) = secret {
+        request = request.header("x-stellaris-secret", secret);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            match response
+                .json::<crate::controller::MembershipManifest>()
+                .await
+            {
+                Ok(manifest) => {
+                    if verify_manifest(state, &manifest, now).is_none() {
+                        return false;
                     }
-                    Err(e) => tracing::warn!(base, error = %e, "invalid manifest"),
+                    state.set_grants(&manifest.members);
+                    tracing::debug!(
+                        generation = manifest.generation,
+                        members = manifest.members.len(),
+                        "applied signed membership manifest"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(%base, error = %e, "invalid manifest");
+                    false
                 }
             }
-            Ok(response) => tracing::debug!(base, status = %response.status(), "manifest rejected"),
-            Err(e) => tracing::debug!(base, error = %e, "manifest unreachable"),
+        }
+        Ok(response) => {
+            tracing::debug!(%base, status = %response.status(), "manifest rejected");
+            false
+        }
+        Err(e) => {
+            tracing::debug!(%base, error = %e, "manifest unreachable");
+            false
         }
     }
-    if verified.is_empty() {
-        return false;
-    }
-    let threshold = state.config.control.controller_threshold.max(1);
-    let selected = if threshold <= 1 {
-        verified
-            .into_iter()
-            .max_by_key(|(m, _)| (m.epoch, m.generation))
-            .map(|(m, _)| m)
-    } else {
-        let mut groups: HashMap<
-            [u8; 32],
-            (crate::controller::MembershipManifest, HashSet<NodeId>),
-        > = HashMap::new();
-        for (manifest, controller) in verified {
-            let bytes = crate::controller::manifest_agreement_bytes(&manifest);
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            let hash: [u8; 32] = hasher.finalize().into();
-            groups
-                .entry(hash)
-                .or_insert_with(|| (manifest.clone(), HashSet::new()))
-                .1
-                .insert(controller);
-        }
-        groups
-            .into_values()
-            .filter(|(_, signers)| signers.len() >= threshold)
-            .map(|(manifest, _)| manifest)
-            .max_by_key(|m| (m.epoch, m.generation))
-    };
-    let Some(manifest) = selected else {
-        tracing::warn!("not enough distinct controller manifest signatures");
-        return false;
-    };
-    state.set_grants(&manifest.members);
-    tracing::debug!(
-        generation = manifest.generation,
-        members = manifest.members.len(),
-        "applied signed membership manifest"
-    );
-    true
 }
 
 fn verify_manifest(
@@ -403,7 +359,7 @@ fn verify_manifest(
 
 async fn try_join(
     client: &reqwest::Client,
-    bases: &[String],
+    base: &str,
     state: &AgentState,
     secret: Option<&str>,
 ) -> bool {
@@ -414,28 +370,30 @@ async fn try_join(
         tracing::warn!("join_token requires node.overlay_ip");
         return true;
     };
-    let mut accepted = false;
-    for base in bases {
-        let mut request = client
-            .post(format!("{base}/v1/join"))
-            .json(&serde_json::json!({
-                "node_id": state.node_id.to_string(),
-                "overlay_ip": overlay.to_string(),
-                "token": token,
-            }));
-        if let Some(secret) = secret {
-            request = request.header("x-stellaris-secret", secret);
+    let mut request = client
+        .post(format!("{base}/v1/join"))
+        .json(&serde_json::json!({
+            "node_id": state.node_id.to_string(),
+            "overlay_ip": overlay.to_string(),
+            "token": token,
+        }));
+    if let Some(secret) = secret {
+        request = request.header("x-stellaris-secret", secret);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            tracing::info!(%base, "controller admitted member");
+            true
         }
-        match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                accepted = true;
-                tracing::info!(base, "controller admitted member");
-            }
-            Ok(response) => tracing::warn!(base, status = %response.status(), "join rejected"),
-            Err(e) => tracing::debug!(base, error = %e, "join request failed"),
+        Ok(response) => {
+            tracing::warn!(%base, status = %response.status(), "join rejected");
+            false
+        }
+        Err(e) => {
+            tracing::debug!(%base, error = %e, "join request failed");
+            false
         }
     }
-    accepted
 }
 
 fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot) -> bool {
@@ -491,50 +449,6 @@ fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot
     } else {
         true
     }
-}
-
-fn select_threshold(state: &AgentState, snapshots: Vec<Snapshot>) -> Option<Snapshot> {
-    if snapshots.is_empty() {
-        return None;
-    }
-    let threshold = if state.config.control.controller_keys.is_empty() {
-        1
-    } else {
-        state.config.control.controller_threshold.max(1)
-    };
-    if threshold <= 1 {
-        return snapshots
-            .into_iter()
-            .max_by_key(|s| (s.epoch, s.generation));
-    }
-    let mut groups: HashMap<[u8; 32], (Snapshot, HashSet<NodeId>)> = HashMap::new();
-    for snapshot in snapshots {
-        let payload = crate::controller::snapshot_payload_bytes(
-            &snapshot.network_id,
-            snapshot.epoch,
-            snapshot.generation,
-            &snapshot.members,
-            &snapshot.routes,
-        );
-        let mut hasher = Sha256::new();
-        hasher.update(&payload);
-        let hash: [u8; 32] = hasher.finalize().into();
-        let entry = groups
-            .entry(hash)
-            .or_insert_with(|| (snapshot.clone(), HashSet::new()));
-        if let Some(signer) = snapshot
-            .signer
-            .as_deref()
-            .and_then(|s| s.parse::<NodeId>().ok())
-        {
-            entry.1.insert(signer);
-        }
-    }
-    groups
-        .into_values()
-        .filter(|(_, signers)| signers.len() >= threshold)
-        .map(|(snapshot, _)| snapshot)
-        .max_by_key(|s| (s.epoch, s.generation))
 }
 
 fn apply_verified_snapshot(
@@ -691,55 +605,5 @@ fn local_lsa(state: &AgentState, seq: u64) -> Lsa {
         prefixes,
         overlay_ip: state.config.node.overlay_ip,
         addrs: state.config.transport.advertise.clone(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use stellaris_types::{Config, NetworkId};
-
-    fn snapshot(network: NetworkId, signer: u8, generation: u64) -> Snapshot {
-        Snapshot {
-            network_id: network.to_string(),
-            epoch: 1,
-            generation,
-            members: Vec::new(),
-            routes: Vec::new(),
-            signer: Some(NodeId::new([signer; 32]).to_string()),
-            signature: None,
-            ed25519_signature: None,
-        }
-    }
-
-    #[test]
-    fn threshold_requires_distinct_controllers() {
-        let keys = [NodeId::new([1u8; 32]), NodeId::new([2u8; 32])];
-        let toml = format!(
-            r#"
-[node]
-name = "a"
-overlay_ip = "10.7.0.1"
-
-[network]
-name = "demo"
-cidr = "10.7.0.0/16"
-
-[control]
-controller_keys = ["{}", "{}"]
-controller_threshold = 2
-"#,
-            keys[0], keys[1]
-        );
-        let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
-        let network = state.network;
-        assert!(select_threshold(&state, vec![snapshot(network, 1, 1)]).is_none());
-        assert!(
-            select_threshold(
-                &state,
-                vec![snapshot(network, 1, 1), snapshot(network, 2, 1)]
-            )
-            .is_some()
-        );
     }
 }

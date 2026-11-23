@@ -1,8 +1,8 @@
-# Openraft Controller HA — 详细设计（未实现）
+# Openraft Controller HA — 设计、实现与迁移记录
 
-> 状态：H0 确定性模型 + H1 单节点持久化 + H2 3 节点 Raft/HTTP RPC/落盘 + controller API 写路径 + 3 controller 进程失败切换 + Raft TLS 已实现；mTLS、大 snapshot、真实多物理主机尚未完成。
-> 当前实现：单 controller + 多 controller active-active fanout（pre-Raft）+ signed snapshot + epoch/manifest + 持久化 ACK。
-> 目标：把 controller 从“内存状态 + fanout”升级为 **openraft 复制的确定性状态机**，提供 quorum、leader election、快照、成员变更和故障恢复。
+> 状态：H0–H4 已完成。3 节点 openraft、HTTP Raft、mTLS、分块 snapshot、leader failover、partition/crash recovery、真实物理三主机 HA 已实现。
+> 当前实现：openraft 复制的确定性状态机；member 通过单个 controller URL/iroh 入口接入；旧 active-active fanout 已移除。
+> 本文保留设计、迁移和验证记录。§8–§10 中标注“限制/尚未”的内容多为阶段记录；当前实现状态以本文顶部和 README/PLAN 为准。
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)。
 
 ---
@@ -274,13 +274,13 @@ If-Match: generation
 - epoch 不匹配 → 409/重新拉取；
 - ACK 只接受当前 epoch 的 leader snapshot。
 
-### 6.3 fanout 兼容
+### 6.3 fanout 迁移（已完成）
 
-保留 `control.urls`：
+旧 `control.urls` active-active fanout 已移除：
 
-- 迁移期 member 仍可 fanout；
-- controller 检测到 Raft 已启用时，follower 不再本地提交，只转发 leader；
-- 迁移完成后移除 fanout 写路径。
+- member 只配置一个 `control.url`（可指向 LB/任一 controller）；
+- 一致性由 openraft 负责；
+- 配置中出现 `control.urls` 会直接报错。
 
 ---
 
@@ -334,9 +334,9 @@ Raft quorum 丢失时：
 
 ---
 
-## 8.1 当前过渡：手动 leader fence
+## 8.1 历史阶段：手动 leader fence（已被 Raft 取代）
 
-在 openraft 实现前，controller 支持：
+在 openraft 接入前，controller 支持：
 
 ```toml
 [control]
@@ -346,10 +346,9 @@ leader_id = "<controller-node-id>"
 - 只有签名身份等于 `leader_id` 的 controller 接受 LSA/join/revoke 写入
 - 非 leader 返回 503
 - 这不是自动 failover；leader 变更需要管理员更新配置/重启
-- 成员侧仍使用 snapshot/manifest threshold
+- 成员侧历史上使用 snapshot/manifest threshold
 
-它用于在过渡期避免“多个 controller 同时接受写”的明显 split-brain，
-最终仍需 openraft 的 term/leader/quorum。
+这是过渡期的防 split-brain 措施；当前已由 openraft term/leader/quorum 取代。
 
 ## 8.2 H0：确定性状态模型（已实现）
 
@@ -379,7 +378,7 @@ crates/stellaris-agent/src/controller_model.rs
 - `GET /v1/model` 可查看 shadow 状态
 - 命令以 JSONL 追加到 `state_dir/controller-commands.jsonl`
 - 重启时按命令日志重放 model
-- 尚未替换旧 controller 状态，也尚未接入 openraft
+- Raft 模式已接入 openraft；legacy 非 Raft 路径保留作兼容
 
 这是 Phase 0 的前置模型。
 
@@ -398,13 +397,12 @@ crates/stellaris-agent/src/controller_raft.rs
 - single-voter `Raft::initialize`
 - `client_write(ApplyLsa)` 测试通过
 
-当前限制：
+H1 当时限制（H2/H3 已解除）：
 
-- log/vote/state 可落盘到 `raft-log.json` / `raft-state.json`（单节点测试通过）
-- snapshot 数据仍主要从 state machine 重建；生产级 snapshot 文件/校验待做
-- `RaftNetworkV2` 是 placeholder，只用于单节点
-- 尚未接入 HTTP controller
-- 尚未实现 3 controller bootstrap/membership
+- log/vote/state 落盘到 `raft-log.json` / `raft-state.json`
+- snapshot 数据从 state machine 重建；后续已加分块/校验
+- `RaftNetworkV2` 当时只是单节点 placeholder
+- 后续已接入 HTTP controller 和 3 controller bootstrap/membership
 
 ### H2：3 节点 Raft（已实现）
 
@@ -444,7 +442,7 @@ three_node_raft_over_http
 限制：
 
 - HTTP RPC 支持共享 secret header（`x-stellaris-raft-secret`）
-- 尚未使用 TLS/mTLS
+- 后续已加入 TLS/mTLS（见 H3）
 - 3 节点可通过 `start_http_cluster_on_disk` 落盘并在整体重启后恢复
 - 集群重启测试已验证（固定监听地址）
 - snapshot 传输已实现（`POST /raft/snapshot` + `SnapshotRpc`）
@@ -571,31 +569,31 @@ cargo build -p stellaris-agent --bin stellaris-controller
 - 增加 `compute_snapshot(model, node)`；
 - 单测：同一命令序列在任意顺序/重复下结果一致。
 
-### Phase 1：单节点 openraft shadow
+### Phase 1：单节点 openraft shadow（已完成）
 
 - 启动 1 个 Raft controller；
 - 写路径先 Raft，再更新旧 API；
 - 对比 Raft state 与旧 state；
 - 不切换 member 读写。
 
-### Phase 2：3 controller cluster
+### Phase 2：3 controller cluster（已完成）
 
 - 3 节点 bootstrap；
 - 故障注入、snapshot、重启；
 - member 只连 leader（或 follower 转发）；
-- 保留 fanout 读兼容。
+- 不再保留 fanout 读兼容。
 
-### Phase 3：cutover
+### Phase 3：cutover（已完成）
 
 - 关闭 fanout 写；
 - 切换签名到 controller key；
 - 监控 drift/ACK；
-- 保留回滚开关（回到 fanout 只读）。
+- 不保留 fanout 回滚路径。
 
-### Phase 4：清理
+### Phase 4：清理（已完成）
 
-- 移除 JSON ACK 持久化；
-- 移除 fanout 写路径；
+- fanout 写路径已移除；
+- legacy JSON ACK 仍保留给非 Raft 兼容路径；
 - 文档/运维手册。
 
 ---
@@ -636,7 +634,7 @@ cargo build -p stellaris-agent --bin stellaris-controller
 - member 路由/ACK；
 - controller 全挂 → 数据面继续；
 - 写 fail-closed；
-- 迁移期 fanout + Raft 混跑。
+- 旧 fanout + Raft 混跑已从代码/配置中移除。
 
 ### 10.5 混沌
 

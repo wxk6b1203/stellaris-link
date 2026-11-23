@@ -635,7 +635,7 @@ Starting → Follower → Leader → Draining → Stopped
 ```
 
 - v1：单 controller + 冷备；无 Raft；DB lease/epoch。
-- v2：3 节点 openraft；leader 处理写，follower 转发。
+- 已实现：3 节点 openraft；leader 处理写，follower 转发。
 - `epoch` 单调；旧 controller 写入被 fence。
 - 写路径：DB transaction → generation+1 → snapshot/delta → notify agents。
 - 读路径：snapshot cache/DB。
@@ -977,7 +977,7 @@ stellaris_manifest_epoch
 | QUIC 性能/MTU | 吞吐/大包 | 基准；MTU 自适应；MSS clamp |
 | NAT 类型复杂 | 直连失败 | iroh 打洞 + 自建 relay；NAT 矩阵 |
 | 路由收敛/抖动 | 大规模不稳 | 聚合/分层/dampening；先 1k |
-| controller HA | 脑裂 | epoch + quorum；v2 openraft |
+| controller HA | 脑裂 | epoch + openraft quorum |
 | 跨平台签名/驱动 | 安装失败 | Linux 先行；Windows 单独里程碑 |
 | 安全审计 | 生产准入 | 威胁模型 + 外部审计 |
 

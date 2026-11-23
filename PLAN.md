@@ -20,7 +20,7 @@
 - [x] Web UI（peers/routes/add/pin/delete/explain）。
 - [x] AZ 同 zone `local_pref` 加成（静态/controller 路由）+ zone 展示。
 - [x] Linux NAT/MASQUERADE（subnet gateway，Docker 实测）。
-- [x] controller：network-scope 静态路由 + epoch/member manifest + HMAC 签名 + ACK 持久化 + member 2s 同步；HTTP、iroh control protocol、多 controller active-active fanout。
+- [x] controller：network-scope 静态路由 + epoch/member manifest + HMAC/Ed25519 签名 + ACK 持久化 + member 2s 同步；HTTP、iroh control protocol；openraft 3 节点 HA。
 - [x] controller-mediated link-state：member 上报 LSA，controller SPF 计算路由（手动集成测试通过）。
 - [x] 分布式 LSA：iroh control stream 洪泛 + 本地 SPF + Ping/Pong 故障收敛 + LSA underlay 地址自动发现 peer（3 节点 demo/FAILOVER 通过）。
 - [x] controller manifest 携带 underlay addrs，member 无静态 peer 自动发现/连接（demo 通过）。
@@ -31,7 +31,7 @@
 - [x] QoS 字节速率整形 `rate_bps/burst_bytes`。
 - [x] controller + 3 members 本机联调（ACK/snapshot/LSA）。
 - [x] controller + 3 TUN 节点真实 Linux netns 联调：双向 0% loss、1000B。
-- [x] 双 controller threshold 本机联调。
+- [x] 旧双 controller threshold/fanout 已移除。
 - [x] controller membership/join token 持久化（重启恢复、token 不复用）。
 - [x] 单进程多 network runtime（重复 `--config`，独立 state/network/TUN/FIB）。
 - [x] 安全配置校验：非 loopback API/control bind 强制 token/secret。
@@ -41,7 +41,7 @@
 - [x] controller 手动 leader fence：非 leader 拒绝 LSA/join/revoke 写入。
 - [x] join token 配置 hash 入 Raft，配置不一致 join 409。
 - [x] `/v1/manifest` 从 Raft model 生成。
-- [x] `raft_dir` 与 legacy fanout 配置互斥。
+- [x] `raft_dir` 与 legacy fanout 配置互斥；`control.urls` 直接报错。
 - [x] controller HA 与 P1 数据面生产化基线收尾。
 - [x] 真实物理三主机 controller mTLS HA / IPv4 overlay（含 2000-byte 分片 ping）/ IPv6 overlay / direct→relay roaming。
 - [x] openraft H0 确定性 ControllerModel/Command，作为 controller shadow 接入（`/v1/model` + durable command log）。
@@ -82,11 +82,11 @@
 - [x] `transport.bind_ip`：TUN 场景绑定 underlay，避免 iroh underlay QUIC 走进 TUN。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
 - [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。
-- [x] manifest threshold/多 controller 聚合；join token 过期/撤销。
+- [x] join token 过期/撤销；旧 manifest threshold/多 controller 聚合已移除。
 - [ ] ACL/QoS 审计日志、复杂整形。
-- [ ] 完整 controller（openraft quorum/leader election）、mDNS/广播发现、ACL/QoS 复杂整形/队列配置、多网络、Windows、macOS NAT。
+- [ ] 完整 PMTUD 状态机、应用层 fragment reassembly、强制 multipath、磁盘满/撕裂写注入、Windows/macOS NAT。
 
-P0/P1 已完成；下一阶段：openraft HA（P2）与 mDNS/单进程多网络/tracing 等增强。
+P0/P1 已完成；controller HA 与真实物理三主机已收尾；剩余为数据面硬化和跨平台。
 
 ---
 
@@ -351,7 +351,7 @@ cargo run -p stellaris-api -- openapi >/dev/null  # schema 可生成
 | QUIC 性能不达标 | 中 | 高 | M0 基准；MTU/MSS；后续 WireGuard 可选 |
 | NAT 穿透失败率高 | 中 | 高 | 自建 relay；NAT 矩阵；TCP/WS fallback 评估 |
 | 路由收敛/抖动 | 中 | 高 | 1k 先行；聚合/dampening；混沌 |
-| controller HA 复杂 | 中 | 中 | v1 单活+冷备；v2 openraft |
+| controller HA 复杂 | 中 | 中 | openraft 3 节点 + mTLS + snapshot，已完成 |
 | 跨平台签名/驱动 | 高 | 中 | Linux 先行；macOS 单独 milestone |
 | 安全审计 | 中 | 高 | 威胁模型；外部审计；fuzz |
 | 范围膨胀 | 高 | 高 | 非目标清单；MVP 冻结 |
