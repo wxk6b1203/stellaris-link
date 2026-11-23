@@ -124,12 +124,20 @@ B -> A after blocking .164: 192.168.0.162:5911
 OK: dual-NIC direct path failover works.
 ```
 
+进一步：
+
+```text
+对 .164 加 100ms 延迟：selected 仍为 .164，path_count=1
+对 .164 加 20% 丢包：selected 仍为 .164，path_count=1
+阻断 .164：切换 .162
+```
+
 结论：
 
 - **双 direct 地址 failover 已通过**
 - iroh 当前只打开 **1 条 path**（`path_count=1`）
 - 没有验证到“双 direct 同时承载”
-- 没有验证 RTT/丢包驱动的多路径调度
+- **RTT/丢包不会触发路径切换；只有硬阻断才会**
 - 双 relay 同时承载未验证
 
 ---

@@ -187,7 +187,7 @@ PMTUD：
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
-| 强制 multipath | ⚠️ | 双网卡 failover 通过；`path_count=1`，没有双 direct 同时承载/RTT 调度/双 relay |
+| 强制 multipath | ⚠️ | 双网卡 failover 通过；`path_count=1`；100ms/20% loss 都不切换，只有硬阻断切换；无双 direct 同承载/RTT 调度/双 relay |
 | 3/3 全路径 roaming | ⚠️ | 批1 最后一次一个 peer relay、一个 direct；脚本仍只断言一个 peer |
 | 完整 PMTUD | ✅ | netns 1500/1400/1300 + tracepath + PTB 黑洞/恢复已跑通 |
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |

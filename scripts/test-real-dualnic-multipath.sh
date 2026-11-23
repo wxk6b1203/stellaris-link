@@ -10,7 +10,7 @@ hosts=("$H1" "$H2" "$H3")
 pips=("$P1" "$P2" "$P3")
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/stellaris-dualnic.XXXXXX")"
 selected=""
-cleanup(){ if [[ -n "$selected" ]]; then ssh -o BatchMode=yes "$H2" "iptables -D OUTPUT -p udp -d $selected -j REJECT 2>/dev/null || true; iptables -D INPUT -p udp -s $selected -j REJECT 2>/dev/null || true" 2>/dev/null || true; fi; ssh -o BatchMode=yes "$H1" "ip rule del from $P1B table 164 2>/dev/null || true; ip route flush table 164" 2>/dev/null || true; for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "for f in $DIR/*.pid; do [ -f \"\$f\" ] && kill \$(cat \"\$f\") 2>/dev/null || true; done" 2>/dev/null || true; done; rm -rf "$TMP"; }
+cleanup(){ if [[ -n "$selected" ]]; then ssh -o BatchMode=yes "$H2" "iptables -D OUTPUT -p udp -d $selected -j REJECT 2>/dev/null || true; iptables -D INPUT -p udp -s $selected -j REJECT 2>/dev/null || true" 2>/dev/null || true; fi; ssh -o BatchMode=yes "$H1" "tc qdisc del dev eth1 root 2>/dev/null || true; tc qdisc del dev eth0 root 2>/dev/null || true; ip rule del from $P1B table 164 2>/dev/null || true; ip route flush table 164" 2>/dev/null || true; for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "for f in $DIR/*.pid; do [ -f \"\$f\" ] && kill \$(cat \"\$f\") 2>/dev/null || true; done" 2>/dev/null || true; done; rm -rf "$TMP"; }
 trap cleanup EXIT
 ssh -o BatchMode=yes "$H1" "for f in all eth0 eth1; do sysctl -w net.ipv4.conf.\$f.arp_ignore=1 net.ipv4.conf.\$f.arp_announce=2 net.ipv4.conf.\$f.rp_filter=0 >/dev/null; done; ip rule add from $P1B table 164 2>/dev/null || true; ip route replace 192.168.0.0/24 dev eth1 table 164; ip route replace default via 192.168.0.253 dev eth1 table 164" 2>/dev/null || true
 for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "rm -rf $DIR/n1 $DIR/n2 $DIR/n3; mkdir -p $DIR" 2>/dev/null || true; done
@@ -72,6 +72,22 @@ echo "B -> A selected path_addr: $initial path_count=$(path_count)"
 [[ -n "$initial" ]] || { echo "FAIL: no selected path_addr" >&2; exit 1; }
 selected="${initial%:*}"
 other="$P1B"; [[ "$selected" == "$P1B" ]] && other="$P1"
+if [[ "$selected" == "$P1B" ]]; then
+  echo '--- RTT-based path selection (delay .164 by 100ms) ---'
+  ssh -o BatchMode=yes "$H1" 'tc qdisc add dev eth1 root netem delay 100ms'
+  sleep 12
+  echo "after delay: $(path_addr) path_count=$(path_count)"
+  ssh -o BatchMode=yes "$H1" 'tc qdisc del dev eth1 root'
+  sleep 2
+  echo '--- loss-based path selection (20% loss on .164) ---'
+  ssh -o BatchMode=yes "$H1" 'tc qdisc add dev eth1 root netem loss 20%'
+  sleep 12
+  echo "after loss: $(path_addr) path_count=$(path_count)"
+  ssh -o BatchMode=yes "$H1" 'tc qdisc del dev eth1 root'
+  sleep 2
+else
+  echo "SKIP RTT/loss selection: selected path is $selected, not .164"
+fi
 ssh -o BatchMode=yes "$H2" "iptables -I OUTPUT -p udp -d $selected -j REJECT; iptables -I INPUT -p udp -s $selected -j REJECT"
 changed=""
 for _ in $(seq 1 120); do
