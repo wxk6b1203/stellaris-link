@@ -20,6 +20,8 @@ pub struct PeerState {
     pub rtt_ms: Option<u64>,
     /// Remote address of the selected transport path, if direct/relay IP.
     pub path_addr: Option<String>,
+    /// Number of currently open transport paths.
+    pub path_count: usize,
     /// Path MTU reported by the current transport path, if known.
     pub mtu: Option<u16>,
     /// Number of selected-path changes observed for this peer.
@@ -52,6 +54,7 @@ impl PeerRegistry {
                     path: None,
                     rtt_ms: None,
                     path_addr: None,
+                    path_count: 0,
                     mtu: None,
                     path_changes: 0,
                 },
@@ -79,6 +82,7 @@ impl PeerRegistry {
         guard.get(node).cloned()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn mark(
         &self,
         node: &NodeId,
@@ -87,6 +91,7 @@ impl PeerRegistry {
         rtt_ms: Option<u64>,
         mtu: Option<u16>,
         path_addr: Option<String>,
+        path_count: usize,
     ) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(peer) = guard.get_mut(node) {
@@ -98,6 +103,7 @@ impl PeerRegistry {
             peer.rtt_ms = rtt_ms;
             peer.mtu = mtu;
             peer.path_addr = path_addr;
+            peer.path_count = path_count;
         }
     }
 
@@ -148,6 +154,7 @@ overlay_ip = "10.7.0.2"
             Some(5),
             Some(1200),
             None,
+            0,
         );
         registry.mark(
             &node,
@@ -156,6 +163,7 @@ overlay_ip = "10.7.0.2"
             Some(6),
             Some(1200),
             None,
+            0,
         );
         assert_eq!(registry.get(&node).unwrap().path_changes, 1);
         registry.mark(
@@ -165,6 +173,7 @@ overlay_ip = "10.7.0.2"
             Some(50),
             Some(1100),
             None,
+            0,
         );
         assert_eq!(registry.get(&node).unwrap().path_changes, 2);
     }
