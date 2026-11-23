@@ -1,6 +1,6 @@
 # 能力与测试审计（2026-11-23）
 
-> 关联：[README.md](README.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)
+> 关联：[README.md](README.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、[TEST-RESULTS.md](TEST-RESULTS.md)
 
 本文只记录**已验证**、**未验证**和**代码未实现**的内容，避免把设计/演示当成生产结论。
 
@@ -107,7 +107,7 @@ cargo test                                                 111 passed
 - `scripts/test-real-crossbatch-direct.sh`
 - `scripts/test-real-crossbatch-relay.sh`
 
-### 2.4 成都 netns PMTUD 实验
+### 2.4 成都 netns PMTUD + 黑洞实验
 
 主机：47.109.58.88，4C/8G，Ubuntu 6.8。
 
@@ -133,6 +133,23 @@ a --1500-- r1 --1400-- r2 --1300-- b
 脚本：
 
 - `scripts/test-netns-pmtud-lab.sh`
+
+### 2.4.1 真实 agent 流量 PTB 黑洞
+
+在 Chengdu netns 中把 r2→b 从 1300 降到 1100 并丢 PTB 15 秒：
+
+```text
+长连接 TCP: T8.4 13,959,168 bytes
+黑洞期间: 不再增长
+T32.4 恢复增长
+GAPS [(6.4, 32.7)]
+恢复后新 HTTP flow: new_http_ok=1
+peer: connected=true path=direct mtu=1224 path_changes=1
+```
+
+结论：长 TCP 可恢复，但约 10–12 秒；iroh 不重连，只保持连接；未主动重建 underlay 路径。
+
+脚本：`scripts/test-netns-pmtud-blackhole.sh`
 
 ### 2.5 Docker 与 PMTUD 现状
 
@@ -170,12 +187,12 @@ PMTUD：
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
-| 强制 multipath | ❌ | 只验证 direct→relay；没有双 direct/双 relay 同时可用与路径选择测试 |
+| 强制 multipath | ⚠️ | 双网卡 failover 通过；`path_count=1`，没有双 direct 同时承载/RTT 调度/双 relay |
 | 3/3 全路径 roaming | ⚠️ | 批1 最后一次一个 peer relay、一个 direct；脚本仍只断言一个 peer |
 | 完整 PMTUD | ✅ | netns 1500/1400/1300 + tracepath + PTB 黑洞/恢复已跑通 |
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ⚠️ | 批1↔批2、深圳↔上海公网 direct/relay 已测；public exit NAT 云上未测 |
-| 磁盘满/撕裂写 | ❌ | 只读目录测试已做；没有 ENOSPC/partially written log |
+| 磁盘满/撕裂写 | ⚠️ | ENOSPC→503、撕裂 log 启动失败已验证；慢 IO/fsync 未注入 |
 | snapshot 跨进程完整续传 | ⚠️ | begin/chunk 重试、TTL/abort 已做；没有 agent/controller 重启后续传 |
 | 真实物理跨地域 | ✅ | 深圳↔上海 25 ms TUN overlay 已测 |
 | Docker 测试复跑 | ⚠️ | Docker pull/容器内 agent 手测通过；标准 Dockerfile apt 构建未完成 |

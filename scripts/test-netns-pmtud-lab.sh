@@ -12,6 +12,8 @@ cleanup(){
 }
 trap cleanup EXIT
 ssh -o BatchMode=yes "$HOST" 'for ns in a r1 r2 b; do ip netns list | grep -q "^$ns" || { echo "missing netns $ns" >&2; exit 1; }; done'
+# IPv6 addresses/routes on the same veth topology.
+ssh -o BatchMode=yes "$HOST" 'ip netns exec a ip -6 addr replace fd00:1::1/64 dev a0; ip netns exec r1 ip -6 addr replace fd00:1::2/64 dev r1a; ip netns exec r1 ip -6 addr replace fd00:2::1/64 dev r1b; ip netns exec r2 ip -6 addr replace fd00:2::2/64 dev r2a; ip netns exec r2 ip -6 addr replace fd00:3::1/64 dev r2b; ip netns exec b ip -6 addr replace fd00:3::2/64 dev b0; ip netns exec a ip -6 route replace default via fd00:1::2; ip netns exec b ip -6 route replace default via fd00:3::1; ip netns exec r1 ip -6 route replace fd00:3::/64 via fd00:2::2; ip netns exec r2 ip -6 route replace fd00:1::/64 via fd00:2::1; ip netns exec r1 sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null; ip netns exec r2 sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null'
 ssh -o BatchMode=yes "$HOST" "rm -rf $DIR; mkdir -p $DIR/a-state $DIR/b-state"
 cat > "$TMP/a.toml" <<TOML
 [node]
@@ -126,4 +128,24 @@ ssh -o BatchMode=yes "$HOST" 'ip netns exec r2 iptables -D OUTPUT -p icmp --icmp
 cat "$TMP/rec"
 grep -qE 'mtu[ =]1300|mtu=1300' "$TMP/rec" || { echo "FAIL: no PTB after restore" >&2; exit 1; }
 ssh -o BatchMode=yes "$HOST" 'ip netns exec a ping -M do -c 2 -W 2 -s 1272 10.0.3.2'
+echo '--- IPv6 hop-by-hop PMTU ---'
+ssh -o BatchMode=yes "$HOST" 'ip netns exec a ip -6 route flush cache; ip netns exec a tracepath -6 -n fd00:3::2' | tee "$TMP/trace6"
+grep -q 'pmtu 1400' "$TMP/trace6"
+grep -q 'pmtu 1300' "$TMP/trace6"
+echo '--- IPv6 PTB 1450 -> R1 1400, then 1300 -> R2 1300 ---'
+ssh -o BatchMode=yes "$HOST" 'ip netns exec a ip -6 route flush cache; ip netns exec a ping -6 -I fd00:1::1 -M do -c1 -W2 -s 1450 fd00:3::2' >"$TMP/ptb6a" 2>&1 || true
+ssh -o BatchMode=yes "$HOST" 'ip netns exec a ping -6 -I fd00:1::1 -M do -c1 -W2 -s 1300 fd00:3::2' >"$TMP/ptb6b" 2>&1 || true
+cat "$TMP/ptb6a" "$TMP/ptb6b"
+grep -qE 'mtu[ =]1400|mtu: 1400' "$TMP/ptb6a" || { echo "FAIL: no IPv6 PTB 1400" >&2; exit 1; }
+grep -qE 'mtu[ =]1300|mtu: 1300' "$TMP/ptb6b" || { echo "FAIL: no IPv6 PTB 1300" >&2; exit 1; }
+ssh -o BatchMode=yes "$HOST" 'ip netns exec a ping -6 -I fd00:1::1 -M do -c2 -W2 -s 1252 fd00:3::2'
+echo '--- IPv6 PTB blackhole / recovery ---'
+ssh -o BatchMode=yes "$HOST" 'ip netns exec r2 ip6tables -I OUTPUT -p icmpv6 --icmpv6-type packet-too-big -j DROP; ip netns exec a ip -6 route flush cache; ip netns exec a ping -6 -I fd00:1::1 -M do -c2 -W2 -s 1300 fd00:3::2' >"$TMP/bh6" 2>&1 || true
+cat "$TMP/bh6"
+grep -q 'packet loss' "$TMP/bh6" || { echo "FAIL: IPv6 blackhole produced no loss" >&2; exit 1; }
+grep -qE 'mtu[ =]1300|mtu: 1300' "$TMP/bh6" && { echo "FAIL: IPv6 blackhole still returned 1300 PTB" >&2; exit 1; }
+ssh -o BatchMode=yes "$HOST" 'ip netns exec r2 ip6tables -D OUTPUT -p icmpv6 --icmpv6-type packet-too-big -j DROP; ip netns exec a ip -6 route flush cache; ip netns exec a ping -6 -I fd00:1::1 -M do -c1 -W2 -s 1300 fd00:3::2' >"$TMP/rec6" 2>&1 || true
+cat "$TMP/rec6"
+grep -qE 'mtu[ =]1300|mtu: 1300' "$TMP/rec6" || { echo "FAIL: no IPv6 PTB after restore" >&2; exit 1; }
+ssh -o BatchMode=yes "$HOST" 'ip netns exec a ping -6 -I fd00:1::1 -M do -c2 -W2 -s 1252 fd00:3::2'
 echo "OK: netns PMTUD lab works (path MTU, TUN, TCP, hop-by-hop, blackhole/recovery)."

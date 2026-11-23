@@ -66,8 +66,9 @@ done
 sleep 7
 peers_b(){ ssh -o BatchMode=yes "$H2" "curl -fsS 'http://127.0.0.1:5982/v1/peers'"; }
 path_addr(){ peers_b | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('path_addr') or '' for p in d if p['name']=='mp1'), ''))" 2>/dev/null; }
+path_count(){ peers_b | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('path_count') or 0 for p in d if p['name']=='mp1'), 0))" 2>/dev/null; }
 initial="$(path_addr)"
-echo "B -> A selected path_addr: $initial"
+echo "B -> A selected path_addr: $initial path_count=$(path_count)"
 [[ -n "$initial" ]] || { echo "FAIL: no selected path_addr" >&2; exit 1; }
 selected="${initial%:*}"
 other="$P1B"; [[ "$selected" == "$P1B" ]] && other="$P1"
