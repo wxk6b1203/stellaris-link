@@ -211,7 +211,12 @@ PMTUD：
 - **NAT**：NAT44/66 公网 exit 已在 Linux netns 验证；NAT66 仅 Linux `ip6tables`，macOS 未实现。
 - **队列/整形**：有 token bucket + 全局/per-priority/per-class queue depth/bytes；没有 DRR/公平调度/更细粒度 SLA。
 
-### 4.2 Controller HA
+### 4.2 已知问题
+
+- Raft 模式下 `/v1/status.generation` 仍使用 legacy 状态字段；磁盘满测试中 LSA 响应为 generation 3，status 仍为 1。
+- 这不影响 Raft snapshot/model，但会误导运维，需改为从 `ControllerModel` 读取。
+
+### 4.3 Controller HA
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。

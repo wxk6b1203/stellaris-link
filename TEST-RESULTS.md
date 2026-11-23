@@ -64,6 +64,8 @@ raft write failed: when Write Logs: No space left on device (os error 28)
 
 结论：磁盘满时写入失败，返回 503，不 ACK。
 
+观察到的问题：写入成功时 LSA API 返回 `generation: 3`，但随后 `/v1/status` 返回 `generation: 1`；Raft 模式下 `/v1/status.generation` 仍来自 legacy 状态字段，未反映 Raft model。
+
 ### 3.4 撕裂 log
 
 删除填充后，把 `raft-log.json` 截断到 100 字节并重启：
