@@ -34,7 +34,7 @@
 ```text
 cargo fmt --check                                          ✅
 cargo clippy --all-targets -- -D warnings                  ✅
-cargo test                                                 111 passed
+cargo test                                                 112 passed
 ```
 
 覆盖：
@@ -193,7 +193,7 @@ PMTUD：
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ⚠️ | 批1↔批2、深圳↔上海公网 direct/relay 已测；public exit NAT 云上未测 |
 | 磁盘满/撕裂写 | ⚠️ | ENOSPC→503、撕裂 log 启动失败已验证；慢 IO/fsync 未注入 |
-| snapshot 跨进程完整续传 | ⚠️ | begin/chunk 重试、TTL/abort 已做；没有 agent/controller 重启后续传 |
+| snapshot 跨进程续传 | ⚠️ | controller HTTP 重启后续传已实现/单测；agent 客户端重启、整集群滚动重启未验证 |
 | 真实物理跨地域 | ✅ | 深圳↔上海 25 ms TUN overlay 已测 |
 | Docker 测试复跑 | ⚠️ | Docker pull/容器内 agent 手测通过；标准 Dockerfile apt 构建未完成 |
 | macOS NAT/pf、Windows | ❌ | 只有 Linux NAT |
@@ -214,7 +214,7 @@ PMTUD：
 ### 4.2 已修复问题
 
 - Raft 模式下 `/v1/status.generation` 已改为从 `ControllerModel` 读取；复测 LSA/status 都为 generation 3。
-- snapshot 跨重启：follower 重启后重新拉 snapshot 已测；按 offset 续传未实现。
+- snapshot 跨重启：controller HTTP 重启后按 offset 续传已实现并单测通过；agent 客户端重启/整集群滚动重启未验证。
 
 ### 4.3 Controller HA
 

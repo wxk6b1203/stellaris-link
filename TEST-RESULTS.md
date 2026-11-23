@@ -22,7 +22,7 @@
 ```text
 cargo fmt --check                          ✅
 cargo clippy --all-targets -- -D warnings  ✅
-cargo test                                 111 passed
+cargo test                                 112 passed
 ```
 
 ---
@@ -87,20 +87,26 @@ last_log_id: Some(... index: 3)
 
 结论：log 与 state 不一致时启动失败，fatal error，不静默继续。
 
-### 3.5 Snapshot 跨重启
+### 3.5 Snapshot 跨重启续传
 
-已有单元/集成验证：
+已实现并验证：
 
 ```text
-restarting_follower_catches_up_via_snapshot
+snapshot_transfer_survives_http_restart
 ```
 
-即 follower 重启后会重新拉取 snapshot 并追平。
+行为：
 
-未实现/未验证：
+- transfer 元数据和 data.bin 持久化到 `raft_dir/snapshot-transfers/<id>/`
+- controller HTTP server 重启后加载未完成 transfer
+- 使用同一个 transfer ID 从已接收 offset 继续发送剩余 chunk
+- finish 成功
 
-- 同一个 snapshot transfer 中断后按 offset **续传**
-- 跨 controller/agent 重启保留 transfer ID/offset
+仍有限制：
+
+- agent 客户端进程重启后不会自动复用旧 transfer ID
+- 仅验证 controller HTTP server 重启，不是整个 Raft 集群滚动重启
+- TTL 从进程重启后重新计时
 
 ### 3.6 仍未验证
 

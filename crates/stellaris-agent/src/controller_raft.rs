@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -650,8 +650,45 @@ pub async fn start_cluster(
 
 const RAFT_SECRET_HEADER: &str = "x-stellaris-raft-secret";
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct SnapshotAssemblies(Arc<std::sync::Mutex<HashMap<String, PendingSnapshot>>>);
+
+impl SnapshotAssemblies {
+    fn load(dir: Option<&Path>) -> Self {
+        let mut assemblies = HashMap::new();
+        if let Some(dir) = dir {
+            let _ = std::fs::create_dir_all(dir);
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(meta) = std::fs::read(path.join("meta.json")) else {
+                        continue;
+                    };
+                    let Ok(begin) = serde_json::from_slice::<SnapshotBegin>(&meta) else {
+                        continue;
+                    };
+                    let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    let data = std::fs::read(path.join("data.bin")).unwrap_or_default();
+                    assemblies.insert(
+                        id.to_string(),
+                        PendingSnapshot {
+                            created: std::time::Instant::now(),
+                            vote: begin.vote,
+                            meta: begin.meta,
+                            total: begin.total,
+                            checksum: begin.checksum,
+                            data,
+                            transfer_dir: Some(path),
+                        },
+                    );
+                }
+            }
+        }
+        Self(Arc::new(std::sync::Mutex::new(assemblies)))
+    }
+}
 
 struct PendingSnapshot {
     created: std::time::Instant,
@@ -660,6 +697,7 @@ struct PendingSnapshot {
     total: usize,
     checksum: String,
     data: Vec<u8>,
+    transfer_dir: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -675,6 +713,7 @@ struct RaftHttpState {
     raft: Raft<TypeConfig, StateMachineStore>,
     secret: Option<Arc<String>>,
     assemblies: SnapshotAssemblies,
+    transfer_dir: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -686,7 +725,11 @@ struct SnapshotRpc {
     checksum: String,
 }
 
-fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>) -> Router {
+fn raft_router(
+    raft: Raft<TypeConfig, StateMachineStore>,
+    secret: Option<String>,
+    transfer_dir: Option<PathBuf>,
+) -> Router {
     Router::new()
         .route("/raft/append", post(raft_append))
         .route("/raft/vote", post(raft_vote))
@@ -699,7 +742,8 @@ fn raft_router(raft: Raft<TypeConfig, StateMachineStore>, secret: Option<String>
         .with_state(RaftHttpState {
             raft,
             secret: secret.map(Arc::new),
-            assemblies: SnapshotAssemblies::default(),
+            assemblies: SnapshotAssemblies::load(transfer_dir.as_deref()),
+            transfer_dir,
         })
 }
 
@@ -711,6 +755,29 @@ fn authorized(state: &RaftHttpState, headers: &axum::http::HeaderMap) -> bool {
         .get(RAFT_SECRET_HEADER)
         .and_then(|value| value.to_str().ok())
         == Some(secret)
+}
+
+fn write_transfer_meta(dir: &Path, begin: &SnapshotBegin) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let bytes = serde_json::to_vec(begin).map_err(io::Error::other)?;
+    std::fs::write(dir.join("meta.json"), bytes)
+}
+
+fn write_transfer_chunk(dir: &Path, offset: usize, data: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("data.bin"))?;
+    file.seek(SeekFrom::Start(offset as u64))?;
+    file.write_all(data)?;
+    file.sync_all()
+}
+
+fn remove_transfer(pending: &PendingSnapshot) {
+    if let Some(dir) = &pending.transfer_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 async fn raft_snapshot_begin(
@@ -733,14 +800,26 @@ async fn raft_snapshot_begin(
     let id = Uuid::now_v7().to_string();
     {
         let mut assemblies = state.assemblies.0.lock().unwrap_or_else(|e| e.into_inner());
-        assemblies
-            .retain(|_, pending| pending.created.elapsed() < std::time::Duration::from_secs(60));
+        assemblies.retain(|_, pending| {
+            let keep = pending.created.elapsed() < std::time::Duration::from_secs(60);
+            if !keep {
+                remove_transfer(pending);
+            }
+            keep
+        });
         if assemblies.len() >= 8 {
             return Err((
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                 "too many concurrent snapshot transfers".into(),
             ));
         }
+        let transfer_dir = state.transfer_dir.as_ref().map(|base| {
+            let dir = base.join(&id);
+            if let Err(e) = write_transfer_meta(&dir, &req) {
+                tracing::warn!(error = %e, "persist snapshot transfer metadata");
+            }
+            dir
+        });
         assemblies.insert(
             id.clone(),
             PendingSnapshot {
@@ -750,6 +829,7 @@ async fn raft_snapshot_begin(
                 total: req.total,
                 checksum: req.checksum,
                 data: Vec::with_capacity(req.total),
+                transfer_dir,
             },
         );
     }
@@ -786,7 +866,9 @@ async fn raft_snapshot_chunk(
         .get(id)
         .is_some_and(|pending| pending.created.elapsed() >= std::time::Duration::from_secs(60))
     {
-        assemblies.remove(id);
+        if let Some(pending) = assemblies.remove(id) {
+            remove_transfer(&pending);
+        }
         return Err((
             axum::http::StatusCode::GONE,
             "snapshot transfer expired".into(),
@@ -825,6 +907,20 @@ async fn raft_snapshot_chunk(
     } else {
         pending.data.extend_from_slice(&body);
     }
+    if let Some(dir) = &pending.transfer_dir {
+        let old_len = pending.data.len() - body.len();
+        let write_body = if offset < old_len {
+            &body[old_len - offset..]
+        } else {
+            &body[..]
+        };
+        write_transfer_chunk(dir, old_len, write_body).map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist snapshot chunk: {e}"),
+            )
+        })?;
+    }
     Ok(axum::http::StatusCode::ACCEPTED)
 }
 
@@ -844,12 +940,15 @@ async fn raft_snapshot_abort(
             "missing transfer id".into(),
         ));
     };
-    state
+    let pending = state
         .assemblies
         .0
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(id);
+    if let Some(pending) = pending {
+        remove_transfer(&pending);
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -878,6 +977,7 @@ async fn raft_snapshot_finish(
     else {
         return Err((axum::http::StatusCode::NOT_FOUND, "unknown transfer".into()));
     };
+    remove_transfer(&pending);
     if pending.data.len() != pending.total {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -1338,7 +1438,8 @@ async fn start_http_node_at(
     let store = StateMachineStore::new(model, state_path);
     let factory = http_factory(secret.clone(), tls.as_ref())?;
     let raft = Raft::new(id, config, factory, log, store.clone()).await?;
-    let app = raft_router(raft.clone(), secret);
+    let transfer_dir = dir.as_ref().map(|dir| dir.join("snapshot-transfers"));
+    let app = raft_router(raft.clone(), secret, transfer_dir);
     let server = if let Some(tls) = tls {
         let config = raft_server_config(&tls).await?;
         let listener = listener.into_std()?;
@@ -1442,7 +1543,8 @@ async fn start_http_cluster_at(
         let raft = Raft::new(id, config.clone(), factory, log, store.clone()).await?;
         stores.push(store);
         rafts.write().await.insert(id, raft.clone());
-        let app = raft_router(raft, secret.clone());
+        let transfer_dir = dirs.as_ref().map(|dirs| dirs[i].join("snapshot-transfers"));
+        let app = raft_router(raft, secret.clone(), transfer_dir);
         let listener = listeners.remove(0);
         servers.push(tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -1599,6 +1701,119 @@ mod tests {
         for raft in rafts.read().await.values() {
             let _ = raft.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_transfer_survives_http_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-raft-transfer-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let first = start_http_node(
+            ControllerModel::new(NetworkId::new(), 1),
+            1,
+            addr,
+            Vec::new(),
+            Some(dir.clone()),
+            Some("secret".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        for i in 0..20_000u64 {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&i.to_be_bytes());
+            let origin = NodeId::new(id);
+            model.lsas.insert(
+                origin,
+                stellaris_linkstate::Lsa {
+                    origin,
+                    seq: i,
+                    zone: Some("z".repeat(64)),
+                    links: vec![],
+                    prefixes: vec![stellaris_linkstate::Prefix {
+                        prefix: "192.168.0.0/16".parse().unwrap(),
+                        metric: 0,
+                    }],
+                    overlay_ip: Some("10.7.0.1".parse().unwrap()),
+                    addrs: vec![],
+                },
+            );
+        }
+        let data = serde_json::to_vec(&model).unwrap();
+        let begin = SnapshotBegin {
+            vote: VoteOf::<TypeConfig>::new(0, 0),
+            meta: SnapshotMetaOf::<TypeConfig> {
+                last_log_id: None,
+                last_membership: StoredMembershipOf::<TypeConfig>::default(),
+            },
+            total: data.len(),
+            checksum: hex::encode(Sha256::digest(&data)),
+        };
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}/raft/snapshot/begin", first.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .json(&begin)
+            .send()
+            .await
+            .unwrap();
+        let id = response.json::<serde_json::Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let chunk = &data[..2 * 1024 * 1024];
+        let response = client
+            .post(format!("http://{}/raft/snapshot/chunk", first.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .header("x-raft-offset", "0")
+            .body(chunk.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        let _ = first.raft.shutdown().await;
+        first.server.abort();
+
+        let second = start_http_node(
+            ControllerModel::new(NetworkId::new(), 1),
+            1,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            Vec::new(),
+            Some(dir.clone()),
+            Some("secret".into()),
+            false,
+        )
+        .await
+        .unwrap();
+        for (offset, chunk) in data[2 * 1024 * 1024..].chunks(2 * 1024 * 1024).enumerate() {
+            let response = client
+                .post(format!("http://{}/raft/snapshot/chunk", second.address))
+                .header(RAFT_SECRET_HEADER, "secret")
+                .header("x-raft-transfer", &id)
+                .header(
+                    "x-raft-offset",
+                    (2 * 1024 * 1024 + offset * 2 * 1024 * 1024).to_string(),
+                )
+                .body(chunk.to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        }
+        let response = client
+            .post(format!("http://{}/raft/snapshot/finish", second.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .header("x-raft-transfer", &id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let _ = second.raft.shutdown().await;
+        second.server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
