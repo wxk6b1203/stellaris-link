@@ -1235,12 +1235,14 @@ async fn status(State(state): State<ControllerState>, headers: HeaderMap) -> Res
     if !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let model = state.model_current().await;
+    let local = state.signer.unwrap_or_else(|| NodeId::new([0u8; 32]));
     Json(json!({
-        "network_id": state.network.to_string(),
-        "epoch": state.epoch,
-        "generation": state.generation.load(Ordering::Relaxed),
-        "routes": state.routes.read().unwrap_or_else(|e| e.into_inner()).len(),
-        "acks": state.acks.read().unwrap_or_else(|e| e.into_inner()).len(),
+        "network_id": model.network.to_string(),
+        "epoch": model.epoch,
+        "generation": model.generation,
+        "routes": model.routes(local).len(),
+        "acks": model.acks.len(),
         "leader": state.leader_hint().await,
         "join_config_hash": state.join_config_hash(),
     }))

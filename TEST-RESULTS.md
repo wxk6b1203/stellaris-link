@@ -64,7 +64,17 @@ raft write failed: when Write Logs: No space left on device (os error 28)
 
 结论：磁盘满时写入失败，返回 503，不 ACK。
 
-观察到的问题：写入成功时 LSA API 返回 `generation: 3`，但随后 `/v1/status` 返回 `generation: 1`；Raft 模式下 `/v1/status.generation` 仍来自 legacy 状态字段，未反映 Raft model。
+修复前观察：LSA API 返回 `generation: 3`，但 `/v1/status` 返回 `generation: 1`；Raft 模式 status 仍使用 legacy 字段。
+
+修复后复测：
+
+```text
+LSA:     generation 3
+status:  generation 3
+磁盘满写入 503 后 status 仍为 generation 3
+```
+
+`/v1/status` 现在从 `ControllerModel` 读取 generation/acks/routes。
 
 ### 3.4 撕裂 log
 
@@ -77,7 +87,22 @@ last_log_id: Some(... index: 3)
 
 结论：log 与 state 不一致时启动失败，fatal error，不静默继续。
 
-### 3.5 仍未验证
+### 3.5 Snapshot 跨重启
+
+已有单元/集成验证：
+
+```text
+restarting_follower_catches_up_via_snapshot
+```
+
+即 follower 重启后会重新拉取 snapshot 并追平。
+
+未实现/未验证：
+
+- 同一个 snapshot transfer 中断后按 offset **续传**
+- 跨 controller/agent 重启保留 transfer ID/offset
+
+### 3.6 仍未验证
 
 - snapshot 传输中断后 agent/controller **重启续传**
 - 磁盘慢 IO / fsync 失败注入
