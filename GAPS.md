@@ -219,6 +219,8 @@ PMTUD：
 
 ### 4.3 Controller HA
 
+- **三地滚动重启失败**：followers 重启后，kill leader 后 node1/node3 80s 内无 leader；需要 Raft debug/election 诊断。
+
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。
 - agent 客户端重启/整集群滚动重启后的 snapshot 续传未验证。

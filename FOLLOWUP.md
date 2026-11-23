@@ -58,7 +58,25 @@
 
 ---
 
-## 3. 其他后续
+## 3. 三地 rolling restart 失败（高优先级）
+
+环境：Shenzhen/Shanghai/Chengdu 各一个 controller，公网 5701/5801 + mTLS。
+
+现象：
+
+- follower 2/3 重启后仍可写
+- follower 3 重启时 leader 从 1 切到 2
+- kill leader 2 后，node1/node3 都 `leader:null`
+- 80s 无新 leader
+
+需要：
+
+- 开 Raft debug/tracing
+- 查 log/term/vote 状态
+- 是否 follower 重启后 log 落后导致无法赢得选举
+- 是否 rolling restart 顺序/选举超时需要调整
+
+## 3.1 其他后续
 
 - 应用层 fragment reassembly
 - Docker 双容器 bridge/mDNS/TUN 全量回归

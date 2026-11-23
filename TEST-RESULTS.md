@@ -109,7 +109,47 @@ snapshot_transfer_survives_http_restart
 - 仅验证 controller HTTP server 重启，不是整个 Raft 集群滚动重启
 - TTL 从进程重启后重新计时
 
-### 3.6 仍未验证
+### 3.6 三地 controller 滚动重启：失败
+
+环境：
+
+- Shenzhen 120.77.233.189
+- Shanghai 8.153.183.185
+- Chengdu 47.109.58.88
+
+公网端口 5701/5801 + mTLS。
+
+过程：
+
+```text
+initial leader=1
+snapshot members ok
+
+restart follower 2:
+  leader after follower 1=1
+  snapshot members ok
+
+restart follower 3:
+  leader after follower 1=2
+  snapshot members ok
+
+restart leader 2:
+  80s 内没有新 leader
+```
+
+结果：
+
+- follower 2/3 单独重启后仍可读写
+- follower 3 重启过程中 leader 曾从 1 切到 2
+- kill leader 2 后，node1/node3 都返回 `leader: null`
+- 80 秒内未选出新 leader
+- 测试失败
+
+日志只有启动 INFO，没有 Raft election/error 细节；需要打开 Raft debug/tracing 才能定位。
+
+这是一个真实问题：**在 follower 已被重启的情况下，随后重启 leader 可能导致剩余节点无法选出 leader**。需要进一步查 Raft 状态/日志/选举。
+
+### 3.7 仍未验证
 
 - snapshot 传输中断后 agent/controller **重启续传**
 - 磁盘慢 IO / fsync 失败注入
