@@ -144,7 +144,7 @@ OK: dual-NIC direct path failover works.
 - iroh 当前只打开 **1 条 path**（`path_count=1`）
 - 没有验证到“双 direct 同时承载”
 - **RTT/丢包不会触发路径切换；只有硬阻断才会**
-- 双 relay 同时承载未验证
+- 双 relay 同时承载未验证：配置 `usw1` + `aps1` 两个 relay URL 后仍为 `path=relay, path_count=1`，只使用一个 relay
 
 ---
 
