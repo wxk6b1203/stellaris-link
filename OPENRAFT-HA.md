@@ -698,3 +698,18 @@ cargo build -p stellaris-agent --bin stellaris-controller
 - openraft `raft-kv-memstore` 示例（仅原型，不是生产存储）
 - 现有 `ARCHITECTURE.md` §6 controller/HA、§7 安全
 - 现有 `PROTOCOL.md` §1 控制协议、§10 iroh controller
+
+
+### 真实物理三主机
+
+`scripts/test-real-3host-ha.sh` 使用三台同 VPC 云主机的私网 IP 运行 controller，证书 SAN 覆盖三个私网 IP。
+
+实际结果：
+
+```text
+physical leader=1
+physical snapshot ok
+physical new leader=3
+physical failover snapshot ok
+OK: physical 3-host controller HA + mTLS + failover works.
+```

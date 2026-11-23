@@ -43,6 +43,7 @@
 - [x] `/v1/manifest` 从 Raft model 生成。
 - [x] `raft_dir` 与 legacy fanout 配置互斥。
 - [x] controller HA 与 P1 数据面生产化基线收尾。
+- [x] 真实物理三主机 controller mTLS HA / IPv4 overlay（含 2000-byte 分片 ping）/ IPv6 overlay / direct→relay roaming。
 - [x] openraft H0 确定性 ControllerModel/Command，作为 controller shadow 接入（`/v1/model` + durable command log）。
 - [x] openraft H1 单节点原型：storage/state machine/single voter；支持 raft-log/raft-state 落盘重启恢复。
 - [x] openraft H2 3 节点：进程内 leader 复制/failover + HTTP Raft RPC（共享 secret/snapshot）+ 落盘重启恢复。

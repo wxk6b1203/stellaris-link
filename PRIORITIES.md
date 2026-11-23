@@ -13,7 +13,7 @@
 - controller 已迁移到 openraft：3 节点、HTTP Raft、mTLS、snapshot、leader failover、partition recovery、crash recovery、join config 一致性。
 - 真实 LAN 使用 macvlan 3 controller + mTLS 验证。
 - 数据面已覆盖 IPv4/IPv6、NAT44/66、public exit、MSS/MTU、ICMP PTB、fragment ACL、relay failover、per-class queue。
-- 剩余为可选硬化：真实物理三主机、完整 PMTUD 状态机、分片重组、强制 roaming/multipath、磁盘满故障。
+- 真实物理三主机 controller/overlay/IPv6/roaming 已完成；剩余为完整 PMTUD 状态机、分片重组、强制 multipath、磁盘满故障。
 
 ---
 

@@ -543,3 +543,34 @@ examples/               # 示例 TOML
 - 每个 PR 关联 issue；Conventional Commits。
 - `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 必须全绿。
 - 外部输入（packet/API）必须有边界检查/测试。
+
+
+## 真实物理三主机
+
+使用三台物理/云主机（root SSH，私网互通，已装 Rust）验证：
+
+```bash
+export H1=root@<public-1> H2=root@<public-2> H3=root@<public-3>
+export P1=<private-1> P2=<private-2> P3=<private-3>
+export BIN=/opt/stellaris/stellaris-controller
+
+# Raft mTLS + failover
+./scripts/test-real-3host-ha.sh
+
+# IPv4 TUN overlay + 1000/2000-byte ping
+export BIN=/opt/stellaris/stellaris-agent
+./scripts/test-real-3host-overlay.sh
+
+# IPv6 TUN overlay + 1200-byte ping
+./scripts/test-real-3host-ipv6.sh
+
+# direct -> relay roaming（阻断私网/公网 direct UDP）
+./scripts/test-real-3host-roaming.sh
+```
+
+已在三台同 VPC 云主机上实际跑通：
+
+- 3 controller + Raft mTLS + leader failover
+- 3 agent IPv4 overlay，1000/2000-byte ping 0% loss（2000-byte 包经 1366-MTU TUN，验证分片转发 + 目的端重组）
+- 3 agent IPv6 overlay，1200-byte ping 0% loss
+- direct path -> relay path 切换
