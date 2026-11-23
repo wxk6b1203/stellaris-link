@@ -280,7 +280,7 @@ peer path MTU: 1414
 
 - 真正 multipath（双 direct 同时承载、RTT/丢包调度、双 relay）
 - 应用层 fragment reassembly
-- snapshot 跨重启续传
+- agent 客户端/整集群滚动重启后的 snapshot 续传
 - 动态 Raft membership
 - Docker 双容器网络/CI
 - macOS/Windows NAT

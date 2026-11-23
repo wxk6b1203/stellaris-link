@@ -205,26 +205,26 @@ PMTUD：
 
 ### 4.1 数据面
 
-- **PMTUD**：有 peer path MTU、MSS clamp、ICMP PTB，但没有完整 PMTUD 状态机/缓存/黑洞检测。
+- **PMTUD**：IPv4/IPv6 netns 逐跳、PTB 黑洞/恢复、agent 真实流量黑洞均已测；真实互联网路由器抓包未做。
 - **fragment reassembly**：只有解析、转发、首片 ACL；没有应用层重组。
-- **multipath**：iroh 默认能力，没有策略/强制测试。
+- **multipath**：双网卡 failover 通过，但 `path_count=1`；RTT/loss 不切换，双 direct/双 relay 同时承载未实现。
 - **NAT**：NAT44/66 公网 exit 已在 Linux netns 验证；NAT66 仅 Linux `ip6tables`，macOS 未实现。
 - **队列/整形**：有 token bucket + 全局/per-priority/per-class queue depth/bytes；没有 DRR/公平调度/更细粒度 SLA。
 
-### 4.2 已修复问题
+### 4.2 已实现/已修复
 
-- Raft 模式下 `/v1/status.generation` 已改为从 `ControllerModel` 读取；复测 LSA/status 都为 generation 3。
-- snapshot 跨重启：controller HTTP 重启后按 offset 续传已实现并单测通过；agent 客户端重启/整集群滚动重启未验证。
+- Raft 模式下 `/v1/status.generation` 改为从 `ControllerModel` 读取；复测 LSA/status 都为 generation 3。
+- snapshot transfer 元数据/data.bin 落盘；controller HTTP 重启后按 offset 续传，单测 `snapshot_transfer_survives_http_restart` 通过。
+- 磁盘满返回 503；撕裂 log 启动 fail-closed。
 
 ### 4.3 Controller HA
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。
-- snapshot 跨重启续传未验证。
-- 磁盘满/撕裂写未注入。
-- 真实物理三主机、跨地域公网 quorum 已验证；未做动态 Raft membership、WAN 丢包/抖动、large snapshot 跨 WAN。
+- agent 客户端重启/整集群滚动重启后的 snapshot 续传未验证。
+- 动态 Raft membership、WAN 丢包/抖动、large snapshot 跨 WAN 未验证。
 
-### 4.3 平台/运维
+### 4.4 平台/运维
 
 - 没有 CI 真实主机流水线；本轮为手工 SSH 执行。
 - 没有 systemd/打包/升级。
@@ -253,10 +253,9 @@ PMTUD：
 
 ## 6. 建议优先级
 
-1. **真正 multipath**：双 direct/双 relay 同时承载、路径选择/带宽聚合；当前只有双网卡 failover。
-2. **agent under PTB 黑洞**：用 iroh 真实流量穿过 netns 路由器，在黑洞下验证重连/回退；当前黑洞测试是 kernel ping。
+1. **真正 multipath**：双 direct/双 relay 同时承载、RTT/丢包调度、带宽聚合；当前 only failover。
+2. **snapshot 客户端/集群滚动重启续传**：controller HTTP server 续传已实现。
 3. **应用层 fragment reassembly**：当前依赖目的端内核。
-4. **磁盘满/撕裂写**：ENOSPC、partially written log、重启恢复。
-5. **snapshot 跨重启续传**。
-6. **Docker 双容器网络/mDNS/TUN 回归**；标准 Dockerfile apt 构建仍受网络阻塞。
-7. **IPv6 PTB/逐跳 MTU**、**public exit NAT 云上**、**macOS/Windows**、**CI/tracing/打包**。
+4. **Docker 双容器网络/mDNS/TUN 回归**；标准 Dockerfile apt 构建仍受网络阻塞。
+5. **动态 Raft membership、WAN 丢包/抖动、large snapshot 跨 WAN**。
+6. **public exit NAT 云上、macOS/Windows、CI/tracing/打包**。
