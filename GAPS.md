@@ -148,8 +148,11 @@ PMTUD：
 - 已修：peer MTU 未知时不再回退到 1100，使用配置 MTU
 - 已加：源端 oversized DF 包的 PTB 合成（ICMP 类原包除外）+ TCP MSS clamp
 - 已验证：peer path MTU 1162–1414、TUN MTU 自适应、手工抬高 TUN MTU 后 2 MiB TCP 传输成功
-- 未验证：真实下游路由器 PTB 黑洞、逐跳 MTU 递减、ICMP PTB 抓包
-- 缺口：源端 PTB 是本地合成，不是完整互联网 PMTUD 黑洞探测
+- 仍未验证：
+  - agent 真实流量在 underlay PTB 黑洞下的重连/回退
+  - IPv6 PTB/逐跳 MTU
+  - 真实互联网路由器抓包（当前是 Linux netns 路由器）
+- 缺口：源端 PTB 是本地合成；未做真实互联网黑洞探测
 
 ### 2.5 之前已验证（本轮未重复跑）
 
@@ -171,10 +174,10 @@ PMTUD：
 | 3/3 全路径 roaming | ⚠️ | 批1 最后一次一个 peer relay、一个 direct；脚本仍只断言一个 peer |
 | 完整 PMTUD | ✅ | netns 1500/1400/1300 + tracepath + PTB 黑洞/恢复已跑通 |
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
-| 公网 NAT/安全组 | ❌ | 三台同 VPC，只走私网；没有公网入站/跨 NAT 测试 |
+| 公网 NAT/安全组 | ⚠️ | 批1↔批2、深圳↔上海公网 direct/relay 已测；public exit NAT 云上未测 |
 | 磁盘满/撕裂写 | ❌ | 只读目录测试已做；没有 ENOSPC/partially written log |
 | snapshot 跨进程完整续传 | ⚠️ | begin/chunk 重试、TTL/abort 已做；没有 agent/controller 重启后续传 |
-| 真实物理跨地域 | ❌ | 同 VPC 低 RTT；没有跨 region/高延迟 |
+| 真实物理跨地域 | ✅ | 深圳↔上海 25 ms TUN overlay 已测 |
 | Docker 测试复跑 | ⚠️ | Docker pull/容器内 agent 手测通过；标准 Dockerfile apt 构建未完成 |
 | macOS NAT/pf、Windows | ❌ | 只有 Linux NAT |
 | tracing/dashboard/打包 | ❌ | 未实现 |
@@ -197,7 +200,7 @@ PMTUD：
 - 非 Raft legacy controller 仍保留。
 - snapshot 跨重启续传未验证。
 - 磁盘满/撕裂写未注入。
-- 真实物理三主机已验证；跨地域/公网未验证。
+- 真实物理三主机、跨地域公网 quorum 已验证；未做动态 Raft membership、WAN 丢包/抖动、large snapshot 跨 WAN。
 
 ### 4.3 平台/运维
 
@@ -228,9 +231,10 @@ PMTUD：
 
 ## 6. 建议优先级
 
-1. **multipath/roaming**：双网卡/双 VPC，强制 3/3 路径切换。
-2. **PMTUD + reassembly**：`tc` 改 MTU、抓 ICMP PTB、TCP MSS；决定是否需要应用层重组。
-3. **公网 NAT 矩阵**：安全组 + 公网 IP + relay。
-4. **磁盘满/撕裂写**：ENOSPC、fsync 失败、重启恢复。
-5. **跨地域/高延迟**。
-6. Docker/CI 回归、macOS/Windows NAT、打包/tracing。
+1. **真正 multipath**：双 direct/双 relay 同时承载、路径选择/带宽聚合；当前只有双网卡 failover。
+2. **agent under PTB 黑洞**：用 iroh 真实流量穿过 netns 路由器，在黑洞下验证重连/回退；当前黑洞测试是 kernel ping。
+3. **应用层 fragment reassembly**：当前依赖目的端内核。
+4. **磁盘满/撕裂写**：ENOSPC、partially written log、重启恢复。
+5. **snapshot 跨重启续传**。
+6. **Docker 双容器网络/mDNS/TUN 回归**；标准 Dockerfile apt 构建仍受网络阻塞。
+7. **IPv6 PTB/逐跳 MTU**、**public exit NAT 云上**、**macOS/Windows**、**CI/tracing/打包**。
