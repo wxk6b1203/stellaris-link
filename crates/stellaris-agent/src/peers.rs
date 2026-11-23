@@ -18,6 +18,8 @@ pub struct PeerState {
     pub connected: bool,
     pub path: Option<String>,
     pub rtt_ms: Option<u64>,
+    /// Remote address of the selected transport path, if direct/relay IP.
+    pub path_addr: Option<String>,
     /// Path MTU reported by the current transport path, if known.
     pub mtu: Option<u16>,
     /// Number of selected-path changes observed for this peer.
@@ -49,6 +51,7 @@ impl PeerRegistry {
                     connected: false,
                     path: None,
                     rtt_ms: None,
+                    path_addr: None,
                     mtu: None,
                     path_changes: 0,
                 },
@@ -83,6 +86,7 @@ impl PeerRegistry {
         path: Option<String>,
         rtt_ms: Option<u64>,
         mtu: Option<u16>,
+        path_addr: Option<String>,
     ) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(peer) = guard.get_mut(node) {
@@ -93,6 +97,7 @@ impl PeerRegistry {
             peer.path = path;
             peer.rtt_ms = rtt_ms;
             peer.mtu = mtu;
+            peer.path_addr = path_addr;
         }
     }
 
@@ -136,10 +141,31 @@ overlay_ip = "10.7.0.2"
         let node: NodeId = "0202020202020202020202020202020202020202020202020202020202020202"
             .parse()
             .unwrap();
-        registry.mark(&node, true, Some("direct".into()), Some(5), Some(1200));
-        registry.mark(&node, true, Some("direct".into()), Some(6), Some(1200));
+        registry.mark(
+            &node,
+            true,
+            Some("direct".into()),
+            Some(5),
+            Some(1200),
+            None,
+        );
+        registry.mark(
+            &node,
+            true,
+            Some("direct".into()),
+            Some(6),
+            Some(1200),
+            None,
+        );
         assert_eq!(registry.get(&node).unwrap().path_changes, 1);
-        registry.mark(&node, true, Some("relay".into()), Some(50), Some(1100));
+        registry.mark(
+            &node,
+            true,
+            Some("relay".into()),
+            Some(50),
+            Some(1100),
+            None,
+        );
         assert_eq!(registry.get(&node).unwrap().path_changes, 2);
     }
 }

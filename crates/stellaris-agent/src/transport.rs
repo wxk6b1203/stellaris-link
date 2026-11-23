@@ -158,8 +158,8 @@ impl IrohTransport {
                             })
                             .await;
                     }
-                    let (path, rtt, mtu) = path_status(&conn);
-                    transport.peers.mark(&node, true, path, rtt, mtu);
+                    let (path, rtt, mtu, addr) = path_status(&conn);
+                    transport.peers.mark(&node, true, path, rtt, mtu, addr);
                     spawn_path_watch(conn.clone(), node, transport.peers.clone());
                     let tx = accept_tx.clone();
                     let peers = transport.peers.clone();
@@ -167,7 +167,7 @@ impl IrohTransport {
                     let down_tx = control_tx.clone();
                     tokio::spawn(async move {
                         read_loop(conn, node, network_hash, tx).await;
-                        peers.mark(&node, false, None, None, None);
+                        peers.mark(&node, false, None, None, None, None);
                         if let Some(tx) = &down_tx {
                             let _ = tx.send(ControlEvent::Down { node }).await;
                         }
@@ -206,6 +206,7 @@ impl IrohTransport {
             connected: false,
             path: None,
             rtt_ms: None,
+            path_addr: None,
             mtu: None,
             path_changes: 0,
         });
@@ -309,7 +310,9 @@ async fn read_loop(
     }
 }
 
-fn path_status(conn: &iroh::endpoint::Connection) -> (Option<String>, Option<u64>, Option<u16>) {
+fn path_status(
+    conn: &iroh::endpoint::Connection,
+) -> (Option<String>, Option<u64>, Option<u16>, Option<String>) {
     let paths = conn.paths();
     for path in paths.iter() {
         if path.is_selected() {
@@ -325,10 +328,14 @@ fn path_status(conn: &iroh::endpoint::Connection) -> (Option<String>, Option<u64
                 Some(path.rtt().as_millis() as u64),
                 conn.max_datagram_size()
                     .map(|n| n.min(u16::MAX as usize) as u16),
+                match path.remote_addr() {
+                    iroh::TransportAddr::Ip(addr) => Some(addr.to_string()),
+                    _ => None,
+                },
             );
         }
     }
-    (None, None, None)
+    (None, None, None, None)
 }
 
 fn spawn_path_watch(conn: iroh::endpoint::Connection, node: NodeId, peers: PeerRegistry) {
@@ -338,8 +345,8 @@ fn spawn_path_watch(conn: iroh::endpoint::Connection, node: NodeId, peers: PeerR
             if conn.paths().is_empty() {
                 break;
             }
-            let (path, rtt, mtu) = path_status(&conn);
-            peers.mark(&node, true, path, rtt, mtu);
+            let (path, rtt, mtu, addr) = path_status(&conn);
+            peers.mark(&node, true, path, rtt, mtu, addr);
         }
     });
 }
@@ -414,8 +421,8 @@ async fn connect_loop(
                         })
                         .await;
                 }
-                let (path, rtt, mtu) = path_status(&conn);
-                transport.peers.mark(&node, true, path, rtt, mtu);
+                let (path, rtt, mtu, addr) = path_status(&conn);
+                transport.peers.mark(&node, true, path, rtt, mtu, addr);
                 spawn_path_watch(conn.clone(), node, transport.peers.clone());
                 let tx = inbound_tx.clone();
                 let peers = transport.peers.clone();
@@ -424,7 +431,7 @@ async fn connect_loop(
                 let down_tx = control_tx.clone();
                 tokio::spawn(async move {
                     read_loop(conn2, node, network_hash, tx).await;
-                    peers.mark(&node, false, None, None, None);
+                    peers.mark(&node, false, None, None, None, None);
                     if let Some(tx) = &down_tx {
                         let _ = tx.send(ControlEvent::Down { node }).await;
                     }
@@ -432,7 +439,7 @@ async fn connect_loop(
                 let stable_id = conn.stable_id();
                 conn.closed().await;
                 transport.remove_conn_if(node, stable_id);
-                transport.peers.mark(&node, false, None, None, None);
+                transport.peers.mark(&node, false, None, None, None, None);
                 if let Some(tx) = &control_tx {
                     let _ = tx.send(ControlEvent::Down { node }).await;
                 }

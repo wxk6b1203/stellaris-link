@@ -432,6 +432,7 @@ zone = "az-b"
             Some("direct".into()),
             Some(100),
             Some(1200),
+            None,
         );
         let lsa = local_lsa(&state, 2, &connected);
         assert_eq!(lsa.links[0].metric, 30);

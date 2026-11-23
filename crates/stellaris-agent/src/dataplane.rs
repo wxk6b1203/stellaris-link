@@ -1091,9 +1091,14 @@ overlay_ip = "10.7.0.2"
     #[test]
     fn path_mtu_limits_clamped_mss() {
         let state = state();
-        state
-            .peers
-            .mark(&node(2), true, Some("direct".into()), Some(5), Some(1100));
+        state.peers.mark(
+            &node(2),
+            true,
+            Some("direct".into()),
+            Some(5),
+            Some(1100),
+            None,
+        );
         let mut p = vec![0u8; 44];
         p[0] = 0x45;
         p[2..4].copy_from_slice(&44u16.to_be_bytes());
@@ -1145,9 +1150,14 @@ overlay_ip = "10.7.0.2"
     #[test]
     fn oversized_inbound_generates_packet_too_big() {
         let state = state();
-        state
-            .peers
-            .mark(&node(2), true, Some("direct".into()), Some(5), Some(1000));
+        state.peers.mark(
+            &node(2),
+            true,
+            Some("direct".into()),
+            Some(5),
+            Some(1000),
+            None,
+        );
         let mut p = vec![0u8; 1400];
         p[0] = 0x45;
         p[2..4].copy_from_slice(&1400u16.to_be_bytes());
