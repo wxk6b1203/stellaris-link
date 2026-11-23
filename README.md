@@ -458,7 +458,20 @@ TLS 只保护 HTTP 控制面；认证仍走 API token / `control.secret`。证�
 - `control.controller_threshold != 1` 会配置报错
 - 多 controller 一致性由 openraft 负责
 
-### 24. 真正的 TUN overlay（两台机器，需要 root）
+### 24. 双网卡/跨批次
+
+```bash
+# 批2 双网卡 direct path failover
+H1=root@... H2=root@... H3=root@... \
+P1=192.168.0.162 P1B=192.168.0.164 P2=192.168.0.161 P3=192.168.0.163 \
+./scripts/test-real-dualnic-multipath.sh
+
+# 批1↔批2 公网 direct UDP / relay
+./scripts/test-real-crossbatch-direct.sh
+./scripts/test-real-crossbatch-relay.sh
+```
+
+### 25. 真正的 TUN overlay（两台机器，需要 root）
 
 两台 Linux 机器（或 macOS + Linux；macOS `utun42`）：
 
@@ -582,3 +595,5 @@ export BIN=/opt/stellaris/stellaris-agent
 - 3 agent IPv4 overlay，1000/2000-byte ping 0% loss（2000-byte 包经 1366-MTU TUN，验证分片转发 + 目的端重组）
 - 3 agent IPv6 overlay，1200-byte ping 0% loss
 - direct path -> relay path 切换
+- 双网卡 direct path failover（.162 → .164）
+- 跨批次公网 direct UDP / relay

@@ -68,7 +68,42 @@ cargo test                                                 110 passed
 - `scripts/test-real-3host-ipv6.sh`
 - `scripts/test-real-3host-roaming.sh`
 
-### 2.3 之前已验证（本轮未重复跑）
+### 2.3 新一批主机（2026-11-23）
+
+网络：
+
+- 批1：私网 10.0.0.88/89/90，同 /24
+- 批2：私网 192.168.0.161/162/163/164，同 /24；47.119.37.129 有 eth0/eth1 双网卡
+- 批1↔批2 私网不通
+- 公网 TCP 5689–6000 全部开放；用户打开 UDP 后，UDP 5689/5901/6000 也通
+- Docker 可用，`docker pull alpine:latest` 成功
+- 三台批1：2 vCPU/1.7 GiB/40 GB
+
+新增通过：
+
+| 测试 | 结果 |
+|---|---|
+| 批1 私网 3 controller + mTLS + failover | ✅ |
+| 批1 私网 IPv4 overlay + 1000/2000 ping | ✅ 0% loss |
+| 批1 私网 IPv6 overlay + 1200 ping | ✅ 0% loss |
+| 批1 direct→relay roaming | ✅（一个 peer relay，一个仍 direct） |
+| 批2 双网卡 direct path failover | ✅ `.162:5911` → `.164:5911` |
+| 批1↔批2 公网 direct UDP | ✅ |
+| 批1↔批2 公网 relay | ✅ |
+
+双网卡注意事项：
+
+- `.162`/`.164` 同 /24，默认路由都走 eth0
+- 需要 `arp_ignore=1`/`arp_announce=2` 和 source policy route（`from .164 table 164`）才能在 `.164` 上稳定工作
+- 测试脚本已包含该设置和清理
+
+脚本：
+
+- `scripts/test-real-dualnic-multipath.sh`
+- `scripts/test-real-crossbatch-direct.sh`
+- `scripts/test-real-crossbatch-relay.sh`
+
+### 2.4 之前已验证（本轮未重复跑）
 
 - macvlan 真实 LAN 3 controller + mTLS + partition recovery
 - Raft 本机 3 节点 + TLS/mTLS
@@ -85,14 +120,14 @@ cargo test                                                 110 passed
 | 项目 | 状态 | 说明 |
 |---|---|---|
 | 强制 multipath | ❌ | 只验证 direct→relay；没有双 direct/双 relay 同时可用与路径选择测试 |
-| 3/3 全路径 roaming | ⚠️ | 最终一次 H1 两个 peer 都是 relay；脚本仍只断言一个 peer，不等于严格 3/3 |
+| 3/3 全路径 roaming | ⚠️ | 批1 最后一次一个 peer relay、一个 direct；脚本仍只断言一个 peer |
 | 完整 PMTUD | ❌ | 没有逐跳 MTU 递减、PTB 黑洞、TCP MSS 抓包验证 |
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ❌ | 三台同 VPC，只走私网；没有公网入站/跨 NAT 测试 |
 | 磁盘满/撕裂写 | ❌ | 只读目录测试已做；没有 ENOSPC/partially written log |
 | snapshot 跨进程完整续传 | ⚠️ | begin/chunk 重试、TTL/abort 已做；没有 agent/controller 重启后续传 |
 | 真实物理跨地域 | ❌ | 同 VPC 低 RTT；没有跨 region/高延迟 |
-| Docker 测试复跑 | ❌ | 云主机未装 Docker；Docker 脚本依赖 bee 环境 |
+| Docker 测试复跑 | ⚠️ | 新主机 Docker 可用且 pull 成功；Docker 功能测试未逐项复跑 |
 | macOS NAT/pf、Windows | ❌ | 只有 Linux NAT |
 | tracing/dashboard/打包 | ❌ | 未实现 |
 
