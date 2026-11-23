@@ -152,7 +152,20 @@ restart leader 2:
 - node3 反复向 node1/node2 发 `SendVote`
 - 日志中出现 `Connection refused` 到 `https://120.77.233.189:5701` / `https://8.153.183.185:5701`
 
-需要排除是测试脚本杀死/未启动节点，还是 Raft 状态/选举真实问题。
+失败后保存的 raft-log/state：
+
+```text
+node1:
+  last_applied: T22-N2 index 5
+  vote: T123-N3
+node3:
+  last_applied: T22-N2 index 5
+  vote: T125-N3
+```
+
+同时从 node3 直连 node1:5701 是通的，node2 已停。
+
+说明 node1 已经给 node3 投过票，但 node3 仍反复升 term，选举没有收敛。需要继续查 vote RPC 返回/选举实现。
 
 这是一个真实问题：**在 follower 已被重启的情况下，随后重启 leader 可能导致剩余节点无法选出 leader**。需要进一步查 Raft 状态/日志/选举。
 

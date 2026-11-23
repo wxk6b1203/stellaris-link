@@ -72,7 +72,7 @@
 需要：
 
 - 开 Raft debug/tracing
-- 查 log/term/vote 状态
+- 已观察到：node1 vote T123-N3，node3 vote T125-N3，两者 last_applied 都是 T22-N2/index5；node3 可 TCP 连到 node1，但仍反复选举
 - 是否 follower 重启后 log 落后导致无法赢得选举
 - 是否测试脚本在重启后错误地杀掉/未启动节点
 - 是否 rolling restart 顺序/选举超时需要调整
