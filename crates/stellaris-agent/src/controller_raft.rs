@@ -807,6 +807,16 @@ async fn raft_snapshot_begin(
             }
             keep
         });
+        if let Some((existing_id, received)) = assemblies
+            .iter()
+            .find(|(_, pending)| pending.total == req.total && pending.checksum == req.checksum)
+            .map(|(id, pending)| (id.clone(), pending.data.len()))
+        {
+            return Ok(Json(serde_json::json!({
+                "id": existing_id,
+                "received": received,
+            })));
+        }
         if assemblies.len() >= 8 {
             return Err((
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -833,7 +843,7 @@ async fn raft_snapshot_begin(
             },
         );
     }
-    Ok(Json(serde_json::json!({ "id": id })))
+    Ok(Json(serde_json::json!({ "id": id, "received": 0 })))
 }
 
 async fn raft_snapshot_chunk(
@@ -1207,7 +1217,10 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
                     openraft::error::StreamingError::Unreachable(Unreachable::new(&e))
                 })?;
                 let id = body["id"].as_str().unwrap_or_default().to_string();
-                for (offset, chunk) in data.chunks(2 * 1024 * 1024).enumerate() {
+                let received = body["received"].as_u64().unwrap_or(0) as usize;
+                let chunk_size = 2 * 1024 * 1024;
+                let first_chunk = received / chunk_size;
+                for (offset, chunk) in data.chunks(chunk_size).enumerate().skip(first_chunk) {
                     let mut last_error = None;
                     let mut accepted = false;
                     for attempt in 0..3 {
@@ -1788,6 +1801,18 @@ mod tests {
         )
         .await
         .unwrap();
+        // A restarted sender begins again with the same checksum; the
+        // persisted assembly must be found and resumed.
+        let response = client
+            .post(format!("http://{}/raft/snapshot/begin", second.address))
+            .header(RAFT_SECRET_HEADER, "secret")
+            .json(&begin)
+            .send()
+            .await
+            .unwrap();
+        let resumed = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(resumed["id"].as_str().unwrap(), id);
+        assert_eq!(resumed["received"].as_u64().unwrap(), 2 * 1024 * 1024);
         for (offset, chunk) in data[2 * 1024 * 1024..].chunks(2 * 1024 * 1024).enumerate() {
             let response = client
                 .post(format!("http://{}/raft/snapshot/chunk", second.address))

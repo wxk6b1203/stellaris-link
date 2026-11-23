@@ -100,6 +100,7 @@ snapshot_transfer_survives_http_restart
 - transfer 元数据和 data.bin 持久化到 `raft_dir/snapshot-transfers/<id>/`
 - controller HTTP server 重启后加载未完成 transfer
 - 使用同一个 transfer ID 从已接收 offset 继续发送剩余 chunk
+- sender 重启后再次 begin 也能拿到同一 id/received
 - finish 成功
 
 仍有限制：

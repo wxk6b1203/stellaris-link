@@ -193,7 +193,7 @@ PMTUD：
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ⚠️ | 批1↔批2、深圳↔上海公网 direct/relay 已测；public exit NAT 云上未测 |
 | 磁盘满/撕裂写 | ⚠️ | ENOSPC→503、撕裂 log 启动失败已验证；慢 IO/fsync 未注入 |
-| snapshot 跨进程续传 | ⚠️ | controller HTTP 重启后续传已实现/单测；agent 客户端重启、整集群滚动重启未验证 |
+| snapshot 跨进程续传 | ⚠️ | controller HTTP 重启 + sender 重新 begin 续传已实现/单测；真实 3 controller 进程滚动重启未测 |
 | 真实物理跨地域 | ✅ | 深圳↔上海 25 ms TUN overlay 已测 |
 | Docker 测试复跑 | ⚠️ | Docker pull/容器内 agent 手测通过；标准 Dockerfile apt 构建未完成 |
 | macOS NAT/pf、Windows | ❌ | 只有 Linux NAT |

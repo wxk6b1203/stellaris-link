@@ -538,6 +538,7 @@ examples/               # 示例 TOML
 | [PROTOCOL.md](PROTOCOL.md) | 控制协议/API/MeshHeader |
 | [PLAN.md](PLAN.md) | 里程碑、Epic、第一 sprint |
 | [GAPS.md](GAPS.md) | 能力/测试审计与未验证项 |
+| [FOLLOWUP.md](FOLLOWUP.md) | 已接受的边界与后续工作 |
 | [TEST-RESULTS.md](TEST-RESULTS.md) | 真实环境测试原始结果 |
 | [ADVANCED-ROUTING.md](ADVANCED-ROUTING.md) | 静态路由、AZ 分段、subnet gateway 设计 |
 | [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
