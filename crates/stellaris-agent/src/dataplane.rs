@@ -499,6 +499,27 @@ async fn egress_worker(
     }
 }
 
+fn outbound_ptb(
+    state: &AgentState,
+    packet: &[u8],
+    next: stellaris_types::NodeId,
+) -> Option<Vec<u8>> {
+    let v6 = packet.first().is_some_and(|b| b >> 4 == 6);
+    let df = packet.len() >= 8 && packet[0] >> 4 == 4 && packet[6] & 0x40 != 0;
+    if !v6 && !df {
+        return None;
+    }
+    let peer = state.peers.get(&next)?;
+    let mtu = path_mtu(state, Some(&peer), packet);
+    if packet.len() <= mtu as usize {
+        return None;
+    }
+    // Present the PTB as coming from the next-hop overlay address, as a
+    // downstream router would. Writing it with our own source address makes
+    // the kernel discard the self-generated ICMP error.
+    wire::icmp_too_big(packet, mtu, peer.overlay_ip)
+}
+
 async fn outbound_loop(
     dev: Arc<AsyncDevice>,
     state: AgentState,
@@ -515,6 +536,12 @@ async fn outbound_loop(
         else {
             continue;
         };
+        if let Some(error) = outbound_ptb(&state, &buf[..n], next) {
+            if let Err(e) = dev.send(&error).await {
+                debug!(error = %e, "TUN PTB send failed");
+            }
+            continue;
+        }
         sequence = sequence.wrapping_add(1);
         let egress = EgressFrame {
             next,
@@ -1149,6 +1176,34 @@ overlay_ip = "10.7.0.2"
             InboundAction::Deliver(p)
         );
     }
+    #[test]
+    fn oversized_outbound_df_generates_peer_sourced_ptb() {
+        let state = state();
+        state.peers.mark(
+            &node(2),
+            true,
+            Some("direct".into()),
+            Some(5),
+            Some(1000),
+            None,
+        );
+        let mut p = vec![0u8; 1400];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&1400u16.to_be_bytes());
+        p[6] = 0x40;
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&[10, 7, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 7, 0, 2]);
+        let error = outbound_ptb(&state, &p, node(2)).expect("PTB");
+        assert_eq!(error[0] >> 4, 4);
+        assert_eq!(&error[12..16], &[10, 7, 0, 2]);
+        assert_eq!(&error[16..20], &[10, 7, 0, 1]);
+        assert_eq!(error[20], 3);
+        assert_eq!(error[21], 4);
+        assert_eq!(u16::from_be_bytes([error[26], error[27]]), 984);
+    }
+
     #[test]
     fn oversized_inbound_generates_packet_too_big() {
         let state = state();

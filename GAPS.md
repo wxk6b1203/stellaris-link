@@ -34,7 +34,7 @@
 ```text
 cargo fmt --check                                          ✅
 cargo clippy --all-targets -- -D warnings                  ✅
-cargo test                                                 110 passed
+cargo test                                                 111 passed
 ```
 
 覆盖：
@@ -119,9 +119,10 @@ Docker：
 PMTUD：
 
 - 已修：peer MTU 未知时不再回退到 1100，使用配置 MTU
-- 未完成：手工把 TUN MTU 提到 1500 后，1450-byte DF 包在源端被静默丢弃，未收到本端/下游 ICMP PTB
-- 现有覆盖：peer path MTU、MSS clamp、入站 oversized PTB、TUN 自适应
-- 缺口：**源端 oversized DF 包的 PTB/route MTU 处理**
+- 已加：源端 oversized DF 包的 PTB 合成（ICMP 类原包除外）+ TCP MSS clamp
+- 已验证：peer path MTU 1162–1414、TUN MTU 自适应、手工抬高 TUN MTU 后 2 MiB TCP 传输成功
+- 未验证：真实下游路由器 PTB 黑洞、逐跳 MTU 递减、ICMP PTB 抓包
+- 缺口：源端 PTB 是本地合成，不是完整互联网 PMTUD 黑洞探测
 
 ### 2.5 之前已验证（本轮未重复跑）
 
@@ -141,7 +142,7 @@ PMTUD：
 |---|---|---|
 | 强制 multipath | ❌ | 只验证 direct→relay；没有双 direct/双 relay 同时可用与路径选择测试 |
 | 3/3 全路径 roaming | ⚠️ | 批1 最后一次一个 peer relay、一个 direct；脚本仍只断言一个 peer |
-| 完整 PMTUD | ❌ | 源端超大 DF 包会静默丢；缺 route MTU/源端 PTB；未做逐跳 MTU 递减 |
+| 完整 PMTUD | ⚠️ | source PTB + TCP MSS + TUN 自适应已验证；真实下游 PTB 黑洞/逐跳 MTU 未测 |
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ❌ | 三台同 VPC，只走私网；没有公网入站/跨 NAT 测试 |
 | 磁盘满/撕裂写 | ❌ | 只读目录测试已做；没有 ENOSPC/partially written log |

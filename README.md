@@ -599,3 +599,5 @@ export BIN=/opt/stellaris/stellaris-agent
 - 跨批次公网 direct UDP / relay
 - 深圳↔上海 25ms 公网 TUN overlay + 2000-byte 分片 ping
 - 深圳/上海 3 controller 公网 quorum + mTLS + failover
+- 跨地域 25ms TUN overlay + 2000-byte 分片 ping
+- PMTUD: peer MTU 1162–1414、MSS clamp、TUN 自适应、2 MiB TCP 传输
