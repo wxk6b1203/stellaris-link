@@ -119,3 +119,19 @@
 2. 传输层 multipath（需要新设计）
 3. 应用层 fragment reassembly
 4. Docker/CI 回归
+
+---
+
+## 4. 2026-11-24 审计修复后的剩余项
+
+已完成（有真实主机/本机证据，见 [AUDIT.md](AUDIT.md) §7、[TEST-RESULTS.md](TEST-RESULTS.md) §3.11）：
+LSA 签名、transit capability、OS 路由防护、iroh 走 Raft、Raft 鉴权/超时、
+routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、snapshot/manifest fail-closed、
+动态 membership 接口、配置 no-op、route TTL、QoS 校验、CLI/API/discovery 测试。
+
+下一步（按优先级）：
+1. relay 路径选择/多 relay：现有测试只断言 relay 消失后连接不断；需要自建双 relay + 注入验证实际切换。
+2. 动态 membership 四进程演练：add_learner → change_membership → 移除，含 quorum 检查。
+3. iroh >4MiB 快照端到端（帧上限已提到 64MiB，但未实测）。
+4. 持续慢链路下 60s transfer TTL / 大快照续传。
+5. 真 multipath、应用层 fragment reassembly、真实互联网 PMTUD、macOS NAT、打包/CI 矩阵。

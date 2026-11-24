@@ -1,6 +1,7 @@
 # Openraft Controller HA — 设计、实现与迁移记录
 
 > 状态：H0–H4 已完成。3 节点 openraft、HTTP Raft、mTLS、分块 snapshot、leader failover、partition/crash recovery、真实物理三主机 HA 已实现。
+> 2026-11-24：审计修复后，iroh 入口改走 Raft；routes/LSA TTL/epoch 进入复制状态；新增签名 join、admin secret、动态 membership API 与 `control.lsa_ttl_secs`（详见 [AUDIT.md](AUDIT.md) §7）。
 > 当前实现：openraft 复制的确定性状态机；member 通过单个 controller URL/iroh 入口接入；旧 active-active fanout 已移除。
 > 本文保留设计、迁移和验证记录。§8–§10 中标注“限制/尚未”的内容多为阶段记录；当前实现状态以本文顶部和 README/PLAN 为准。
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)。
@@ -319,7 +320,33 @@ control.raft_election_timeout_ms   (正式配置)
 
 ---
 
-## 6. 与现有 API 的兼容
+### 5.7 状态复制与成员操作（2026-11-24）
+
+审计后 Raft 模式的行为：
+
+- **路由**：`POST /v1/routes` 写入 `ControllerCommand::UpsertRoute`，进入
+  `ControllerModel.routes`；RouteId 由 `(network, prefix, via)` 经 UUIDv5 派生，
+  三副本一致；follower 写入返回 503 + leader hint。
+- **LSA TTL**：leader 每 5s 检查 `lsa_seen`，超过 `control.lsa_ttl_secs`（默认 30s）
+  的 LSA 通过 `ExpireLsa { origin, up_to_seq }` 复制删除；新 leader 会先给所有
+  现存 LSA 一个 TTL 宽限期。
+- **epoch**：Raft 模式初始 epoch 为 0（配置显式值优先），leader 当选后写入
+  `SetEpoch{max(now, epoch+1)}`；`RevokeMember` 也会 +1，旧 manifest 因此失效。
+- **加入**：`require_join_signature = true` 时，`/v1/join` 必须带 nonce 与
+  origin 私钥签名；member agent 始终签名，curl 引导脚本需显式关闭或自行签名。
+- **权限**：`control.admin_secret` 存在时，`revoke` 与 `routes` 只接受 admin
+  secret，member secret 仅能读快照/写 LSA/加入。
+- **动态成员**：`POST /v1/raft/learner {id, addr}` 与
+  `POST /v1/raft/membership {voters:[{id,addr}]}`（admin）分别封装
+  `add_learner`（非阻塞）与 `change_membership`。
+- **快照**：member 默认拒绝未签名快照（可用 `allow_unsigned_snapshot` 显式放开），
+  并校验 `network_id` 与 epoch 回退；manifest 只能由 leader 签发（follower 503）。
+- **iroh**：`dispatch_control` 现在 `linearize` 后读快照，LSA/Ack 走
+  `apply_lsa_current`/`record_ack_current`，不再触碰 legacy 内存状态。
+
+---
+
+## 6. 与现有 API 的兼容## 6. 与现有 API 的兼容
 
 ### 6.1 写路径
 

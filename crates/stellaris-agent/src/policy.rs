@@ -57,6 +57,12 @@ impl PolicyFile {
             if class.burst_bytes == Some(0) {
                 return Err(format!("qos class {} burst_bytes must be > 0", class.name));
             }
+            if class.queue_depth == Some(0) {
+                return Err(format!("qos class {} queue_depth must be > 0", class.name));
+            }
+            if class.queue_bytes == Some(0) {
+                return Err(format!("qos class {} queue_bytes must be > 0", class.name));
+            }
         }
         Ok(())
     }
@@ -485,5 +491,42 @@ dst_port = 443
         assert_eq!(policy.apply_qos(&mut p1, &info), QosVerdict::Marked(46));
         let mut p2 = https_packet();
         assert_eq!(policy.apply_qos(&mut p2, &info), QosVerdict::RateLimited);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn class(field: &str) -> stellaris_types::QosClass {
+        let mut class: stellaris_types::QosClass = serde_json::from_value(serde_json::json!({
+            "name": "c",
+            "dscp": 0
+        }))
+        .unwrap();
+        match field {
+            "queue_depth" => class.queue_depth = Some(0),
+            "queue_bytes" => class.queue_bytes = Some(0),
+            "rate_pps" => class.rate_pps = Some(0),
+            "rate_bps" => class.rate_bps = Some(0),
+            _ => unreachable!(),
+        }
+        class
+    }
+
+    #[test]
+    fn policy_validation_rejects_zero_queue_caps() {
+        for field in ["queue_depth", "queue_bytes", "rate_pps", "rate_bps"] {
+            let policy = PolicyFile {
+                acl: Default::default(),
+                qos: QosConfig {
+                    enabled: true,
+                    classes: vec![class(field)],
+                    ..Default::default()
+                },
+            };
+            let error = policy.validate().unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
     }
 }

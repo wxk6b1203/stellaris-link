@@ -36,6 +36,11 @@ pub enum ControllerCommand {
         origin: NodeId,
         up_to_seq: u64,
     },
+    /// Batch form used by the leader housekeeping task: one Raft write can
+    /// retire many stale LSAs instead of one entry per origin.
+    ExpireLsas {
+        entries: Vec<(NodeId, u64)>,
+    },
     UpsertMember {
         node: NodeId,
         member: MemberRecord,
@@ -115,6 +120,20 @@ impl ControllerModel {
                     self.lsas.insert(lsa.origin, lsa);
                 }
                 newer
+            }
+            ControllerCommand::ExpireLsas { entries } => {
+                let mut removed = false;
+                for (origin, up_to_seq) in entries {
+                    if self
+                        .lsas
+                        .get(&origin)
+                        .is_some_and(|lsa| lsa.seq <= up_to_seq)
+                    {
+                        self.lsas.remove(&origin);
+                        removed = true;
+                    }
+                }
+                removed
             }
             ControllerCommand::ExpireLsa { origin, up_to_seq } => {
                 if self
@@ -355,6 +374,25 @@ mod tests {
             lsa: lsa(1, 1, "10.0.0.2/32"),
         });
         assert_eq!(model.lsas[&NodeId::new([1u8; 32])].seq, 2);
+    }
+
+    #[test]
+    fn expire_lsas_batch_retires_only_matching_sequences() {
+        let a = NodeId::new([1u8; 32]);
+        let b = NodeId::new([2u8; 32]);
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::ApplyLsa {
+            lsa: lsa(1, 5, "10.0.0.1/32"),
+        });
+        model.apply(ControllerCommand::ApplyLsa {
+            lsa: lsa(2, 9, "10.0.0.2/32"),
+        });
+        assert!(model.apply(ControllerCommand::ExpireLsas {
+            entries: vec![(a, 5), (b, 8)],
+        }));
+        assert!(!model.lsas.contains_key(&a));
+        // b's LSA is newer than the requested sequence and must survive.
+        assert!(model.lsas.contains_key(&b));
     }
 
     #[test]

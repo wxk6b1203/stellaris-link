@@ -22,8 +22,8 @@
 
 ```text
 cargo fmt --check                          ✅
-cargo clippy -p stellaris-types -p stellaris-agent --all-targets -- -D warnings  ✅
-cargo test --workspace                     118 passed
+cargo clippy --workspace --all-targets -- -D warnings  ✅
+cargo test --workspace                     152 passed
 ```
 
 ---
@@ -339,7 +339,53 @@ LSA 把状态推进到 generation 5402，再清空 ctrl3 并限速启动：
   "transfer TTL 与滚动重启窗口协调"）。
 - 丢包/抖动叠加慢链路时的大 snapshot 没有测。
 
-### 3.11 仍未验证
+### 3.11 2026-11-24 晚审计修复验证（8 台临时主机）
+
+成都 8.137.217.116/.51、深圳 47.112.117.96/.100.19、乌兰察布 8.161.224.235/.111、
+上海 8.153.184.35/.228；公网互通，地域间 RTT 28–41 ms；`.116` 编译 release 后
+md5 `9306484038210dce706ec406a41a71eb` 分发到其余 7 台。
+
+| 验证 | 脚本 | 结果 |
+|---|---|---|
+| Raft 路由复制（三副本同 RouteId） | `scripts/test-controller-state-ha.sh` | ✅ |
+| admin secret 分离（member secret 写路由 401） | 同上 | ✅ |
+| 未签名 join 403 / agent 签名 join 复制到三副本 | 同上 | ✅ |
+| 复制 LSA TTL（2s）到期后三副本同时移除 | 同上 | ✅ |
+| 换主后 epoch 单调 | 同上 | ✅ |
+| iroh 入口走 Raft（follower 不落本地、leader 复制三副本） | `scripts/test-real-iroh-raft.sh` | ✅ |
+| OS 路由安全（默认路由 opt-in、外部路由不覆盖、proto 240、显式替换） | `scripts/test-netns-route-safety.sh` | ✅ |
+| netns 3-node controller（含 transit 授权，ping/status 有断言） | `scripts/test-linux-netns-3node-controller.sh` | ✅ |
+| netns IPv6（含 transit 授权） | `scripts/test-linux-netns-ipv6.sh` | ✅ |
+| netns TUN / 3-node 分布式 LSA | `test-linux-netns-tun.sh` / `test-linux-netns-3node.sh` | ✅ |
+| 分布式 LSA 签名链路 | `demo-distributed-linkstate.sh` | ✅ |
+| TLS 集成 / 三进程 mTLS Raft | `test-tls.sh` / `test-controller-raft-tls-3node.sh` | ✅ |
+| 本机三进程 Raft（含默认 1000ms 检查） | `test-controller-raft-3node.sh` | ✅ |
+| 三地 TOML 滚动重启（新二进制） | `test-real-rolling-restart-ha.sh` | ✅ |
+| 三地 20% 丢包 + 50ms（新二进制） | `test-real-wan-loss-ha.sh` | ✅ 换主 4.1s |
+| 三地 >4MiB snapshot（重跑） | 临时编排 | 见 §3.10；本次重跑结果记录在下方 |
+
+state-ha 关键输出：
+
+```text
+leader=1
+route present on all replicas (via=0202...0202)
+member secret rejected for admin write
+signed join replicated (74816bbd...)
+LSA present: ['74816bbd...'] -> LSA expired on all replicas
+epoch monotonic (1795518007 -> 1795518007), new leader=2
+OK: controller state replication, signed join, LSA TTL and epoch verified
+```
+
+iroh-raft 关键输出：
+
+```text
+leader=1 follower=2
+follower did not apply the iroh LSA
+iroh LSA applied on the leader and replicated to all replicas
+OK: iroh control path goes through Raft
+```
+
+### 3.12 仍未验证### 3.11 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot

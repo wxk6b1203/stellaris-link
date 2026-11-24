@@ -1,7 +1,8 @@
 # Stellaris Linking — Implementation Architecture
 
 > 版本：v0.1（2026-11-22）
-> 状态：设计定稿，准备开工
+> 状态：**设计文档**。本文包含 v1 目标设计与尚未实现的条目（如 Path 层、IPv4 重组、Byte-DRR、controller status/metrics、Postgres 等）。
+> 当前实现状态与已实现/未实现清单以 [README.md](README.md) 顶部与 [AUDIT.md](AUDIT.md) 为准（2026-11-24 审计已修复 P0 与大部分 P1）。
 > 目标：一个**完全掌控、相对可靠、可长期维护**的 L3 虚拟组网系统，Rust 实现，iroh/QUIC 传输，可选控制面，支持每节点路由查询与路由调节。
 > 本文是实现的单一事实源；调研背景见 `stellaris-linking-architecture.md`、`stellaris-linking-routing-design.md`、`virtual-network-survey-2026-11.md`。
 

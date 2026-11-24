@@ -1,6 +1,7 @@
 # Stellaris Linking — Execution Plan
 
 > 版本：v0.1（2026-11-22）
+> 2026-11-24：审计修复了 P0 与大部分 P1（LSA 签名、transit、路由安全、iroh/Raft、签名 join、状态复制、动态 membership 接口等），剩余项见 [AUDIT.md](AUDIT.md) §7 与 [PRIORITIES.md](PRIORITIES.md)。
 > 配套：`ARCHITECTURE.md`、`PROTOCOL.md`
 > 目标：从 0 到可内测 MVP；按 2～3 人团队排期。
 

@@ -122,13 +122,15 @@ Raft 保证“副本一致”，不保证“写入合法”。所以先做：
 - MSS/peer MTU/ICMP PTB、fragment ACL
 - relay failover、per-class queue
 
-剩余：
+2026-11-24 审计修复后剩余：
 
-1. 完整 PMTUD 状态机 / 应用层 fragment reassembly
-2. 强制 multipath（双接口/双路径）
-3. 磁盘满/撕裂写注入
-4. 公网 NAT/安全组矩阵
-5. Windows/macOS NAT、打包/service/upgrade、tracing/UI
+1. 真 multipath（双 direct/双 relay 同时承载、按 RTT/丢包调度、去重）
+2. 应用层 fragment reassembly / 完整 PMTUD 状态机
+3. relay 路径选择验证（现有测试只断言 relay 消失后不断线）
+4. 动态 membership 四进程演练、iroh >4MiB 端到端、持续慢链路 TTL
+5. 磁盘慢 IO/撕裂写注入、公网 NAT 矩阵、Windows/macOS NAT、打包/service/tracing
+
+修复记录见 [AUDIT.md](AUDIT.md) §7。
 
 ---
 

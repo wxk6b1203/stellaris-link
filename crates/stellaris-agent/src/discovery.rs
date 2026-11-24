@@ -35,6 +35,11 @@ pub fn start(state: AgentState, transport: Arc<IrohTransport>) {
     }
 }
 
+/// A discovery announce is only usable inside its own network.
+fn announce_matches_network(announce: &Announce, network: &crate::NetworkId) -> bool {
+    announce.network == network.to_string()
+}
+
 fn start_broadcast(state: AgentState, transport: Arc<IrohTransport>) {
     let Some(port) = state.config.transport.discovery_port else {
         return;
@@ -106,7 +111,7 @@ fn start_broadcast(state: AgentState, transport: Arc<IrohTransport>) {
             let Ok(announce) = serde_json::from_slice::<Announce>(&buf[..n]) else {
                 continue;
             };
-            if announce.network != state.network.to_string() {
+            if !announce_matches_network(&announce, &state.network) {
                 continue;
             }
             let Ok(node) = announce.node.parse::<NodeId>() else {
@@ -277,4 +282,47 @@ fn bind_port(port: u16) -> anyhow::Result<tokio::net::UdpSocket> {
     socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
     socket.set_nonblocking(true)?;
     Ok(tokio::net::UdpSocket::from_std(socket.into())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellaris_types::NetworkId;
+
+    #[test]
+    fn announce_only_matches_its_network() {
+        let network = NetworkId::new();
+        let announce = Announce {
+            network: network.to_string(),
+            node: NodeId::new([1u8; 32]).to_string(),
+            overlay_ip: "10.7.0.1".parse().unwrap(),
+            zone: Some("az-a".into()),
+            addrs: vec!["192.0.2.1:5611".parse().unwrap()],
+        };
+        assert!(announce_matches_network(&announce, &network));
+        assert!(!announce_matches_network(&announce, &NetworkId::new()));
+    }
+
+    #[test]
+    fn announce_json_roundtrips() {
+        let network = NetworkId::new();
+        let announce = Announce {
+            network: network.to_string(),
+            node: NodeId::new([2u8; 32]).to_string(),
+            overlay_ip: "10.7.0.2".parse().unwrap(),
+            zone: None,
+            addrs: vec![],
+        };
+        let bytes = serde_json::to_vec(&announce).unwrap();
+        let decoded: Announce = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.node, announce.node);
+        assert_eq!(decoded.overlay_ip, announce.overlay_ip);
+        assert!(MDNS_SERVICE.ends_with(".local."));
+    }
+
+    #[test]
+    fn malformed_announce_is_rejected() {
+        assert!(serde_json::from_slice::<Announce>(b"{}").is_err());
+        assert!(serde_json::from_slice::<Announce>(b"not json").is_err());
+    }
 }

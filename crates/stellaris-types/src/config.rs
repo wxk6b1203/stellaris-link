@@ -934,6 +934,18 @@ impl Config {
                     class.name
                 )));
             }
+            if class.rate_bps == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "qos class {} rate_bps must be > 0",
+                    class.name
+                )));
+            }
+            if class.burst_bytes == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "qos class {} burst_bytes must be > 0",
+                    class.name
+                )));
+            }
             if class.queue_bytes == Some(0) {
                 return Err(ConfigError::Invalid(format!(
                     "qos class {} queue_bytes must be > 0",
@@ -1182,6 +1194,34 @@ cidr = "10.7.0.0/16"
                 error.contains(name.split('.').next().unwrap()),
                 "{name}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn qos_class_zero_rates_are_rejected_on_both_paths() {
+        for (field, value) in [
+            ("rate_bps", "rate_bps = 0"),
+            ("burst_bytes", "burst_bytes = 0"),
+            ("queue_depth", "queue_depth = 0"),
+            ("queue_bytes", "queue_bytes = 0"),
+        ] {
+            let toml = format!(
+                r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[qos]
+enabled = true
+[[qos.classes]]
+name = "c"
+dscp = 0
+{value}
+"#
+            );
+            let error = Config::from_toml(&toml).unwrap_err().to_string();
+            assert!(error.contains(field), "{field}: {error}");
         }
     }
 

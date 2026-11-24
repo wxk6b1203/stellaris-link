@@ -34,7 +34,7 @@
 ```text
 cargo fmt --check                                          ✅
 cargo clippy --all-targets -- -D warnings                  ✅
-cargo test                                                 118 passed
+cargo test                                                 152 passed
 ```
 
 覆盖：
@@ -228,6 +228,16 @@ PMTUD：
 - agent 客户端重启后的 snapshot 续传未验证（controller 侧 + 整集群滚动后的续传已在 TEST-RESULTS §3.10 验证）。
 - 动态 Raft membership 未实现（不是"未验证"）；WAN 丢包/大 snapshot 已测单次，未做 soak。
 - 2026-11-24 审计发现：iroh 控制入口绕过 Raft、`POST /v1/routes` 不进 Raft、Raft 模式 LSA TTL 不执行、epoch 不复制、Raft RPC 可无鉴权等，详见 [AUDIT.md](AUDIT.md)。
+
+### 4.3.1 2026-11-24 审计修复（详见 AUDIT.md §7）
+
+已修复并验证：LSA Ed25519 签名、transit capability 强制、OS 路由 owner/默认路由防护、
+iroh 入口走 Raft、Raft RPC 鉴权/超时/checksum、routes/LSA TTL/epoch 入 Raft、
+签名 join、admin secret 分权、snapshot/manifest 默认 fail-closed、动态 membership 接口、
+配置 no-op 报错、route TTL、QoS 校验对称。
+
+仍开放：relay 路径选择（测试只断言“不断线”）、iroh >4MiB 端到端、动态 membership
+四进程演练、持续慢链路 60s TTL、真 multipath、应用层重组、真实互联网 PMTUD、macOS NAT。
 
 ### 4.4 平台/运维
 

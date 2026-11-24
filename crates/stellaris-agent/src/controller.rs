@@ -659,18 +659,24 @@ impl ControllerState {
                 let live: HashSet<NodeId> = model.lsas.keys().copied().collect();
                 seen.retain(|origin, _| live.contains(origin));
             }
-            for (origin, up_to_seq) in stale {
+            if !stale.is_empty() {
+                // One command per round keeps the log small even when a large
+                // model expires at once.
                 match raft
-                    .client_write(ControllerCommand::ExpireLsa { origin, up_to_seq })
+                    .client_write(ControllerCommand::ExpireLsas {
+                        entries: stale.clone(),
+                    })
                     .await
                 {
                     Ok(_) => {
-                        self.lsa_seen
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&origin);
+                        let mut seen = self.lsa_seen.lock().unwrap_or_else(|e| e.into_inner());
+                        for (origin, _) in &stale {
+                            seen.remove(origin);
+                        }
                     }
-                    Err(error) => tracing::debug!(%error, %origin, "raft LSA expiry failed"),
+                    Err(error) => {
+                        tracing::debug!(%error, count = stale.len(), "raft LSA expiry batch failed")
+                    }
                 }
             }
         }

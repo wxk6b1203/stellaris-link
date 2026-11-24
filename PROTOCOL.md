@@ -4,7 +4,7 @@
 > 配套：`ARCHITECTURE.md`
 > 范围：控制面 wire protocol、RouteQuery/RouteAdjust HTTP API、CLI 映射、版本/安全约定。
 >
-> **MVP 说明**：当前已实现的是一个极简 HTTP controller（`GET /v1/snapshot` + `POST /v1/routes`，`x-stellaris-secret` 鉴权）；本文的 iroh control protocol（Hello/manifest/epoch/签名/ACK）是下一阶段目标。
+> **实现状态（2026-11-24）**：HTTP controller 已含 openraft HA、mTLS、snapshot/manifest、join/revoke/ack、`/v1/raft/*` 成员操作；iroh control 已实现 JSON 帧（签名 LSA/ACK、线性化快照）并走 Raft。本文中的 protobuf/8MiB/Hello/nonce/Delta、`/v1/paths`、SSE、history/rollback 等仍是设计目标，未实现项以 [AUDIT.md](AUDIT.md) §5/§7 为准。
 
 ---
 

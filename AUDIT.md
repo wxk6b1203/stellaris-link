@@ -24,6 +24,27 @@
 
 ---
 
+## 0.1 2026-11-24 修复状态（当晚）
+
+下面 §1–§3 保留当天上午的审计原文；本条与 §7 是修复后的状态。
+
+| 级别 | 修复 | 仍有边界 |
+|---|---|---|
+| P0 | 6 / 6 已修复并在真实主机/本机验证 | 无已知 P0 残留 |
+| P1 | 15 / 17 已修复；2 项部分完成（relay 路径选择、iroh >4MiB 端到端） | 见 §7.2 |
+| P2 | 文档与 CI 少量项处理，其余仍开放 | 见 §7.3 |
+
+P0 证据速查：
+
+| 项 | 证据 |
+|---|---|
+| P0-1 LSA 签名 | `lsa_auth` 单测（签名/篡改/换钥/畸形）；`demo-distributed-linkstate.sh` 三进程通过（LSA 帧带签名） |
+| P0-2 transit capability | `membership::tests::dataplane_grants_require_transit_for_other_sources`；netns 3-node controller/IPv6 脚本给转发成员 `capabilities=["transit"]` 后通过 |
+| P0-3 OS 路由防护 | `scripts/test-netns-route-safety.sh` 在临时主机通过（默认路由拒绝、外部路由保留、proto 240 标记、显式替换） |
+| P0-4 iroh 走 Raft | `scripts/test-real-iroh-raft.sh`：follower iroh 入口不落本地，leader 入口复制到三副本 |
+| P0-5 Raft 鉴权/超时/checksum | `control.raft_dir` 强制非空 `raft_secret`、TLS 配对、RPC 超时、单发 snapshot 拒绝空 checksum；config 单测 + 全部 raft 脚本（TLS/三地/滚动）通过 |
+| P0-6 脚本假绿 | netns 3-node-controller 改为断言并在主机通过；WAN 丢包脚本加 `-e`/逐项失败/重试后在成都-深圳-上海通过 |
+
 ## 1. P0：会直接推翻"可用/安全"结论的项
 
 ### P0-1 LSA 无签名，且 origin 不与连接绑定
@@ -163,3 +184,47 @@
 5. **文档与 CI 对账（1-2 天）**：按本文 §5 全量修正；把 ARCHITECTURE/PROTOCOL 的"设计"与"已实现"分开标注；CI 增加 macOS `cargo check`、shellcheck、`cargo deny`（可选）。
 
 **资源需求**：第 1、3 步大部分本机可做（3 进程 + loopback）；第 2 步的 LSA 伪造/transit 攻击本机三进程可复现；第 4 步需要 Linux root/netns；真实公网 NAT/互联网 PMTUD 与 5 节点/动态成员需要 3-5 台多地域主机。若再开机器，仍按 3 台一地域一台、root SSH、TCP/UDP 5689-6000 的规格即可。
+
+---
+
+## 7. 2026-11-24 修复记录与剩余项
+
+### 7.1 已修复（代码 + 证据）
+
+| 审计项 | 修复 | 证据 |
+|---|---|---|
+| P0-1 LSA 可伪造 | 控制流 LSA 帧携带 Ed25519 签名（origin 即公钥），接收端先验签；iem/controller 的 iroh 入口要求签名 | `lsa_auth` 4 个单测；`demo-distributed-linkstate.sh` 通过 |
+| P0-2 transit 放行 | `inbound_source_allowed` 要求发送 peer 具备 `transit`/`gateway`/`exit` capability 才可携带他人源地址 | 单测 + netns 3node/Ipv6（授权后通过） |
+| P0-3 OS 路由无主 | 默认路由需 `dataplane.allow_default_route`；外部路由默认跳过，需 `replace_existing_routes`；安装带 `proto 240`；`Drop` 清理 | `test-netns-route-safety.sh` 通过 |
+| P0-4 iroh 绕过 Raft | iroh `Snapshot/Lsa/Ack` 改为 `linearize` + `snapshot_current` + `apply_lsa_current` + Raft Ack | `test-real-iroh-raft.sh` 通过 |
+| P0-5 Raft 鉴权 | `raft_dir` 必须有非空 `raft_secret`；raft TLS cert/key 与 client cert/key 成对校验；append/vote RPC 超时；单发 snapshot 必须带 checksum | config 单测；三地/滚动/TLS 脚本通过 |
+| P0-6 假绿 | netns 3node-controller 断言 ping+status；WAN 丢包脚本 `curl -fsS`、逐项 fail、snapshot 重试 | 两者均在临时主机通过 |
+| P1 routes 不在 Raft | 新增 `UpsertRoute` 命令与模型 routes；执行 `POST /v1/routes` 走 Raft；RouteId 由 (network,prefix,via) 确定性生成 | `test-controller-state-ha.sh`：三副本同 id |
+| P1 LSA TTL 不执行 | leader housekeeping 周期提交 `ExpireLsa`；`control.lsa_ttl_secs` 可配 | 同上：LSA 在三副本全部过期 |
+| P1 epoch 不复制 | raft 模式初始 epoch 为 0，leader 当选后写 `SetEpoch`（墙钟、单调）；revoke +1 | 同上：换主后 epoch 不回退；模型单测 |
+| P1 join 无签名 | `require_join_signature` + nonce + Ed25519 签名；member agent 始终签名；未签名 curl 可显式关闭 | 同上：未签 403、agent 加入成功并复制 |
+| P1 无特权分离 | `control.admin_secret`：revoke/routes 需要 admin；member secret 被拒 | 同上 + 单测 |
+| P1 snapshot/manifest fail-open | 未签名快照默认拒绝（`allow_unsigned_snapshot` 显式开启）；校验 `network_id` 与 epoch 回退；LSA 不再自授权前缀；manifest 仅 leader 可签 | `control_client` 4 个单测；follower manifest 503 单测 |
+| P1 动态 membership | `/v1/raft/learner`、`/v1/raft/membership`（admin） | 单测：鉴权/校验/非阻塞 add_learner |
+| P1 配置 no-op | `transport.listen=false`、`rib_mode!=full`、`set_path_hint` 直接报错；新增 `Match.zone` 并实现匹配 | config/routing 单测 |
+| P1 空 secret / TLS 配对 / QoS 校验 | 全部为 validate 错误；QoS 两条路径都校验 0 值 | config/policy 单测 |
+| P1 route TTL 不生效 | runtime 每秒调用 `RouteEngine::expire()` | routing 单测 |
+| P1 iroh 4 MiB 上限 | 控制帧上限提高到 64 MiB | 代码；未做 >4MiB iroh 端到端 |
+| P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 152 |
+
+### 7.2 仍开放的 P1/P2 边界
+
+- **relay failover 路径选择**：测试已改名为“一个 relay 消失后连接不断”，不再声称完成 failover；relay1→relay2 的实际选择仍无证据（iroh 内部行为）。
+- **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
+- **动态 membership 端到端**：接口与单测已有，但没有起第 4 个控制器进程做 add_learner → change_membership 的完整演练。
+- **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。
+- **P2 未动**：metrics/audit 细化、IPv6 <1280、network_hash、默认开放 discovery、relay_urls 语义、ACL 不回 ICMP、macOS NAT、打包/CI 矩阵、真 multipath、应用层重组、真实互联网 PMTUD 等。
+
+### 7.3 本轮新增的配置/行为变化（升级注意）
+
+- 新增：`control.admin_secret`、`control.require_join_signature`、`control.lsa_ttl_secs`、`dataplane.allow_default_route`、`dataplane.replace_existing_routes`。
+- Raft 模式现在**强制** `raft_secret`；只配 `raft_tls_cert` 不配 key 会报错（之前静默退化为 HTTP）。
+- `transport.listen=false`、`routing.rib_mode!=full`、`set_path_hint` 从“静默忽略”改为配置报错。
+- 子网网关/exit 转发必须给成员 grant `capabilities=["transit"]`，否则数据面按 spoof 丢弃。
+- 未配置 `controller_keys`/`control.secret` 且未开 `allow_unsigned_snapshot` 的 member 会拒绝控制器快照。
+- iroh LSA/Ack 现在要求签名；旧版本 agent 与新版 controller 的 iroh 入口不兼容。
