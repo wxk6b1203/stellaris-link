@@ -14,6 +14,7 @@
 | 深圳批2 | 47.119.37.129 / 47.119.37.217 / 47.119.37.223 | 双网卡 multipath/failover、公网 direct/relay |
 | 上海 | 8.153.183.185 | 跨地域 overlay/controller |
 | 成都 | 47.109.58.88 | netns PMTUD 路由实验 |
+| 临时批（11-24 12:43–14:00） | 成都 47.108.95.243 / 深圳 47.107.226.187 / 上海 8.153.179.142 | TOML 三地滚动重启、WAN 丢包/时延、>4MiB snapshot |
 
 ---
 
@@ -162,8 +163,8 @@ OK: cross-region 3-controller rolling restart works.
 
 限制：
 
-- 选举超时目前用环境变量覆盖，尚未暴露正式 TOML 配置
-- 本轮滚动重启没有制造大 snapshot 传输；snapshot transfer 重启续传仍是单独单测验证
+- 选举超时当时用环境变量覆盖；同日已暴露为 TOML 配置并在三地复跑（见 §3.8）
+- 本轮滚动重启没有制造大 snapshot 传输；snapshot transfer 重启续传仍是单独单测验证（§3.10 补 WAN 大 snapshot）
 
 ### 3.7 选举超时 TOML 配置：本机通过（2026-11-24）
 
@@ -221,11 +222,102 @@ ELECTION_MS=1000 ./scripts/test-controller-raft-3node.sh
 
 未验证：真实三地用 TOML 复跑滚动重启（当前无测试主机）；WAN 丢包/抖动下的选举稳定性。
 
-### 3.8 仍未验证
+### 3.8 三地 TOML 滚动重启：通过（2026-11-24）
 
-- snapshot 传输中断后 agent/controller **重启续传**
+新一批临时主机（成都 / 深圳 / 上海，公网，端口 5701 raft + 5801 HTTP，mTLS），
+二进制在成都 `cargo build --release` 后 scp 到三台（同 md5），脚本直接写
+`raft_election_timeout_ms = 1000`，不再注入环境变量：
+
+```bash
+H1=root@47.108.95.243 H2=root@47.107.226.187 H3=root@8.153.179.142 \
+BIN=/opt/stellaris/stellaris-controller ./scripts/test-real-rolling-restart-ha.sh
+```
+
+```text
+initial leader=1
+raft timing ok: 1000ms source=config
+snapshot members ok
+--- restart follower 2 ---
+leader after follower 1=1
+snapshot members ok
+--- restart follower 3 ---
+leader after follower 1=1
+snapshot members ok
+--- restart leader 1 ---
+new leader=3
+snapshot members ok
+OK: cross-region 3-controller rolling restart works.
+```
+
+说明：`status.raft.source=config` 证明生效值来自 TOML，而不是默认值或环境变量；
+每台节点日志都有 `raft election timing ... source="config"`（脚本逐台断言）。
+
+### 3.9 WAN 20% 丢包 + 50ms 单向时延下的选举：通过
+
+用 `tc`（prio + u32 过滤）只对发往另外两台 controller 的流量注入
+`delay 50ms loss 20%`，编排用的 SSH 不受影响。三地基线 RTT 36–38ms，
+注入后 ping 采样 135.9ms（5 包样本偏大，只作量级参考）。
+
+```bash
+H1=... H2=... H3=... ./scripts/test-real-wan-loss-ha.sh
+```
+
+```text
+[13:04:28] baseline ping: rtt avg 36.293ms / 38.233ms, 0% loss
+[13:04:33] apply netem loss=20% delay=50ms (egress to peer controllers)
+[13:04:49] initial leader=1 after 0.7s under loss
+[13:04:50] raft timing: {'election_timeout_min_ms': 1000, 'election_timeout_max_ms': 2000, 'heartbeat_interval_ms': 250, 'source': 'config'}
+[13:04:53] joined member and wrote lsa=1 on leader 1
+[13:04:54] snapshot members ok on leader
+[13:04:54] kill leader 1
+[13:04:59] new leader=2 after 3.6s
+[13:05:00] wrote lsa=2 on new leader
+[13:05:02] failover snapshot ok
+[13:05:02] OK: 3-region controller HA survives 20% loss + 50ms delay
+```
+
+同脚本复跑一次（验证入库版本）：`new leader=3 after 11.1s`。同样 20% 丢包下
+换主耗时 3.6s vs 11.1s，说明会经历多轮选举，符合预期但没有稳定性统计。
+
+边界：只验证了"单次 leader 故障 + 20% 丢包"；没有做长时间 soak，也没有在
+丢包下测滚动重启和 >4MiB snapshot（见 §3.10）。
+
+### 3.10 >4MiB snapshot 跨 WAN：传输/安装通过，中断续传部分通过
+
+做法：三 controller 正常起（TOML 1000ms），停掉 ctrl3，从 leader 本机并发写入
+5100 条 LSA（每条 24 个 prefix，8 线程），写入耗时 331s（每条命令都重写整份
+`raft-log.json`/`raft-state.json`，O(n²) 写放大）。leader 模型：
+
+```text
+leader raft-state.json bytes=5843090  (5.57 MiB)
+leader generation=5102
+```
+
+然后把 leader→ctrl3 限速到 2mbit 再启动 ctrl3，观察分块传输（2MiB chunk）：
+
+```text
+[13:12:17] ctrl3 partial data.bin=2097152      # 正好一个 chunk
+[13:12:18] kill ctrl3 mid-transfer (partial=2097152)
+[13:12:20] partial on disk before restart=2097152
+[13:12:24] partial after restart=2097152       # 重启后保留，没有从 0 开始
+```
+
+全速重跑后 ctrl3 追平：`ctrl3 generation=5102`，即 5.84MB 的 Raft snapshot 在
+三地公网上通过分块路径完成传输和安装。
+
+未完成/未验证：
+
+- 限速 + 中断之后"续传到完成"没有在 90s 窗口内看到；随后一次复测被编排脚本
+  自身 `pkill` 误杀和 ctrl3 未进入 snapshot 路径打断，因此不能写成通过。
+- 60s transfer TTL 与 2mbit 级慢链路是否冲突，需要单独实验（这正是
+  [FOLLOWUP.md](FOLLOWUP.md) 里"transfer TTL 与滚动重启窗口协调"那条）。
+
+### 3.11 仍未验证
+
+- snapshot 传输中断后 **续传到完成**（§3.10 只验证了部分数据和全速安装）
+- 丢包/抖动下的滚动重启与 >4MiB snapshot
+- 长时间 soak / 性能
 - 磁盘慢 IO / fsync 失败注入
-- 跨地域大 snapshot
 - 动态 Raft membership
 
 ---

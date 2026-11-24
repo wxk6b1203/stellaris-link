@@ -79,10 +79,18 @@
 - `scripts/test-controller-raft-3node.sh` 改用 TOML 并断言生效值；本机 3 进程实测通过。
 - `scripts/test-real-rolling-restart-ha.sh` 也改为写 TOML（未复跑，当前无测试主机）。
 
-仍需真实主机验证：
+2026-11-24 用新一批临时主机（成都/深圳/上海）补测：
 
-- 在滚动重启期间制造 >4MiB snapshot transfer，验证真实 transfer 续传
-- 观测 WAN 丢包/抖动下的选举稳定性（默认值是按已通过的单次三地测试定的，不是丢包场景的结论）
+- 三地滚动重启用 TOML 复跑通过（`status.raft.source=config`）。
+- 20% 丢包 + 50ms 单向时延下，leader 故障后 3.6s 选出新 leader，写/LSA/snapshot 正常。
+- 5.57 MiB 模型走 2MiB 分块 snapshot 传输；2mbit 限速中断后部分数据保留（2097152 字节，重启前后一致）；全速重跑安装成功（follower generation 追平 leader）。
+
+仍需：
+
+- 限速中断后的"续传到完成"没观察到（90s 窗口 + 后续复测被编排问题打断），需要单独实验；
+- 60s transfer TTL 在 2mbit 级慢链路上是否够用，需要和上面一起验证；
+- 丢包/抖动下的滚动重启与 >4MiB snapshot；
+- 长时间 soak。
 
 资源需求（本轮无测试主机，只记录待开）：
 

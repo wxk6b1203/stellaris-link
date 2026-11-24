@@ -156,6 +156,14 @@ curl -X POST http://127.0.0.1:7800/v1/routes \
 
 # 真实 LAN macvlan 3 controller + mTLS
 PARENT=eth0 SUBNET=... ./scripts/test-docker-controller-raft-macvlan.sh
+
+# 真实三地：滚动重启（mTLS）
+H1=root@<chengdu> H2=root@<shenzhen> H3=root@<shanghai> \
+BIN=/opt/stellaris/stellaris-controller ./scripts/test-real-rolling-restart-ha.sh
+
+# 真实三地：20% 丢包 + 50ms 单向时延下的选举
+H1=root@<chengdu> H2=root@<shenzhen> H3=root@<shanghai> \
+./scripts/test-real-wan-loss-ha.sh
 ```
 
 member 只配置一个入口：
