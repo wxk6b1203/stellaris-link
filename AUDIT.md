@@ -236,3 +236,4 @@ P0 证据速查：
 - 子网网关/exit 转发必须给成员 grant `capabilities=["transit"]`，否则数据面按 spoof 丢弃。
 - 未配置 `controller_keys`/`control.secret` 且未开 `allow_unsigned_snapshot` 的 member 会拒绝控制器快照。
 - iroh LSA/Ack 现在要求签名；旧版本 agent 与新版 controller 的 iroh 入口不兼容。
+- `network_hash` 从 UUIDv7 前 4 字节改为 SHA-256 前 32 位：混合版本节点的数据面会互不匹配，需同时升级。
