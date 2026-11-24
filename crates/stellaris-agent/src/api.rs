@@ -238,7 +238,17 @@ stellaris_fib_routes {}\n\
 stellaris_peers_total {}\n\
 stellaris_peers_connected {}\n\
 # TYPE stellaris_peer_path_changes_total counter\n\
-stellaris_peer_path_changes_total {}\n",
+stellaris_peer_path_changes_total {}\n\
+# TYPE stellaris_acl_rejected_total counter\n\
+stellaris_acl_rejected_total {}\n\
+# TYPE stellaris_spoof_dropped_total counter\n\
+stellaris_spoof_dropped_total {}\n\
+# TYPE stellaris_frag_reassembled_total counter\n\
+stellaris_frag_reassembled_total {}\n\
+# TYPE stellaris_frag_dropped_total counter\n\
+stellaris_frag_dropped_total {}\n\
+# TYPE stellaris_reassembly_entries gauge\n\
+stellaris_reassembly_entries {}\n",
         load(&stats.acl_denied),
         load(&stats.qos_rate_limited),
         load(&stats.queue_dropped),
@@ -253,6 +263,15 @@ stellaris_peer_path_changes_total {}\n",
             .iter()
             .map(|peer| peer.path_changes)
             .sum::<u64>(),
+        load(&stats.acl_rejected),
+        load(&stats.spoof_dropped),
+        load(&stats.frag_reassembled),
+        load(&stats.frag_dropped),
+        state
+            .reassembly
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len(),
     );
     Ok((
         [(
@@ -715,6 +734,9 @@ previous_tokens = ["old"]
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("stellaris_acl_denied_total"));
         assert!(text.contains("stellaris_fib_routes"));
+        assert!(text.contains("stellaris_acl_rejected_total"));
+        assert!(text.contains("stellaris_frag_reassembled_total"));
+        assert!(text.contains("stellaris_reassembly_entries"));
     }
 
     #[tokio::test]

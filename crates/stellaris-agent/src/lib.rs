@@ -15,6 +15,7 @@ pub mod lsa_auth;
 pub mod membership;
 pub mod peers;
 pub mod policy;
+pub mod reassembly;
 pub mod serve;
 pub mod stats;
 pub mod transport;
@@ -43,6 +44,7 @@ pub struct AgentState {
     pub grants: membership::GrantMap,
     pub policy: Arc<RwLock<policy::Policy>>,
     pub stats: Arc<stats::Stats>,
+    pub reassembly: Arc<std::sync::Mutex<reassembly::Reassembler>>,
     pub started_at: Instant,
 }
 
@@ -174,6 +176,7 @@ impl AgentState {
             grants: Arc::new(RwLock::new(std::collections::HashMap::new())),
             policy,
             stats: Arc::new(stats::Stats::default()),
+            reassembly: Arc::new(std::sync::Mutex::new(reassembly::Reassembler::default())),
             started_at: Instant::now(),
         })
     }

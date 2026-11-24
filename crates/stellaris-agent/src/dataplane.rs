@@ -767,12 +767,19 @@ fn route_outbound_priority(
         AclDirection::Outbound
     };
     let policy = state.policy.read().unwrap_or_else(|e| e.into_inner());
-    if matches!(
-        policy.check(direction, &info, Some(next.node), zone),
-        AclVerdict::Deny(_)
-    ) {
+    if let AclVerdict::Deny(rule) = policy.check(direction, &info, Some(next.node), zone) {
         crate::stats::Stats::inc(&state.stats.acl_denied);
-        tracing::info!(target: "stellaris_audit", direction = "outbound", "acl denied");
+        tracing::warn!(
+            target: "stellaris_audit",
+            action = "deny",
+            direction = "outbound",
+            rule = %rule,
+            src = %info.src,
+            dst = %info.dst,
+            protocol = info.protocol,
+            peer = %next.node.short(),
+            "acl denied"
+        );
         return None;
     }
     let priority = policy.qos_priority(&info);
@@ -797,7 +804,40 @@ async fn handle_inbound(
     transport: &Arc<IrohTransport>,
     inbound: InboundPacket,
 ) {
-    match decide_inbound(state, inbound.from, &inbound.packet) {
+    // Reassemble fragments before ACL/transit decisions so rules see the
+    // complete L4 header.
+    let framed = {
+        let payload = match inbound.packet.get(HEADER_LEN..) {
+            Some(payload) => payload,
+            None => {
+                crate::stats::Stats::inc(&state.stats.frag_dropped);
+                return;
+            }
+        };
+        let outcome = {
+            let mut reassembly = state.reassembly.lock().unwrap_or_else(|e| e.into_inner());
+            reassembly.process(inbound.from, payload, std::time::Instant::now())
+        };
+        match outcome {
+            crate::reassembly::Outcome::Pass => inbound.packet.clone(),
+            crate::reassembly::Outcome::Buffered => return,
+            crate::reassembly::Outcome::Dropped(reason) => {
+                crate::stats::Stats::inc(&state.stats.frag_dropped);
+                debug!(from = %inbound.from.short(), reason, "fragment dropped");
+                return;
+            }
+            crate::reassembly::Outcome::Complete(inner) => {
+                crate::stats::Stats::inc(&state.stats.frag_reassembled);
+                let flow = PacketInfo::parse(&inner).map_or(0, |info| flow_hash(&info));
+                let header = MeshHeader::new(state.network, 64, flow);
+                let mut frame = Vec::with_capacity(HEADER_LEN + inner.len());
+                frame.extend_from_slice(&header.encode());
+                frame.extend_from_slice(&inner);
+                bytes::Bytes::from(frame)
+            }
+        }
+    };
+    match decide_inbound(state, inbound.from, &framed) {
         InboundAction::Deliver(packet) => {
             crate::stats::Stats::inc(&state.stats.delivered);
             if let Err(e) = dev.send(&packet).await {
@@ -953,12 +993,20 @@ pub fn decide_inbound(
         AclDirection::Forward
     };
     let policy = state.policy.read().unwrap_or_else(|e| e.into_inner());
-    if matches!(
-        policy.check(direction, &info, Some(from), peer.zone.as_deref()),
-        AclVerdict::Deny(_)
-    ) {
+    if let AclVerdict::Deny(rule) = policy.check(direction, &info, Some(from), peer.zone.as_deref())
+    {
         crate::stats::Stats::inc(&state.stats.acl_denied);
-        tracing::info!(target: "stellaris_audit", direction = "inbound", "acl denied");
+        tracing::warn!(
+            target: "stellaris_audit",
+            action = "deny",
+            direction = "inbound",
+            rule = %rule,
+            src = %info.src,
+            dst = %info.dst,
+            protocol = info.protocol,
+            from = %from.short(),
+            "acl denied"
+        );
         return InboundAction::Drop("acl denied");
     }
 
