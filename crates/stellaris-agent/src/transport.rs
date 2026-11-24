@@ -659,9 +659,18 @@ cidr = "10.8.0.0/16"
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let peer = a.peers.get(&b_id).expect("peer");
-        assert!(peer.connected);
-        assert_eq!(peer.path.as_deref(), Some("relay"));
+        let mut relay_path = false;
+        for _ in 0..50 {
+            if let Some(peer) = a.peers.get(&b_id)
+                && peer.connected
+                && peer.path.as_deref() == Some("relay")
+            {
+                relay_path = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(relay_path, "peer did not report a relay path");
         let before1 = relay1.metrics().server.send_packets_recv.get();
         let before2 = relay2.metrics().server.send_packets_recv.get();
         a.send(b_id, Bytes::from_static(b"relay-probe"))
