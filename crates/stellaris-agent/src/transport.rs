@@ -538,7 +538,7 @@ bind = "127.0.0.1:0"
     }
 
     #[tokio::test]
-    async fn endpoint_fails_over_between_http_relays() {
+    async fn endpoint_keeps_working_after_a_configured_relay_dies() {
         let (relay1, url1) = start_relay().await;
         let (relay2, url2) = start_relay().await;
         let base =
@@ -612,17 +612,18 @@ bind = "127.0.0.1:0"
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(a.peers.get(&b_id).is_some_and(|p| p.connected));
+        // Drop the relay that the endpoints were told to use. Which relay is
+        // selected afterwards is an iroh internal decision; this test only
+        // asserts that losing one configured relay does not drop the peer.
+        // Relay-path selection/failover remains unverified (see AUDIT.md).
         drop(relay1);
-        for _ in 0..150 {
-            if a.peers.get(&b_id).is_some_and(|p| p.connected) {
-                break;
-            }
+        for _ in 0..30 {
+            assert!(
+                a.peers.get(&b_id).is_some_and(|p| p.connected),
+                "peer disconnected after a configured relay went away"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(
-            a.peers.get(&b_id).is_some_and(|p| p.connected),
-            "connection did not fail over to the second relay"
-        );
         drop(relay2);
         drop(a);
         drop(b);

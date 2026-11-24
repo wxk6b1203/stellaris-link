@@ -26,16 +26,27 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(7);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ControlFrame {
-    Lsa { lsa: Lsa },
-    Ping { seq: u64 },
-    Pong { seq: u64 },
+    Lsa {
+        lsa: Lsa,
+        /// Ed25519 signature by `lsa.origin` over the canonical LSA payload.
+        #[serde(default)]
+        signature: String,
+    },
+    Ping {
+        seq: u64,
+    },
+    Pong {
+        seq: u64,
+    },
 }
 
 pub struct Service {
     state: AgentState,
     transport: Arc<IrohTransport>,
     db: RwLock<LinkStateDb>,
-    tx: broadcast::Sender<Lsa>,
+    /// Last accepted signature per origin, kept so peers can be re-synced.
+    signatures: RwLock<HashMap<NodeId, String>>,
+    tx: broadcast::Sender<(Lsa, String)>,
     connections: RwLock<HashMap<NodeId, u32>>,
     seq: AtomicU64,
 }
@@ -50,6 +61,7 @@ pub async fn run(
         state: state.clone(),
         transport,
         db: RwLock::new(LinkStateDb::new()),
+        signatures: RwLock::new(HashMap::new()),
         tx,
         connections: RwLock::new(HashMap::new()),
         seq: AtomicU64::new(now_seq()),
@@ -73,6 +85,7 @@ pub async fn run(
                 if removed > 0 {
                     service.recompute();
                 }
+                service.prune_signatures();
             }
         });
     }
@@ -118,10 +131,15 @@ impl Service {
             .collect();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let lsa = local_lsa(&self.state, seq, &connected);
-        self.publish(lsa);
+        let signature = crate::lsa_auth::sign(&self.state.identity_secret, &lsa);
+        self.publish(lsa, signature);
     }
 
-    fn publish(&self, lsa: Lsa) {
+    fn publish(&self, lsa: Lsa, signature: String) {
+        if !crate::lsa_auth::verify(&lsa, &signature) {
+            warn!(origin = %lsa.origin.short(), "LSA signature invalid, dropped");
+            return;
+        }
         if lsa.origin != self.state.node_id && !crate::membership::lsa_authorized(&self.state, &lsa)
         {
             tracing::debug!(origin = %lsa.origin.short(), "unauthorized LSA dropped");
@@ -132,11 +150,15 @@ impl Service {
             let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
             db.apply(lsa.clone())
         };
+        self.signatures
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lsa.origin, signature.clone());
         if !changed {
             return;
         }
         self.recompute();
-        let _ = self.tx.send(lsa);
+        let _ = self.tx.send((lsa, signature));
     }
 
     fn discover(&self, lsa: &Lsa) {
@@ -199,9 +221,28 @@ impl Service {
         }
     }
 
-    fn snapshot(&self) -> Vec<Lsa> {
+    fn snapshot(&self) -> Vec<(Lsa, String)> {
         let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        db.all().cloned().collect()
+        let signatures = self.signatures.read().unwrap_or_else(|e| e.into_inner());
+        db.all()
+            .cloned()
+            .map(|lsa| {
+                let signature = signatures.get(&lsa.origin).cloned().unwrap_or_default();
+                (lsa, signature)
+            })
+            .collect()
+    }
+
+    /// Drop stored signatures for LSAs that are no longer in the database.
+    fn prune_signatures(&self) {
+        let live: HashSet<NodeId> = {
+            let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+            db.all().map(|lsa| lsa.origin).collect()
+        };
+        self.signatures
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|origin, _| live.contains(origin));
     }
 }
 
@@ -213,8 +254,8 @@ async fn peer_task(
     info!(peer = %node.short(), "link-state control connection");
     let mut events = service.tx.subscribe();
     let (mut send, _recv) = conn.open_bi().await.context("open LSA stream")?;
-    for lsa in service.snapshot() {
-        write_frame(&mut send, &ControlFrame::Lsa { lsa }).await?;
+    for (lsa, signature) in service.snapshot() {
+        write_frame(&mut send, &ControlFrame::Lsa { lsa, signature }).await?;
     }
     let send = Arc::new(Mutex::new(send));
     let last_pong = Arc::new(Mutex::new(Instant::now()));
@@ -230,7 +271,7 @@ async fn peer_task(
                 };
                 while let Some(frame) = read_frame(&mut recv).await? {
                     match frame {
-                        ControlFrame::Lsa { lsa } => service.publish(lsa),
+                        ControlFrame::Lsa { lsa, signature } => service.publish(lsa, signature),
                         ControlFrame::Ping { seq } => {
                             let mut guard = send.lock().await;
                             write_frame(&mut guard, &ControlFrame::Pong { seq }).await?;
@@ -267,17 +308,17 @@ async fn peer_task(
                 }
             }
             event = events.recv() => match event {
-                Ok(lsa) => {
+                Ok((lsa, signature)) => {
                     let mut guard = send.lock().await;
-                    if write_frame(&mut guard, &ControlFrame::Lsa { lsa }).await.is_err() {
+                    if write_frame(&mut guard, &ControlFrame::Lsa { lsa, signature }).await.is_err() {
                         service.on_down(node);
                         break;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let mut guard = send.lock().await;
-                    for lsa in service.snapshot() {
-                        if write_frame(&mut guard, &ControlFrame::Lsa { lsa }).await.is_err() {
+                    for (lsa, signature) in service.snapshot() {
+                        if write_frame(&mut guard, &ControlFrame::Lsa { lsa, signature }).await.is_err() {
                             break;
                         }
                     }

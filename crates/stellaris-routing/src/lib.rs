@@ -730,6 +730,11 @@ fn policy_matches(m: &Match, route: &RouteEntry) -> bool {
     {
         return false;
     }
+    if let Some(zone) = &m.zone
+        && route.attrs.zone.as_deref() != Some(zone.as_str())
+    {
+        return false;
+    }
     if let Some(region) = &m.region
         && route.attrs.region.as_deref() != Some(region.as_str())
     {
@@ -896,6 +901,81 @@ mod tests {
         .unwrap();
         let entry = e.lookup("10.0.0.1".parse().unwrap()).unwrap();
         assert_eq!(entry.next_hops.len(), 1);
+    }
+
+    #[test]
+    fn expired_route_is_removed_by_expire() {
+        let e = engine();
+        let prefix: IpNet = "10.5.0.0/16".parse().unwrap();
+        e.add_static(
+            prefix,
+            peer(2),
+            None,
+            None,
+            None,
+            false,
+            Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(1)),
+            "ttl",
+        )
+        .unwrap();
+        assert!(e.lookup("10.5.1.1".parse().unwrap()).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        e.expire().unwrap();
+        assert!(e.lookup("10.5.1.1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn policy_zone_match_targets_the_route_zone() {
+        let e = engine();
+        let prefix: IpNet = "10.6.0.0/16".parse().unwrap();
+        e.set_policies(vec![RoutePolicy {
+            id: "deny-z1".into(),
+            priority: 1,
+            match_: Match {
+                zone: Some("az-a".into()),
+                ..Default::default()
+            },
+            action: Action::Deny,
+        }])
+        .unwrap();
+        let attrs = RouteAttributes {
+            zone: Some("az-a".into()),
+            ..Default::default()
+        };
+        e.add_static_with_attrs(
+            prefix,
+            peer(2),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            attrs,
+            "zone",
+        )
+        .unwrap();
+        assert!(e.lookup("10.6.1.1".parse().unwrap()).is_none());
+
+        let other: IpNet = "10.7.0.0/16".parse().unwrap();
+        let attrs = RouteAttributes {
+            zone: Some("az-b".into()),
+            ..Default::default()
+        };
+        e.add_static_with_attrs(
+            other,
+            peer(2),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            attrs,
+            "zone",
+        )
+        .unwrap();
+        assert!(e.lookup("10.7.1.1".parse().unwrap()).is_some());
     }
 
     #[test]

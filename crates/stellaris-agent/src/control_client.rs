@@ -50,6 +50,7 @@ async fn run_http(
     let mut joined = state.config.control.join_token.is_none();
     let mut last_manifest = Instant::now() - Duration::from_secs(60);
     let mut last_generation = 0u64;
+    let mut last_epoch = 0u64;
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
@@ -105,8 +106,13 @@ async fn run_http(
         }
 
         if let Some(snapshot) = snapshot
-            && let Some((generation, epoch)) =
-                apply_verified_snapshot(&state, snapshot, last_generation, transport.as_ref())
+            && let Some((generation, epoch)) = apply_verified_snapshot(
+                &state,
+                snapshot,
+                last_generation,
+                &mut last_epoch,
+                transport.as_ref(),
+            )
         {
             last_generation = generation;
             let mut ack = client.post(format!("{base}/v1/ack"));
@@ -185,6 +191,7 @@ async fn run_iroh(
     }
 
     let mut last_generation = 0u64;
+    let mut last_epoch = 0u64;
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
@@ -199,8 +206,11 @@ async fn run_iroh(
         loop {
             if last_lsa.elapsed() >= Duration::from_secs(10) {
                 seq = seq.max(now_seq());
+                let lsa = local_lsa(&state, seq);
+                let signature = crate::lsa_auth::sign(&state.identity_secret, &lsa);
                 let req = Request::Lsa {
-                    lsa: local_lsa(&state, seq),
+                    lsa,
+                    signature,
                     secret: secret.clone(),
                 };
                 match request(&conn, &req).await {
@@ -226,6 +236,7 @@ async fn run_iroh(
                             &state,
                             snapshot,
                             last_generation,
+                            &mut last_epoch,
                             transport.as_ref(),
                         )
                     {
@@ -397,6 +408,14 @@ async fn try_join(
 }
 
 fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot) -> bool {
+    if snapshot.network_id != state.network.to_string() {
+        tracing::warn!(
+            expected = %state.network,
+            got = %snapshot.network_id,
+            "controller snapshot is for another network; ignored"
+        );
+        return false;
+    }
     if !state.config.control.controller_keys.is_empty() {
         let Some(signer) = snapshot
             .signer
@@ -446,8 +465,14 @@ fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot
             return false;
         }
         true
-    } else {
+    } else if state.config.control.allow_unsigned_snapshot {
+        tracing::warn!("accepted unsigned controller snapshot (control.allow_unsigned_snapshot)");
         true
+    } else {
+        tracing::warn!(
+            "unsigned controller snapshot rejected; set controller_keys, control.secret, or allow_unsigned_snapshot"
+        );
+        false
     }
 }
 
@@ -455,11 +480,21 @@ fn apply_verified_snapshot(
     state: &AgentState,
     mut snapshot: Snapshot,
     last_generation: u64,
+    last_epoch: &mut u64,
     transport: Option<&std::sync::Arc<IrohTransport>>,
 ) -> Option<(u64, u64)> {
     if snapshot.generation == last_generation {
         return None;
     }
+    if snapshot.epoch < *last_epoch {
+        tracing::warn!(
+            got = snapshot.epoch,
+            seen = *last_epoch,
+            "controller snapshot epoch rolled back; ignored"
+        );
+        return None;
+    }
+    *last_epoch = (*last_epoch).max(snapshot.epoch);
     state.set_grants(&snapshot.members);
     if state.config.control.discover_members {
         discover_members(state, &snapshot.members, transport);
@@ -605,5 +640,83 @@ fn local_lsa(state: &AgentState, seq: u64) -> Lsa {
         prefixes,
         overlay_ip: state.config.node.overlay_ip,
         addrs: state.config.transport.advertise.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellaris_types::Config;
+
+    fn agent(control: &str) -> AgentState {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-snapshot-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "m"
+state_dir = "{}"
+overlay_ip = "10.7.0.2"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+url = "http://127.0.0.1:7800"
+{control}
+"#,
+            dir.display()
+        );
+        AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
+    }
+
+    fn snapshot(network: &str) -> Snapshot {
+        Snapshot {
+            network_id: network.to_string(),
+            epoch: 3,
+            generation: 2,
+            members: Vec::new(),
+            routes: Vec::new(),
+            signer: None,
+            signature: None,
+            ed25519_signature: None,
+        }
+    }
+
+    #[test]
+    fn unsigned_snapshot_is_rejected_by_default() {
+        let state = agent("");
+        let snapshot = snapshot(&state.network.to_string());
+        assert!(!verify_snapshot(&state, None, &snapshot));
+    }
+
+    #[test]
+    fn unsigned_snapshot_can_be_opted_in_for_development() {
+        let state = agent("allow_unsigned_snapshot = true");
+        let snapshot = snapshot(&state.network.to_string());
+        assert!(verify_snapshot(&state, None, &snapshot));
+    }
+
+    #[test]
+    fn snapshot_for_another_network_is_rejected() {
+        let state = agent("allow_unsigned_snapshot = true");
+        let other = stellaris_types::NetworkId::new().to_string();
+        assert!(!verify_snapshot(&state, None, &snapshot(&other)));
+    }
+
+    #[test]
+    fn snapshot_epoch_rollback_is_rejected() {
+        let mut state = agent("allow_unsigned_snapshot = true");
+        state.config = std::sync::Arc::new(state.config.as_ref().clone());
+        let mut last_epoch = 5;
+        let generation = 9;
+        let mut snap = snapshot(&state.network.to_string());
+        snap.epoch = 4;
+        assert!(
+            apply_verified_snapshot(&state, snap, generation - 1, &mut last_epoch, None).is_none()
+        );
+        assert_eq!(last_epoch, 5);
     }
 }

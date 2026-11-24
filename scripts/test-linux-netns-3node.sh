@@ -4,8 +4,8 @@ set -euo pipefail
 # Real 3-node Linux TUN/LSA transit test using three network namespaces.
 # Requires root and a Linux binary matching the host architecture.
 [[ $EUID -eq 0 ]] || { echo "run as root (needs netns + TUN)" >&2; exit 1; }
-[[ -x "$BIN" ]] || { echo "missing Linux binary: $BIN" >&2; exit 1; }
 BIN="${BIN:-$(pwd)/target/release/stellaris-agent}"
+[[ -x "$BIN" ]] || { echo "missing Linux binary: $BIN" >&2; exit 1; }
 DIR="${DIR:-/tmp/stellaris-3node}"
 rm -rf "$DIR"; mkdir -p "$DIR"/{a,b,c}-state
 cleanup() {

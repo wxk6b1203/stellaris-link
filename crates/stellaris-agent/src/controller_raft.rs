@@ -1028,7 +1028,13 @@ async fn raft_snapshot(
         ));
     }
     let checksum = hex::encode(Sha256::digest(&rpc.data));
-    if !rpc.checksum.is_empty() && rpc.checksum != checksum {
+    if rpc.checksum.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "snapshot checksum required".into(),
+        ));
+    }
+    if rpc.checksum != checksum {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "snapshot checksum mismatch".into(),
@@ -1084,6 +1090,19 @@ async fn raft_vote(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+/// Smallest timeout we allow for request/response Raft RPCs.
+///
+/// openraft's soft TTL is derived from election/heartbeat settings and can be
+/// tight for cross-region links; the floor still bounds a black-holed peer.
+const RPC_TIMEOUT_FLOOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Timeout for one snapshot HTTP request (chunk upload/download).
+const SNAPSHOT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn rpc_timeout(option: RPCOption) -> std::time::Duration {
+    option.soft_ttl().max(RPC_TIMEOUT_FLOOR)
+}
+
 pub struct HttpFactory {
     client: reqwest::Client,
     secret: Option<Arc<String>>,
@@ -1114,11 +1133,12 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
         let mut request = self
             .client
             .post(format!("{}/raft/append", self.base))
+            .timeout(rpc_timeout(option))
             .json(&rpc);
         if let Some(secret) = &self.secret {
             request = request.header(RAFT_SECRET_HEADER, secret.as_str());
@@ -1142,11 +1162,12 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
     async fn vote(
         &mut self,
         rpc: VoteRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
         let mut request = self
             .client
             .post(format!("{}/raft/vote", self.base))
+            .timeout(rpc_timeout(option))
             .json(&rpc);
         if let Some(secret) = &self.secret {
             request = request.header(RAFT_SECRET_HEADER, secret.as_str());
@@ -1188,6 +1209,7 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
                     let mut request = self
                         .client
                         .post(format!("{}/raft/snapshot/begin", self.base))
+                        .timeout(SNAPSHOT_REQUEST_TIMEOUT)
                         .json(&serde_json::json!({
                             "vote": vote,
                             "meta": snapshot.meta,
@@ -1231,6 +1253,7 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
                         let mut request = self
                             .client
                             .post(format!("{}/raft/snapshot/chunk", self.base))
+                            .timeout(SNAPSHOT_REQUEST_TIMEOUT)
                             .header("x-raft-transfer", &id)
                             .header("x-raft-offset", (offset * 2 * 1024 * 1024).to_string())
                             .body(chunk.to_vec());
@@ -1262,6 +1285,7 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
                 let mut finish = self
                     .client
                     .post(format!("{}/raft/snapshot/finish", self.base))
+                    .timeout(SNAPSHOT_REQUEST_TIMEOUT)
                     .header("x-raft-transfer", &id);
                 if let Some(secret) = &self.secret {
                     finish = finish.header(RAFT_SECRET_HEADER, secret.as_str());
@@ -1279,6 +1303,7 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
                 let mut request = self
                     .client
                     .post(format!("{}/raft/snapshot", self.base))
+                    .timeout(SNAPSHOT_REQUEST_TIMEOUT)
                     .json(&rpc);
                 if let Some(secret) = &self.secret {
                     request = request.header(RAFT_SECRET_HEADER, secret.as_str());

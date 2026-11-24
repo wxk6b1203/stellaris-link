@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod gateway;
 pub mod identity;
 pub mod link_state;
+pub mod lsa_auth;
 pub mod membership;
 pub mod peers;
 pub mod policy;
@@ -253,6 +254,22 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
         let transport = transport_handle.clone();
         tokio::spawn(async move {
             control_client::run(state, base, secret, transport).await;
+        });
+    }
+
+    {
+        // Expire routes with an `expires_at` (pin/TTL) even when no route
+        // events arrive; FIB rebuilds only happen on changes.
+        let expiry = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Err(e) = expiry.routes.expire() {
+                    tracing::debug!(error = %e, "route expiry failed");
+                }
+            }
         });
     }
 

@@ -64,9 +64,15 @@ pub fn inbound_source_allowed(state: &crate::AgentState, peer: NodeId, src: IpAd
     if owns {
         return true;
     }
-    // A forwarding member may carry another granted member's source.
-    // The source must still belong to a valid member grant; `transit` is
-    // reserved for additional gateway/exit policy.
+    // Only a member explicitly granted transit/gateway/exit may carry another
+    // member's source address. Without the capability this is a spoof.
+    let may_transit = grant
+        .capabilities
+        .iter()
+        .any(|capability| matches!(capability.as_str(), "transit" | "gateway" | "exit"));
+    if !may_transit {
+        return false;
+    }
     grants
         .values()
         .any(|g| g.overlay_ip == Some(src) || g.prefixes.iter().any(|prefix| prefix.contains(&src)))
@@ -350,7 +356,7 @@ overlay_ip = "10.7.0.2"
     }
 
     #[test]
-    fn dataplane_grants_allow_own_and_transit_sources() {
+    fn dataplane_grants_require_transit_for_other_sources() {
         use stellaris_types::Config;
         let dir =
             std::env::temp_dir().join(format!("stellaris-iface-test-{}", uuid::Uuid::now_v7()));
@@ -407,6 +413,21 @@ overlay_ip = "10.7.0.2"
                 capabilities: vec!["member".into()],
             },
         );
+        // A plain member may not carry another member's source address.
+        assert!(!inbound_source_allowed(
+            &state,
+            b,
+            "10.7.0.1".parse().unwrap()
+        ));
+        // Granting transit makes the same packet acceptable.
+        state
+            .grants
+            .write()
+            .unwrap()
+            .get_mut(&b)
+            .unwrap()
+            .capabilities
+            .push("transit".into());
         assert!(inbound_source_allowed(
             &state,
             b,

@@ -56,6 +56,12 @@ pub enum ControllerCommand {
         generation: u64,
         epoch: u64,
     },
+    /// Add or update a network-scope controller route.
+    UpsertRoute {
+        prefix: String,
+        via: NodeId,
+        metric: u32,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +75,9 @@ pub struct ControllerModel {
     pub consumed_join_tokens: BTreeSet<String>,
     #[serde(default)]
     pub join_config_hash: Option<String>,
+    /// Controller-pushed routes: prefix -> next hop -> metric.
+    #[serde(default)]
+    pub routes: BTreeMap<String, BTreeMap<NodeId, u32>>,
 }
 
 impl ControllerModel {
@@ -82,6 +91,7 @@ impl ControllerModel {
             acks: BTreeMap::new(),
             consumed_join_tokens: BTreeSet::new(),
             join_config_hash: None,
+            routes: BTreeMap::new(),
         }
     }
 
@@ -149,6 +159,11 @@ impl ControllerModel {
             ControllerCommand::RevokeMember { node } => {
                 let removed = self.members.remove(&node).is_some();
                 let lsa_removed = self.lsas.remove(&node).is_some();
+                if removed || lsa_removed {
+                    // A revocation invalidates manifests signed under the old
+                    // epoch; bump it so stale manifest copies are fenced.
+                    self.epoch = self.epoch.saturating_add(1);
+                }
                 removed || lsa_removed
             }
             ControllerCommand::Ack {
@@ -162,6 +177,22 @@ impl ControllerModel {
                     self.acks.insert(node, record);
                 }
                 changed
+            }
+            ControllerCommand::UpsertRoute {
+                prefix,
+                via,
+                metric,
+            } => {
+                if prefix.parse::<ipnet::IpNet>().is_err() {
+                    false
+                } else {
+                    let entry = self.routes.entry(prefix).or_default();
+                    let changed = entry.get(&via) != Some(&metric);
+                    if changed {
+                        entry.insert(via, metric);
+                    }
+                    changed
+                }
             }
         };
         if changed {
@@ -188,6 +219,7 @@ impl ControllerModel {
             acks: Vec<(&'a NodeId, &'a AckRecord)>,
             consumed_join_tokens: Vec<&'a String>,
             join_config_hash: Option<&'a String>,
+            routes: Vec<(&'a String, Vec<(&'a NodeId, &'a u32)>)>,
         }
         let snapshot = Snapshot {
             network: &self.network,
@@ -198,8 +230,44 @@ impl ControllerModel {
             acks: self.acks.iter().collect(),
             consumed_join_tokens: self.consumed_join_tokens.iter().collect(),
             join_config_hash: self.join_config_hash.as_ref(),
+            routes: self
+                .routes
+                .iter()
+                .map(|(prefix, vias)| (prefix, vias.iter().collect()))
+                .collect(),
         };
         serde_json::to_vec(&snapshot).unwrap_or_default()
+    }
+
+    /// Deterministic route entries for controller-pushed routes.
+    ///
+    /// The RouteId is derived from (network, prefix, next hop) so every replica
+    /// produces the same id for the same route, unlike the legacy random ids.
+    pub fn route_entries(&self) -> Vec<RouteEntry> {
+        let mut out = Vec::new();
+        for (prefix_text, vias) in &self.routes {
+            let Ok(prefix) = prefix_text.parse::<ipnet::IpNet>() else {
+                continue;
+            };
+            for (via, metric) in vias {
+                let mut entry = RouteEntry::new(
+                    self.network,
+                    prefix,
+                    stellaris_types::RouteSource::Controller,
+                    NodeId::new([0u8; 32]),
+                    *via,
+                );
+                entry.id = stellaris_types::RouteId(uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    format!("stellaris-route|{}|{prefix}|{via}", self.network).as_bytes(),
+                ));
+                entry.metric = *metric;
+                entry.admin_distance = 20;
+                entry.generation = self.generation;
+                out.push(entry);
+            }
+        }
+        out
     }
 
     pub fn routes(&self, local: NodeId) -> Vec<RouteEntry> {
@@ -287,6 +355,75 @@ mod tests {
             lsa: lsa(1, 1, "10.0.0.2/32"),
         });
         assert_eq!(model.lsas[&NodeId::new([1u8; 32])].seq, 2);
+    }
+
+    #[test]
+    fn routes_are_deterministic_across_replicas() {
+        let network = NetworkId::new();
+        let via = NodeId::new([7u8; 32]);
+        let mut a = ControllerModel::new(network, 1);
+        let mut b = ControllerModel::new(network, 1);
+        let command = ControllerCommand::UpsertRoute {
+            prefix: "192.168.44.0/24".into(),
+            via,
+            metric: 5,
+        };
+        assert!(a.apply(command.clone()));
+        assert!(b.apply(command));
+        assert_eq!(a.snapshot_bytes(), b.snapshot_bytes());
+        let ra = a.route_entries();
+        let rb = b.route_entries();
+        assert_eq!(ra.len(), 1);
+        assert_eq!(ra[0].id, rb[0].id);
+        assert_eq!(ra[0].next_hop, via);
+        assert_eq!(ra[0].metric, 5);
+        // Re-applying the same route is a no-op.
+        assert!(!a.apply(ControllerCommand::UpsertRoute {
+            prefix: "192.168.44.0/24".into(),
+            via,
+            metric: 5,
+        }));
+        // Invalid prefixes are ignored instead of poisoning the model.
+        assert!(!a.apply(ControllerCommand::UpsertRoute {
+            prefix: "not-a-prefix".into(),
+            via,
+            metric: 1,
+        }));
+    }
+
+    #[test]
+    fn revoke_bumps_the_epoch() {
+        let node = NodeId::new([1u8; 32]);
+        let mut model = ControllerModel::new(NetworkId::new(), 10);
+        model.apply(ControllerCommand::UpsertMember {
+            node,
+            member: MemberRecord::default(),
+        });
+        assert_eq!(model.epoch, 10);
+        assert!(model.apply(ControllerCommand::RevokeMember { node }));
+        assert!(model.epoch > 10, "revoke must fence old manifests");
+        assert!(!model.members.contains_key(&node));
+    }
+
+    #[test]
+    fn expire_lsa_only_removes_older_sequences() {
+        let origin = NodeId::new([1u8; 32]);
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::ApplyLsa {
+            lsa: lsa(1, 7, "10.0.0.1/32"),
+        });
+        // Expiring up to a lower sequence must keep a newer LSA.
+        assert!(!model.apply(ControllerCommand::ExpireLsa {
+            origin,
+            up_to_seq: 6
+        }));
+        assert!(model.lsas.contains_key(&origin));
+        // Expiring through the observed sequence removes it.
+        assert!(model.apply(ControllerCommand::ExpireLsa {
+            origin,
+            up_to_seq: 7
+        }));
+        assert!(!model.lsas.contains_key(&origin));
     }
 
     #[test]

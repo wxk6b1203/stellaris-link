@@ -173,6 +173,9 @@ pub struct Match {
     pub tag: Option<String>,
     pub source: Option<RouteSource>,
     pub region: Option<String>,
+    /// Availability-zone match (same label as `node.zone`).
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

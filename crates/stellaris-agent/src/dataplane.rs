@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -84,6 +84,8 @@ pub async fn start(
         state.routes.clone(),
         tun_name.clone(),
         state.config.network.cidr,
+        state.config.dataplane.allow_default_route,
+        state.config.dataplane.replace_existing_routes,
     );
 
     let queue_depth = state.config.qos.queue_depth.unwrap_or(4096);
@@ -208,10 +210,14 @@ fn spawn_route_reconciler(
     routes: Arc<stellaris_routing::RouteEngine>,
     tun_name: String,
     overlay: ipnet::IpNet,
+    allow_default_route: bool,
+    replace_existing_routes: bool,
 ) {
+    let guard = Arc::new(InstalledRoutes {
+        tun: tun_name.clone(),
+        prefixes: Mutex::new(std::collections::BTreeSet::new()),
+    });
     tokio::spawn(async move {
-        let mut installed: std::collections::BTreeSet<ipnet::IpNet> =
-            std::collections::BTreeSet::new();
         let mut changed = routes.subscribe();
         loop {
             let desired: std::collections::BTreeSet<ipnet::IpNet> = routes
@@ -219,18 +225,53 @@ fn spawn_route_reconciler(
                 .into_iter()
                 .map(|r| r.prefix)
                 .filter(|p| !overlay.contains(&p.network()))
+                .filter(|p| {
+                    if is_default_prefix(p) && !allow_default_route {
+                        debug!(%p, "refusing to install a default route without dataplane.allow_default_route");
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .collect();
 
-            let missing: Vec<_> = desired.difference(&installed).copied().collect();
-            for prefix in missing {
-                if install_os_route(prefix, &tun_name) {
-                    installed.insert(prefix);
+            let installed = {
+                let guard = guard.prefixes.lock().unwrap_or_else(|e| e.into_inner());
+                guard.clone()
+            };
+            for prefix in desired.difference(&installed).copied().collect::<Vec<_>>() {
+                match route_state(prefix, &tun_name) {
+                    RouteState::Free | RouteState::Ours => {
+                        if install_os_route(prefix, &tun_name) {
+                            guard
+                                .prefixes
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(prefix);
+                        }
+                    }
+                    RouteState::Foreign if replace_existing_routes => {
+                        warn!(%prefix, "replacing a foreign OS route (dataplane.replace_existing_routes)");
+                        if install_os_route(prefix, &tun_name) {
+                            guard
+                                .prefixes
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(prefix);
+                        }
+                    }
+                    RouteState::Foreign => {
+                        warn!(%prefix, "OS route conflict, skipping (see dataplane.replace_existing_routes)");
+                    }
                 }
             }
-            let stale: Vec<_> = installed.difference(&desired).copied().collect();
-            for prefix in stale {
+            for prefix in installed.difference(&desired).copied().collect::<Vec<_>>() {
                 remove_os_route(prefix, &tun_name);
-                installed.remove(&prefix);
+                guard
+                    .prefixes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&prefix);
             }
             tokio::select! {
                 result = changed.changed() => {
@@ -244,6 +285,95 @@ fn spawn_route_reconciler(
     });
 }
 
+/// Routes we install are tagged with a private protocol number so that route
+/// ownership can be checked and only our routes are removed.
+#[cfg(target_os = "linux")]
+const ROUTE_PROTO: &str = "186";
+
+#[allow(dead_code)] // variants are only constructed by the Linux route probe
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteState {
+    /// No route for this prefix exists.
+    Free,
+    /// The existing route was installed by us (proto tag + TUN device).
+    Ours,
+    /// Somebody else owns this prefix.
+    Foreign,
+}
+
+fn is_default_prefix(prefix: &ipnet::IpNet) -> bool {
+    prefix.prefix_len() == 0
+}
+
+/// Parse `ip route show <prefix>` output into an ownership decision.
+#[cfg(target_os = "linux")]
+fn route_state_from(tun: &str, output: &str) -> RouteState {
+    let mut seen = false;
+    let ours = format!("proto {ROUTE_PROTO}");
+    let dev = format!("dev {tun}");
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        seen = true;
+        if line.contains(&dev) && line.contains(&ours) {
+            return RouteState::Ours;
+        }
+    }
+    if seen {
+        RouteState::Foreign
+    } else {
+        RouteState::Free
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn route_state(prefix: ipnet::IpNet, tun: &str) -> RouteState {
+    let mut command = std::process::Command::new("ip");
+    if matches!(prefix, ipnet::IpNet::V6(_)) {
+        command.arg("-6");
+    }
+    let output = command
+        .args(["route", "show", &prefix.to_string()])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            route_state_from(tun, &String::from_utf8_lossy(&out.stdout))
+        }
+        Ok(out) => {
+            debug!(%prefix, code = ?out.status.code(), "ip route show failed; skipping");
+            RouteState::Foreign
+        }
+        Err(e) => {
+            debug!(%prefix, error = %e, "failed to spawn ip route show; skipping");
+            RouteState::Foreign
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn route_state(_prefix: ipnet::IpNet, _tun: &str) -> RouteState {
+    // Ownership tagging is Linux-only; other platforms keep the previous
+    // behaviour and only rely on the device when removing.
+    RouteState::Free
+}
+
+/// Owns installed OS routes and removes them when the dataplane shuts down.
+struct InstalledRoutes {
+    tun: String,
+    prefixes: Mutex<std::collections::BTreeSet<ipnet::IpNet>>,
+}
+
+impl Drop for InstalledRoutes {
+    fn drop(&mut self) {
+        let prefixes = self.prefixes.lock().unwrap_or_else(|e| e.into_inner());
+        for prefix in prefixes.iter() {
+            remove_os_route(*prefix, &self.tun);
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn install_os_route(prefix: ipnet::IpNet, tun: &str) -> bool {
     let mut command = std::process::Command::new("ip");
@@ -251,16 +381,24 @@ fn install_os_route(prefix: ipnet::IpNet, tun: &str) -> bool {
         command.arg("-6");
     }
     let status = command
-        .args(["route", "replace", &prefix.to_string(), "dev", tun])
+        .args([
+            "route",
+            "replace",
+            &prefix.to_string(),
+            "dev",
+            tun,
+            "proto",
+            ROUTE_PROTO,
+        ])
         .status();
     match status {
         Ok(s) if s.success() => true,
         Ok(s) => {
-            debug!(%prefix, %tun, code = ?s.code(), "ip route replace failed");
+            warn!(%prefix, %tun, code = ?s.code(), "ip route replace failed");
             false
         }
         Err(e) => {
-            debug!(%prefix, error = %e, "failed to spawn ip route");
+            warn!(%prefix, error = %e, "failed to spawn ip route");
             false
         }
     }
@@ -273,7 +411,15 @@ fn remove_os_route(prefix: ipnet::IpNet, tun: &str) {
         command.arg("-6");
     }
     let _ = command
-        .args(["route", "del", &prefix.to_string(), "dev", tun])
+        .args([
+            "route",
+            "del",
+            &prefix.to_string(),
+            "dev",
+            tun,
+            "proto",
+            ROUTE_PROTO,
+        ])
         .status();
 }
 
@@ -1117,6 +1263,31 @@ overlay_ip = "10.7.0.2"
             InboundAction::Deliver(p)
         );
     }
+    #[test]
+    fn default_routes_are_opt_in() {
+        assert!(is_default_prefix(&"0.0.0.0/0".parse().unwrap()));
+        assert!(is_default_prefix(&"::/0".parse().unwrap()));
+        assert!(!is_default_prefix(&"10.0.0.0/8".parse().unwrap()));
+        assert!(!is_default_prefix(&"2001:db8::/32".parse().unwrap()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn route_ownership_is_parsed_from_ip_output() {
+        use super::RouteState;
+        let ours = "10.9.0.0/16 dev stellaris0 proto 186 scope link";
+        assert_eq!(route_state_from("stellaris0", ours), RouteState::Ours);
+        let foreign = "10.9.0.0/16 dev eth0 scope link";
+        assert_eq!(route_state_from("stellaris0", foreign), RouteState::Foreign);
+        assert_eq!(route_state_from("stellaris0", ""), RouteState::Free);
+        // Same device but not our proto tag is still foreign.
+        let untagged = "10.9.0.0/16 dev stellaris0 scope link";
+        assert_eq!(
+            route_state_from("stellaris0", untagged),
+            RouteState::Foreign
+        );
+    }
+
     #[test]
     fn path_mtu_limits_clamped_mss() {
         let state = state();

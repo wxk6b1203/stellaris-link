@@ -53,6 +53,7 @@ struct PersistedLsas {
 pub struct ControllerState {
     pub network: NetworkId,
     secret: Option<String>,
+    admin_secret: Option<String>,
     routes: Arc<RwLock<Vec<RouteEntry>>>,
     link_state: Arc<RwLock<LinkStateDb>>,
     acks: Arc<RwLock<HashMap<NodeId, u64>>>,
@@ -70,9 +71,13 @@ pub struct ControllerState {
     signer: Option<NodeId>,
     raft: Option<Arc<Raft<TypeConfig, StateMachineStore>>>,
     raft_store: Option<StateMachineStore>,
+    raft_id: Option<u64>,
+    /// Last time each origin's LSA was written or first observed by this leader.
+    lsa_seen: Arc<std::sync::Mutex<HashMap<NodeId, std::time::Instant>>>,
     raft_timing: Option<RaftTiming>,
     leader: Option<NodeId>,
     manifest_ttl: u64,
+    lsa_ttl_secs: u64,
     pub epoch: u64,
     generation: Arc<AtomicU64>,
 }
@@ -295,6 +300,7 @@ impl ControllerState {
         Ok(Self {
             network,
             secret: config.control.secret.clone(),
+            admin_secret: config.control.admin_secret.clone(),
             routes: Arc::new(RwLock::new(routes)),
             link_state: Arc::new(RwLock::new(link_state)),
             acks: Arc::new(RwLock::new(acks)),
@@ -312,6 +318,8 @@ impl ControllerState {
             signer: None,
             raft: None,
             raft_store: None,
+            raft_id: None,
+            lsa_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
             raft_timing: None,
             leader: config
                 .control
@@ -321,6 +329,7 @@ impl ControllerState {
                 .transpose()
                 .context("control.leader_id")?,
             manifest_ttl: config.control.manifest_ttl_secs,
+            lsa_ttl_secs: config.control.lsa_ttl_secs,
             epoch,
             generation: Arc::new(AtomicU64::new(if loaded_lsas > 0 { 2 } else { 1 })),
         })
@@ -333,6 +342,11 @@ impl ControllerState {
     ) {
         self.raft = Some(raft);
         self.raft_store = Some(store);
+    }
+
+    /// Record this controller's Raft node id (used for leader-only tasks).
+    pub fn set_raft_identity(&mut self, id: u64) {
+        self.raft_id = Some(id);
     }
 
     /// Record the Raft election timing this controller runs with, for status.
@@ -447,6 +461,7 @@ impl ControllerState {
         if let Some(local) = local {
             routes.extend(model.routes(local));
         }
+        routes.extend(model.route_entries());
         let members = self.members_from_model(&model);
         let network_id = self.network.to_string();
         let generation = model.generation;
@@ -482,9 +497,9 @@ impl ControllerState {
                     overlay_ip: lsa.overlay_ip,
                     addrs: lsa.addrs.clone(),
                     prefixes: lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect(),
-                    allowed_prefixes: member.map(|m| m.prefixes.clone()).unwrap_or_else(|| {
-                        lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect()
-                    }),
+                    // Only an explicit grant authorizes a prefix; an LSA must
+                    // never whitelist its own advertised prefixes.
+                    allowed_prefixes: member.map(|m| m.prefixes.clone()).unwrap_or_default(),
                     capabilities: member.map(|m| m.capabilities.clone()).unwrap_or_default(),
                     links: lsa.links.iter().map(|l| l.to.to_string()).collect(),
                     last_seq: lsa.seq,
@@ -557,12 +572,89 @@ impl ControllerState {
     async fn apply_lsa_current(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
         self.authorize_lsa_current(&lsa).await?;
         if let Some(raft) = &self.raft {
+            let origin = lsa.origin;
             raft.client_write(ControllerCommand::ApplyLsa { lsa })
                 .await
-                .map(|_| true)
+                .map(|_| {
+                    self.note_lsa(origin);
+                    true
+                })
                 .map_err(|e| (503, format!("raft write failed: {e}")))
         } else {
             self.apply_lsa(lsa)
+        }
+    }
+
+    fn note_lsa(&self, origin: NodeId) {
+        self.lsa_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(origin, std::time::Instant::now());
+    }
+
+    async fn raft_is_leader(&self) -> bool {
+        match (&self.raft, self.raft_id) {
+            (Some(raft), Some(id)) => raft.current_leader().await == Some(id),
+            _ => false,
+        }
+    }
+
+    /// Leader-only maintenance: monotonic epoch and replicated LSA expiry.
+    async fn raft_housekeeping(&self) {
+        let Some(raft) = self.raft.clone() else {
+            return;
+        };
+        let mut bumped = false;
+        let ttl = std::time::Duration::from_secs(self.lsa_ttl_secs.max(1));
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if !self.raft_is_leader().await {
+                bumped = false;
+                continue;
+            }
+            let model = self.model_current().await;
+            if !bumped {
+                let target = now_epoch().max(model.epoch.saturating_add(1));
+                if target > model.epoch
+                    && let Err(error) = raft
+                        .client_write(ControllerCommand::SetEpoch { epoch: target })
+                        .await
+                {
+                    tracing::debug!(%error, "raft epoch bump failed");
+                }
+                bumped = true;
+            }
+            let mut stale = Vec::new();
+            {
+                let mut seen = self.lsa_seen.lock().unwrap_or_else(|e| e.into_inner());
+                for (origin, lsa) in &model.lsas {
+                    match seen.get(origin) {
+                        None => {
+                            seen.insert(*origin, std::time::Instant::now());
+                        }
+                        Some(at) if at.elapsed() >= ttl => stale.push((*origin, lsa.seq)),
+                        Some(_) => {}
+                    }
+                }
+                let live: HashSet<NodeId> = model.lsas.keys().copied().collect();
+                seen.retain(|origin, _| live.contains(origin));
+            }
+            for (origin, up_to_seq) in stale {
+                match raft
+                    .client_write(ControllerCommand::ExpireLsa { origin, up_to_seq })
+                    .await
+                {
+                    Ok(_) => {
+                        self.lsa_seen
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&origin);
+                    }
+                    Err(error) => tracing::debug!(%error, %origin, "raft LSA expiry failed"),
+                }
+            }
         }
     }
 
@@ -862,6 +954,7 @@ impl ControllerState {
     fn apply_lsa(&self, lsa: Lsa) -> Result<bool, (u16, String)> {
         self.ensure_leader()?;
         self.authorize_lsa(&lsa)?;
+        self.note_lsa(lsa.origin);
         let model_lsa = lsa.clone();
         let changed = self
             .link_state
@@ -1084,6 +1177,18 @@ impl ControllerState {
         Ok(())
     }
 
+    /// Admin authority for revoke/route writes; falls back to the member
+    /// secret when `control.admin_secret` is not configured.
+    fn admin_authorized(&self, headers: &HeaderMap) -> bool {
+        let provided = headers
+            .get("x-stellaris-secret")
+            .and_then(|v| v.to_str().ok());
+        match (&self.admin_secret, &self.secret) {
+            (Some(admin), _) => provided.is_some_and(|value| value == admin),
+            (None, _) => self.authorized_secret(provided),
+        }
+    }
+
     fn authorized(&self, headers: &HeaderMap) -> bool {
         let provided = headers
             .get("x-stellaris-secret")
@@ -1128,6 +1233,60 @@ impl ControllerState {
             .apply(command);
         self.persist_acks();
         Ok(())
+    }
+
+    async fn record_ack_current(
+        &self,
+        node: NodeId,
+        generation: u64,
+        epoch: Option<u64>,
+    ) -> Result<(), (u16, String)> {
+        if let Some(raft) = &self.raft {
+            let model = self.model_current().await;
+            if let Some(epoch) = epoch
+                && epoch != model.epoch
+            {
+                return Err((409, "controller epoch changed; refetch snapshot".into()));
+            }
+            return raft
+                .client_write(ControllerCommand::Ack {
+                    node,
+                    generation,
+                    epoch: model.epoch,
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| (503, format!("raft write failed: {e}")));
+        }
+        self.record_ack(node, generation, epoch)
+    }
+
+    async fn upsert_route_current(
+        &self,
+        prefix: IpNet,
+        via: NodeId,
+        metric: u32,
+    ) -> Result<(), (u16, String)> {
+        if let Some(raft) = &self.raft {
+            raft.client_write(ControllerCommand::UpsertRoute {
+                prefix: prefix.to_string(),
+                via,
+                metric,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| (503, format!("raft write failed: {e}")))
+        } else {
+            self.add_route(prefix, via, metric);
+            self.model.write().unwrap_or_else(|e| e.into_inner()).apply(
+                ControllerCommand::UpsertRoute {
+                    prefix: prefix.to_string(),
+                    via,
+                    metric,
+                },
+            );
+            Ok(())
+        }
     }
 
     fn add_route(&self, prefix: IpNet, via: NodeId, metric: u32) -> RouteEntry {
@@ -1319,6 +1478,11 @@ async fn manifest(State(state): State<ControllerState>, headers: HeaderMap) -> R
     if !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // Only the leader may sign a manifest: a stale follower would otherwise
+    // hand members an old membership view.
+    if let Err(error) = state.linearize().await {
+        return controller_error(&state, 503, error).await;
+    }
     Json(state.manifest_current().await).into_response()
 }
 
@@ -1372,11 +1536,15 @@ async fn join(
         }
     };
     match state.join_current(node, overlay, &req.token).await {
-        Ok(()) => Json(json!({
-            "joined": node.to_string(),
-            "generation": state.generation.load(Ordering::Relaxed),
-        }))
-        .into_response(),
+        Ok(()) => {
+            let model = state.model_current().await;
+            Json(json!({
+                "joined": node.to_string(),
+                "generation": model.generation,
+                "epoch": model.epoch,
+            }))
+            .into_response()
+        }
         Err((code, message)) => controller_error(&state, code, message).await,
     }
 }
@@ -1391,7 +1559,7 @@ async fn revoke(
     headers: HeaderMap,
     Json(req): Json<RevokeRequest>,
 ) -> Response {
-    if !state.authorized(&headers) {
+    if !state.admin_authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let node: NodeId = match req.node_id.parse() {
@@ -1401,11 +1569,15 @@ async fn revoke(
         }
     };
     match state.revoke_current(node).await {
-        Ok(()) => Json(json!({
-            "revoked": node.to_string(),
-            "generation": state.generation.load(Ordering::Relaxed),
-        }))
-        .into_response(),
+        Ok(()) => {
+            let model = state.model_current().await;
+            Json(json!({
+                "revoked": node.to_string(),
+                "generation": model.generation,
+                "epoch": model.epoch,
+            }))
+            .into_response()
+        }
         Err((code, message)) => controller_error(&state, code, message).await,
     }
 }
@@ -1453,7 +1625,7 @@ async fn add_route(
     headers: HeaderMap,
     Json(req): Json<AddRoute>,
 ) -> Response {
-    if !state.authorized(&headers) {
+    if !state.admin_authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let prefix: IpNet = match req.prefix.parse() {
@@ -1464,9 +1636,15 @@ async fn add_route(
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid via: {e}")).into_response(),
     };
-    let entry = state.add_route(prefix, via, req.metric);
-    Json(json!({"generation": state.generation.load(Ordering::Relaxed), "route": entry}))
-        .into_response()
+    if let Err((code, message)) = state.upsert_route_current(prefix, via, req.metric).await {
+        return controller_error(&state, code, message).await;
+    }
+    let model = state.model_current().await;
+    let entry = model
+        .route_entries()
+        .into_iter()
+        .find(|route| route.prefix == prefix && route.next_hop == via);
+    Json(json!({"generation": model.generation, "route": entry})).into_response()
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -1558,7 +1736,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             "controller raft enabled"
         );
         state.set_raft_timing(timing);
+        state.set_raft_identity(id);
         state.set_raft(Arc::new(node.raft), node.store);
+        let housekeeping = state.clone();
+        tokio::spawn(async move {
+            housekeeping.raft_housekeeping().await;
+        });
         let publish_state = state.clone();
         tokio::spawn(async move {
             publish_state.publish_join_config().await;
@@ -1658,14 +1841,14 @@ async fn handle_control_conn(
         let Some(request) = crate::control_wire::read_frame(&mut recv).await? else {
             break;
         };
-        let response = dispatch_control(&state, request);
+        let response = dispatch_control(&state, request).await;
         crate::control_wire::write_frame(&mut send, &response).await?;
         let _ = send.finish();
     }
     Ok(())
 }
 
-fn dispatch_control(
+async fn dispatch_control(
     state: &ControllerState,
     request: crate::control_wire::Request,
 ) -> crate::control_wire::Response {
@@ -1688,23 +1871,44 @@ fn dispatch_control(
                 }
                 None => None,
             };
+            // Linearize before serving so an iroh member never reads a stale
+            // snapshot from a follower (no-op when Raft is disabled).
+            if let Err(error) = state.linearize().await {
+                return Response::Error {
+                    code: 503,
+                    message: error,
+                };
+            }
             Response::Snapshot {
-                snapshot: state.snapshot(local),
+                snapshot: state.snapshot_current(local).await,
             }
         }
-        Request::Lsa { lsa, secret } => {
+        Request::Lsa {
+            lsa,
+            signature,
+            secret,
+        } => {
             if !state.authorized_secret(secret.as_deref()) {
                 return Response::Error {
                     code: 401,
                     message: "unauthorized".into(),
                 };
             }
-            match state.apply_lsa(lsa) {
-                Ok(changed) => Response::Ok {
-                    changed,
-                    generation: state.generation.load(Ordering::Relaxed),
-                    epoch: state.epoch,
-                },
+            if !crate::lsa_auth::verify(&lsa, &signature) {
+                return Response::Error {
+                    code: 403,
+                    message: "LSA signature required or invalid".into(),
+                };
+            }
+            match state.apply_lsa_current(lsa).await {
+                Ok(changed) => {
+                    let model = state.model_current().await;
+                    Response::Ok {
+                        changed,
+                        generation: model.generation,
+                        epoch: model.epoch,
+                    }
+                }
                 Err((code, message)) => Response::Error { code, message },
             }
         }
@@ -1729,12 +1933,15 @@ fn dispatch_control(
                     };
                 }
             };
-            match state.record_ack(node, generation, epoch) {
-                Ok(()) => Response::Ok {
-                    changed: true,
-                    generation,
-                    epoch: state.epoch,
-                },
+            match state.record_ack_current(node, generation, epoch).await {
+                Ok(()) => {
+                    let model = state.model_current().await;
+                    Response::Ok {
+                        changed: true,
+                        generation: model.generation,
+                        epoch: model.epoch,
+                    }
+                }
                 Err((code, message)) => Response::Error { code, message },
             }
         }
@@ -1791,6 +1998,127 @@ via = "b"
     async fn json(response: axum::response::Response) -> serde_json::Value {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn follower_cannot_sign_a_manifest() {
+        let mut follower_state = state();
+        let models = (0..3)
+            .map(|_| ControllerModel::new(follower_state.network, follower_state.epoch))
+            .collect();
+        let (rafts, stores) = crate::controller_raft::start_cluster(models).await.unwrap();
+        let mut leader = None;
+        for _ in 0..50 {
+            for (id, raft) in rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(*id);
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let leader = leader.expect("leader");
+        let follower = (1..=3).find(|id| *id != leader).unwrap();
+        let raft = rafts.read().await.get(&follower).cloned().unwrap();
+        follower_state.set_raft(Arc::new(raft), stores[(follower - 1) as usize].clone());
+        let response = router(follower_state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/manifest")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key("x-stellaris-raft-leader"));
+    }
+
+    #[tokio::test]
+    async fn raft_routes_replicate_with_deterministic_ids() {
+        let mut leader_state = state();
+        let models = (0..3)
+            .map(|_| ControllerModel::new(leader_state.network, leader_state.epoch))
+            .collect();
+        let (rafts, stores) = crate::controller_raft::start_cluster(models).await.unwrap();
+        let mut leader = None;
+        for _ in 0..50 {
+            for (id, raft) in rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(*id);
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let leader = leader.expect("leader");
+        let follower = (1..=3).find(|id| *id != leader).unwrap();
+        let raft = rafts.read().await.get(&leader).cloned().unwrap();
+        leader_state.set_raft(Arc::new(raft), stores[(leader - 1) as usize].clone());
+        let app = router(leader_state);
+        let via = NodeId::new([2u8; 32]);
+        let body = json!({"prefix": "192.168.77.0/24", "via": via.to_string(), "metric": 3});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/routes")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // All replicas must converge on the same route with the same id.
+        let mut ids = Vec::new();
+        for store in &stores {
+            for _ in 0..50 {
+                let model = store.model().await;
+                let routes = model.route_entries();
+                if let Some(route) = routes
+                    .iter()
+                    .find(|route| route.prefix.to_string() == "192.168.77.0/24")
+                {
+                    ids.push(route.id);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        assert_eq!(ids.len(), 3, "route missing on a replica");
+        assert!(ids.iter().all(|id| *id == ids[0]), "route ids diverged");
+
+        // A follower cannot accept route writes.
+        let follower_raft = rafts.read().await.get(&follower).cloned().unwrap();
+        let mut follower_state = state();
+        follower_state.set_raft(
+            Arc::new(follower_raft),
+            stores[(follower - 1) as usize].clone(),
+        );
+        let body = json!({"prefix": "192.168.78.0/24", "via": via.to_string(), "metric": 1});
+        let response = router(follower_state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/routes")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -2587,6 +2915,112 @@ epoch = 1
                 .iter()
                 .any(|m| m.node_id == node.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn admin_secret_separates_member_and_admin_writes() {
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "member-secret"
+admin_secret = "admin-secret"
+
+[[control.join_tokens]]
+token = "join-admin-test"
+prefixes = ["192.168.60.0/24"]
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let app = router(state);
+        let node = "0101010101010101010101010101010101010101010101010101010101010101";
+        let join = serde_json::json!({"node_id": node, "overlay_ip": "10.7.0.2", "token": "join-admin-test"});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "member-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(join.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let revoke = serde_json::json!({"node_id": node});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/revoke")
+                    .header("x-stellaris-secret", "member-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(revoke.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/revoke")
+                    .header("x-stellaris-secret", "admin-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(revoke.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let route = serde_json::json!({
+            "prefix": "192.168.61.0/24",
+            "via": node,
+            "metric": 1
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/routes")
+                    .header("x-stellaris-secret", "member-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(route.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/routes")
+                    .header("x-stellaris-secret", "admin-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(route.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

@@ -4,6 +4,14 @@ BIN="${BIN:-$(pwd)/target/release/stellaris-agent}"; CTRL="${CTRL:-$(pwd)/target
 rm -rf "$DIR"; mkdir -p "$DIR"
 cleanup(){ kill ${CTRL_PID:-} ${A_PID:-} ${B_PID:-} ${C_PID:-} 2>/dev/null || true; for ns in sa sb sc; do ip netns del $ns 2>/dev/null || true; done; if [ "${KEEP:-0}" != 1 ]; then rm -rf $DIR; fi; }
 trap cleanup EXIT
+ping_ok(){
+  local ns=$1; shift
+  if ! ip netns exec "$ns" ping -4 -c 3 -W 2 "$@" >/dev/null 2>&1; then
+    echo "FAIL: ping from $ns to $*" >&2
+    for f in "$DIR"/{a,b,c}.log "$DIR"/ctrl.log; do [ -f "$f" ] && { echo "--- $f"; tail -20 "$f"; }; done
+    exit 1
+  fi
+}
 for ns in sa sb sc; do ip netns del $ns 2>/dev/null || true; ip netns add $ns; ip netns exec $ns ip link set lo up; done
 ip link add va type veth peer name vb1; ip link set va netns sa; ip link set vb1 netns sb
 ip link add vb2 type veth peer name vc; ip link set vb2 netns sb; ip link set vc netns sc
@@ -100,17 +108,19 @@ for ns in sa sb sc; do echo "== $ns"; ip netns exec $ns ip route; ip netns exec 
 echo '--- tcpdump C tun ---'
 ip netns exec sc tcpdump -i stellaris0 -n -c 10 > "$DIR/c.tcp" 2>&1 & TCP_PID=$!
 sleep 1
-ip netns exec sa ping -4 -c 3 -W 2 10.115.0.3 || true
-ip netns exec sc ping -4 -c 3 -W 2 10.115.0.1 || true
-ip netns exec sa ping -4 -c 3 -s 1000 -W 2 10.115.0.3 || true
+ping_ok sa 10.115.0.3
+ping_ok sc 10.115.0.1
+ping_ok sa -s 1000 10.115.0.3
 sleep 1
 kill $TCP_PID 2>/dev/null || true
 cat "$DIR/c.tcp"
 echo '--- B tcpdump tun ---'
 ip netns exec sb tcpdump -i stellaris0 -n -c 10 > "$DIR/b.tcp" 2>&1 & TCP_PID=$!
-ip netns exec sc ping -4 -c 3 -W 1 10.115.0.1 || true
+ping_ok sc 10.115.0.1
 sleep 1
 kill $TCP_PID 2>/dev/null || true
 cat "$DIR/b.tcp"
 echo '--- logs ---'
 for f in "$DIR"/{a,b,c}.log; do echo ===$f; grep -E 'inbound mesh|dropped|spoofed|no transit|deliver|forward' "$f" | tail -20; done
+ip netns exec sb curl -fsS -H 'x-stellaris-secret: ctrl-secret' http://127.0.0.1:46200/v1/status >/dev/null
+echo "OK: 3-node controller TUN/LSA/transit test passed (ping + status asserted)."

@@ -178,6 +178,10 @@ pub struct ControlConfig {
     /// Shared secret for snapshot auth (MVP).
     #[serde(default)]
     pub secret: Option<String>,
+    /// Optional admin secret for revoke/route writes. Falls back to `secret`
+    /// when unset; setting it separates member and admin authority.
+    #[serde(default)]
+    pub admin_secret: Option<String>,
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
@@ -235,9 +239,17 @@ pub struct ControlConfig {
     /// Membership manifest lifetime in seconds.
     #[serde(default = "default_manifest_ttl")]
     pub manifest_ttl_secs: u64,
+    /// Leader-side LSA lifetime in seconds (Raft mode); stale LSAs are removed
+    /// from the replicated model by an ``ExpireLsa`` command.
+    #[serde(default = "default_lsa_ttl")]
+    pub lsa_ttl_secs: u64,
     /// Trusted controller NodeIds for verifying Ed25519 snapshots.
     #[serde(default)]
     pub controller_keys: Vec<String>,
+    /// Accept controller snapshots that carry neither an Ed25519 signature nor
+    /// a shared-secret HMAC. Development only; rejected by default.
+    #[serde(default)]
+    pub allow_unsigned_snapshot: bool,
     /// Deprecated: fanout threshold was removed; only 1 is accepted.
     #[serde(default = "default_controller_threshold")]
     pub controller_threshold: usize,
@@ -286,6 +298,7 @@ impl Default for ControlConfig {
             urls: Vec::new(),
             bind: None,
             secret: None,
+            admin_secret: None,
             epoch: None,
             leader_id: None,
             previous_secrets: Vec::new(),
@@ -304,7 +317,9 @@ impl Default for ControlConfig {
             raft_tls_client_key: None,
             raft_tls_require_client_cert: false,
             manifest_ttl_secs: default_manifest_ttl(),
+            lsa_ttl_secs: default_lsa_ttl(),
             controller_keys: Vec::new(),
+            allow_unsigned_snapshot: false,
             controller_threshold: 1,
             members: Vec::new(),
             join_tokens: Vec::new(),
@@ -502,6 +517,10 @@ fn default_controller_threshold() -> usize {
     1
 }
 
+fn default_lsa_ttl() -> u64 {
+    30
+}
+
 fn default_manifest_ttl() -> u64 {
     3600
 }
@@ -520,6 +539,18 @@ pub struct DataplaneConfig {
     pub tun_name: String,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Install a default route (`0.0.0.0/0` or `::/0`) learned from the RIB.
+    ///
+    /// Disabled by default: a leaked or misconfigured default route would send
+    /// all host traffic into the TUN and can break the machine's connectivity.
+    #[serde(default)]
+    pub allow_default_route: bool,
+    /// Replace an existing non-stellaris OS route for the same prefix.
+    ///
+    /// Disabled by default: conflicting routes (Tailscale, admin routes, other
+    /// VPNs) are logged and skipped instead of being overwritten.
+    #[serde(default)]
+    pub replace_existing_routes: bool,
 }
 
 impl Default for DataplaneConfig {
@@ -530,6 +561,8 @@ impl Default for DataplaneConfig {
             nat: false,
             tun_name: default_tun_name(),
             mtu: default_mtu(),
+            allow_default_route: false,
+            replace_existing_routes: false,
         }
     }
 }
@@ -658,10 +691,94 @@ impl Config {
                 "network.auth.secret is required when auth.mode = psk".into(),
             ));
         }
+        if self.control.lsa_ttl_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "control.lsa_ttl_secs must be > 0".into(),
+            ));
+        }
         if self.control.manifest_ttl_secs == 0 {
             return Err(ConfigError::Invalid(
                 "control.manifest_ttl_secs must be > 0".into(),
             ));
+        }
+        for (name, value) in [
+            ("api.token", self.api.token.as_deref()),
+            ("api.read_token", self.api.read_token.as_deref()),
+            ("control.secret", self.control.secret.as_deref()),
+            ("control.admin_secret", self.control.admin_secret.as_deref()),
+            ("control.raft_secret", self.control.raft_secret.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} must not be empty when set"
+                )));
+            }
+        }
+        for token in &self.api.previous_tokens {
+            if token.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "api.previous_tokens entries must not be empty".into(),
+                ));
+            }
+        }
+        for secret in &self.control.previous_secrets {
+            if secret.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "control.previous_secrets entries must not be empty".into(),
+                ));
+            }
+        }
+        if self.control.raft_tls_cert.is_some() != self.control.raft_tls_key.is_some() {
+            return Err(ConfigError::Invalid(
+                "control.raft_tls_cert and control.raft_tls_key must be set together".into(),
+            ));
+        }
+        if self.control.raft_tls_client_cert.is_some() != self.control.raft_tls_client_key.is_some()
+        {
+            return Err(ConfigError::Invalid(
+                "control.raft_tls_client_cert and control.raft_tls_client_key must be set together"
+                    .into(),
+            ));
+        }
+        if self.control.raft_tls_require_client_cert && self.control.raft_tls_client_cert.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "control.raft_tls_require_client_cert requires raft_tls_client_cert/key".into(),
+            ));
+        }
+        if self.control.raft_dir.is_some() {
+            if self
+                .control
+                .raft_secret
+                .as_deref()
+                .is_none_or(|secret| secret.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "control.raft_dir requires a non-empty control.raft_secret".into(),
+                ));
+            }
+            if let Some(bind) = &self.control.raft_bind
+                && bind.parse::<SocketAddr>().is_err()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "control.raft_bind: {bind} is not a socket address"
+                )));
+            }
+            let mut ids = HashSet::new();
+            for peer in &self.control.raft_peers {
+                if !ids.insert(peer.id) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate control.raft_peers id {}",
+                        peer.id
+                    )));
+                }
+                if peer.addr.parse::<SocketAddr>().is_err() {
+                    return Err(ConfigError::Invalid(format!(
+                        "control.raft_peers {}: {} is not a socket address",
+                        peer.id, peer.addr
+                    )));
+                }
+            }
         }
         if let Some(min) = self.control.raft_election_timeout_ms
             && !(MIN_RAFT_ELECTION_TIMEOUT_MS..=MAX_RAFT_ELECTION_TIMEOUT_MS).contains(&min)
@@ -815,6 +932,24 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "qos class {} queue_bytes must be > 0",
                     class.name
+                )));
+            }
+        }
+        if !self.transport.listen {
+            return Err(ConfigError::Invalid(
+                "transport.listen=false is not supported (the transport always listens)".into(),
+            ));
+        }
+        if self.routing.rib_mode != RibMode::Full {
+            return Err(ConfigError::Invalid(
+                "routing.rib_mode only supports \"full\"; cache/none are not implemented".into(),
+            ));
+        }
+        for policy in &self.routing.policies {
+            if matches!(policy.action, crate::route::Action::SetPathHint { .. }) {
+                return Err(ConfigError::Invalid(format!(
+                    "routing policy {} uses set_path_hint, which is not implemented",
+                    policy.id
                 )));
             }
         }
@@ -977,6 +1112,7 @@ name = "demo"
 cidr = "10.7.0.0/16"
 [control]
 raft_dir = "/tmp/stellaris-raft-timing-test"
+raft_secret = "raft-secret"
 "#;
 
     #[test]
@@ -1015,6 +1151,121 @@ raft_dir = "/tmp/stellaris-raft-timing-test"
             let toml = format!("{RAFT_BASE}raft_election_timeout_ms = {value}\n");
             assert!(Config::from_toml(&toml).is_ok(), "value {value}");
         }
+    }
+
+    #[test]
+    fn unimplemented_config_options_are_rejected() {
+        let base = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+"#;
+        for (name, extra) in [
+            ("transport.listen", "[transport]\nlisten = false\n"),
+            ("routing.rib_mode", "[routing]\nrib_mode = \"cache\"\n"),
+            (
+                "set_path_hint",
+                "[[routing.policies]]\nid = \"p\"\npriority = 1\n[routing.policies.match_]\n[routing.policies.action]\nkind = \"set_path_hint\"\nvalue = \"direct\"\n",
+            ),
+        ] {
+            let toml = format!("{base}{extra}");
+            let error = Config::from_toml(&toml).unwrap_err().to_string();
+            assert!(
+                error.contains(name.split('.').next().unwrap()),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn raft_requires_a_non_empty_secret() {
+        let toml = r#"
+[node]
+name = "c"
+role = "controller"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[control]
+raft_dir = "/tmp/stellaris-raft-secret-test"
+"#;
+        let error = Config::from_toml(toml).unwrap_err().to_string();
+        assert!(error.contains("raft_secret"), "{error}");
+        let empty = toml.replace("[control]", "[control]\nraft_secret = \"\"");
+        let error = Config::from_toml(&empty).unwrap_err().to_string();
+        assert!(error.contains("raft_secret"), "{error}");
+    }
+
+    #[test]
+    fn empty_credentials_are_rejected() {
+        let base = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[api]
+bind = "127.0.0.1:7777"
+"#;
+        for (field, toml) in [
+            ("api.token", format!("{base}token = \"\"\n")),
+            ("api.read_token", format!("{base}read_token = \" \"\n")),
+            (
+                "control.secret",
+                format!("{base}[control]\nsecret = \"\"\n"),
+            ),
+        ] {
+            let error = Config::from_toml(&toml).unwrap_err().to_string();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn raft_tls_files_must_be_paired() {
+        let base = r#"
+[node]
+name = "c"
+role = "controller"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[control]
+raft_dir = "/tmp/stellaris-raft-tls-test"
+raft_secret = "raft-secret"
+"#;
+        let with_cert = format!("{base}raft_tls_cert = \"/tmp/cert.pem\"\n");
+        assert!(Config::from_toml(&with_cert).is_err());
+        let with_client = format!("{base}raft_tls_require_client_cert = true\n");
+        assert!(Config::from_toml(&with_client).is_err());
+        let ok = format!("{base}raft_tls_cert = \"/tmp/c.pem\"\nraft_tls_key = \"/tmp/k.pem\"\n");
+        assert!(Config::from_toml(&ok).is_ok());
+    }
+
+    #[test]
+    fn raft_peers_and_bind_are_validated() {
+        let base = r#"
+[node]
+name = "c"
+role = "controller"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[control]
+raft_dir = "/tmp/stellaris-raft-peer-test"
+raft_secret = "raft-secret"
+"#;
+        let bad_bind = format!("{base}raft_bind = \"not-an-address\"\n");
+        assert!(Config::from_toml(&bad_bind).is_err());
+        let bad_peer = format!(
+            "{base}raft_bind = \"127.0.0.1:5701\"\n[[control.raft_peers]]\nid = 1\naddr = \"nope\"\n"
+        );
+        assert!(Config::from_toml(&bad_peer).is_err());
+        let dup = format!(
+            "{base}raft_bind = \"127.0.0.1:5701\"\n[[control.raft_peers]]\nid = 1\naddr = \"127.0.0.1:1\"\n[[control.raft_peers]]\nid = 1\naddr = \"127.0.0.1:2\"\n"
+        );
+        assert!(Config::from_toml(&dup).is_err());
     }
 
     #[test]

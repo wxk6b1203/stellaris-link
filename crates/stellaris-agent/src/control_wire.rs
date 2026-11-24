@@ -21,6 +21,9 @@ pub enum Request {
     },
     Lsa {
         lsa: Lsa,
+        /// Ed25519 signature by `lsa.origin` over the canonical LSA payload.
+        #[serde(default)]
+        signature: String,
         #[serde(default)]
         secret: Option<String>,
     },
