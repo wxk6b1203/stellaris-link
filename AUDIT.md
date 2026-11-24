@@ -175,6 +175,9 @@ P0 证据速查：
 
 ---
 
+> 说明：§5 中 README/GAPS/TEST-RESULTS 的条目已按实际修复情况修正；ARCHITECTURE.md、
+> PROTOCOL.md、MEMBERSHIP-AUTH.md 已加"设计文档/实现状态"横幅，未实现条目仍保留为设计目标。
+
 ## 6. 建议的下一步（按投入产出排序）
 
 1. **先修证据链（1-2 天）**：把 WAN 脚本加固版在下一批主机复跑；修 `test-linux-netns-3node-controller.sh` 让 ping 失败即退出；CI 的 Docker step 改绝对路径；至少把 `test-controller-raft-3node.sh`、一个 netns 脚本、`test-tls.sh` 纳入 CI；push 让 CI 真正跑一次。

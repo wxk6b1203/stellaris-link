@@ -1,5 +1,10 @@
 # 入网与成员授权 — 设计
 
+> 实现状态（2026-11-24）：签名 `POST /v1/join`（`require_join_signature`）、
+> `control.admin_secret` 读写分权、动态 Raft membership 接口、快照/manifest 默认
+> fail-closed 已落地；Hello 挑战、per-member key、threshold、manifest 过期只读等
+> 仍是设计目标，详见 [AUDIT.md](AUDIT.md) §7。
+
 > 状态：设计稿；已实现 **PSK 双向 HMAC 入网认证 + allowlist**、controller Ed25519 snapshot 签名、controller 侧 member/prefix grant 校验、一次性 join token（HTTP `/v1/join`）、**独立 Ed25519 signed membership manifest（`GET /v1/manifest`）**、member 侧 LSA prefix 强制。
 > 关联：[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、[PROTOCOL.md](PROTOCOL.md)
 > 目标：把“谁能加入网络、谁能让别人加入、谁能广告哪些前缀”设计清楚，再实现。
