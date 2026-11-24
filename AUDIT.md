@@ -20,7 +20,7 @@
 |---|---:|---|
 | P0 | 6 | LSA 可伪造、transit 放行任意成员源、OS 路由无 owner、iroh 绕过 Raft、Raft RPC fail-open、脚本假绿 |
 | P1 | 17 | `/v1/routes` 不进 Raft、LSA TTL 不执行、epoch 语义、join 无签名、snapshot/manifest fail-open、动态 membership、relay failover 空断言、TTL/path hint 缺失、配置 no-op、空 secret、零测试模块…… |
-| P2 | 15+ | metrics/audit、IPv6 MTU、network_hash、discovery 默认开放、relay 回退、CI/打包/许可、文档漂移…… |
+| P2 | 14+ | metrics/audit、IPv6 MTU、discovery 默认开放、relay_urls 语义、CI/打包/许可、文档漂移…… |
 
 ---
 
@@ -210,12 +210,13 @@ P0 证据速查：
 | P1 snapshot/manifest fail-open | 未签名快照默认拒绝（`allow_unsigned_snapshot` 显式开启）；校验 `network_id` 与 epoch 回退；LSA 不再自授权前缀；manifest 仅 leader 可签 | `control_client` 4 个单测；follower manifest 503 单测 |
 | P1 动态 membership | `/v1/raft/learner`、`/v1/raft/membership`（admin） | 单测 + `test-real-raft-membership.sh`：3→4 voters、learner 转正、1 follower 宕机仍可写 |
 | P1 relay failover | 重连地址加入全部 `transport.relay_urls`；新增 `disable_discovery` 以便强制 relay-only 测试 | 单测：shutdown 承载流量的 relay 后，数据改走第二个 relay（约 60s，等旧连接关闭） |
+| P2 network_hash | 改为 SHA-256(network_id) 前 32 位，避免 UUIDv7 时间前缀碰撞 | wire 单测；文档同步 |
 | P1 配置 no-op | `transport.listen=false`、`rib_mode!=full`、`set_path_hint` 直接报错；新增 `Match.zone` 并实现匹配 | config/routing 单测 |
 | P1 空 secret / TLS 配对 / QoS 校验 | 全部为 validate 错误；QoS 两条路径都校验 0 值 | config/policy 单测 |
 | P1 route TTL 不生效 | runtime 每秒调用 `RouteEngine::expire()` | routing 单测 |
 | P1 iroh 4 MiB 上限 | 控制帧上限提高到 64 MiB | `test-real-iroh-large-snapshot.sh`：8 MiB 模型经 iroh-only member 同步并 ACK |
 | P1 LSA 过期洪泛 | 新增批量 `ExpireLsas`，每轮一条 Raft 写 | 模型单测；修复了 5100 条 LSA 同时过期导致复制/追赶被拖慢的问题 |
-| P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 153 |
+| P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 154 |
 
 ### 7.2 仍开放的 P1/P2 边界
 
@@ -225,7 +226,7 @@ P0 证据速查：
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。
 - **大模型追赶性能**：LSA 过期已批量，但每次 apply 仍重写整份 raft-log/state（O(n²)），5k 条写入约 10 分钟；未做日志分片/增量持久化。
 - **iroh 大帧**：8 MiB 已验证；>64 MiB 仍会失败（无分块）。
-- **P2 未动**：metrics/audit 细化、IPv6 <1280、network_hash、默认开放 discovery、relay_urls 语义、ACL 不回 ICMP、macOS NAT、打包/CI 矩阵、真 multipath、应用层重组、真实互联网 PMTUD 等。
+- **P2 未动**：metrics/audit 细化、IPv6 <1280、默认开放 discovery、relay_urls 语义、ACL 不回 ICMP、macOS NAT、打包/CI 矩阵、真 multipath、应用层重组、真实互联网 PMTUD 等。
 
 ### 7.3 本轮新增的配置/行为变化（升级注意）
 

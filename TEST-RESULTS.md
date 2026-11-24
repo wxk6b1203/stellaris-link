@@ -23,7 +23,7 @@
 ```text
 cargo fmt --check                          ✅
 cargo clippy --workspace --all-targets -- -D warnings  ✅
-cargo test --workspace                     153 passed
+cargo test --workspace                     154 passed
 ```
 
 ---
