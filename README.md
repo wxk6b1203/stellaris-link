@@ -610,7 +610,7 @@ examples/               # 示例 TOML
 - agent 的路由写 API 只接受 `scope=local`；network scope 目前只能通过 controller 配置/静态路由（`api.rs:365-369` 会拒绝 network scope）。
 - ACL/QoS 支持 API 动态更新 + token-bucket + per-priority/per-class queue depth/bytes + DSCP；内置静态 Web UI（`crates/stellaris-agent/static/index.html`）只覆盖 peers/routes/status/policy。anti-spoof 允许 peer 自身 overlay IP + 它广告的前缀；subnet gateway 的 NAT66 目前仅 Linux（macOS 待做）。
 - **控制帧没有 per-member 签名/Hello 挑战**：iroh 连接有 `network.auth.mode = "psk"` 双向认证，但控制帧本身没有逐成员签名；不要把这个 MVP 直接暴露在不可信网络。
-- relay 建连与 direct→relay 切换已测；relay1→relay2 自动 failover 的测试当前为空断言，生产建议自建 relay 并单独验证（见 AUDIT.md）。
+- relay 建连与 direct→relay 切换已测；**relay1→relay2 自动 failover 确认为未实现**（强制 relay-only 后 shutdown 一个 relay，60s 内不迁移），生产需自建 relay 并监控（见 AUDIT.md）。
 - 2026-11-24 完成静态审计（[AUDIT.md](AUDIT.md)）并修复 P0：LSA 签名、transit 强制、OS 路由防护、iroh 走 Raft、Raft RPC 必须配 `raft_secret` 且有超时、签名 join、admin secret、routes/LSA TTL/epoch 入 Raft、动态 membership。仍没有第三方安全审计，MVP 仅用于开发/实验。
 - 2026-11-24 新增的配置：`control.admin_secret`、`control.require_join_signature`、`control.lsa_ttl_secs`、`dataplane.allow_default_route`、`dataplane.replace_existing_routes`；`transport.listen=false`、`routing.rib_mode!=full`、`set_path_hint` 现在会直接报错（此前被静默忽略）。子网网关/exit 转发需要给对应成员 grant `capabilities = ["transit"]`。
 

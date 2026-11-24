@@ -23,7 +23,7 @@
 ```text
 cargo fmt --check                          ✅
 cargo clippy --workspace --all-targets -- -D warnings  ✅
-cargo test --workspace                     152 passed
+cargo test --workspace                     153 passed
 ```
 
 ---
@@ -362,7 +362,10 @@ md5 `9306484038210dce706ec406a41a71eb` 分发到其余 7 台。
 | 本机三进程 Raft（含默认 1000ms 检查） | `test-controller-raft-3node.sh` | ✅ |
 | 三地 TOML 滚动重启（新二进制） | `test-real-rolling-restart-ha.sh` | ✅ |
 | 三地 20% 丢包 + 50ms（新二进制） | `test-real-wan-loss-ha.sh` | ✅ 换主 4.1s |
-| 三地 >4MiB snapshot（重跑） | 临时编排 | 见 §3.10；本次重跑结果记录在下方 |
+| 三地 >4MiB snapshot（重跑） | 临时编排 | ✅ 5.2 MiB 模型、2MiB 分块、中断后续传追平（generation 5103） |
+| 动态 membership 3→4 voter + learner 转正 | `scripts/test-real-raft-membership.sh` | ✅；1 follower 宕机仍可写 |
+| iroh 入口同步 >4MiB 模型 | `scripts/test-real-iroh-large-snapshot.sh` | ✅ 8 MiB 模型，member ACK |
+| relay 路径（禁用 discovery 强制 relay） | `transport` 单测 | ✅ 数据确实经 relay；relay 真正 shutdown 后 60s 未迁移（failover 未实现） |
 
 state-ha 关键输出：
 
@@ -385,7 +388,31 @@ iroh LSA applied on the leader and replicated to all replicas
 OK: iroh control path goes through Raft
 ```
 
-### 3.12 仍未验证### 3.11 仍未验证
+补充（19:5x 重跑，新二进制 `02e412f6…`）：
+
+```text
+>4MiB snapshot: ctrl3 partial=2097152 -> kill -> restart(partial=2097152)
+-> link restored -> ctrl3 caught up: generation=5103
+OK: >4MiB snapshot transferred across regions with an interrupted resume
+
+membership: initial leader=1 (3 voters) -> learner 4 added -> 4-voter cluster
+-> route replicated to ctrl4 -> write accepted with one follower down (200)
+OK: dynamic membership (3 -> 4 voters, learner promotion) verified
+
+iroh large: controller raft-state.json bytes=9378264
+iroh member ACKed a 8 MiB snapshot (acks=1)
+OK: iroh control syncs models above the old 4 MiB frame cap
+
+WAN loss rerun: initial leader=1 under loss; new leader=3 after 4.6s;
+failover snapshot ok; OK
+```
+
+relay failover 的否定证据（本轮新增）：用 `clear_address_lookup` 强制 relay-only、
+真正 `shutdown()` 第一个 relay 后，60s 内第二个 relay 没有收到数据，
+`send_datagram` 开始失败，peer 仍显示 connected。说明当前**没有**自动迁移到第二个 relay；
+单测已改为断言“经 relay 传输”，failover 留作后续。
+
+### 3.12 仍未验证### 3.12 仍未验证### 3.11 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot

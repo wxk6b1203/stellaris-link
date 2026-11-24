@@ -31,7 +31,7 @@
 | 级别 | 修复 | 仍有边界 |
 |---|---|---|
 | P0 | 6 / 6 已修复并在真实主机/本机验证 | 无已知 P0 残留 |
-| P1 | 15 / 17 已修复；2 项部分完成（relay 路径选择、iroh >4MiB 端到端） | 见 §7.2 |
+| P1 | 16 / 17 修复或关闭；**relay 自动 failover 确认为未实现** | 见 §7.2 |
 | P2 | 文档与 CI 少量项处理，其余仍开放 | 见 §7.3 |
 
 P0 证据速查：
@@ -206,6 +206,7 @@ P0 证据速查：
 | P1 无特权分离 | `control.admin_secret`：revoke/routes 需要 admin；member secret 被拒 | 同上 + 单测 |
 | P1 snapshot/manifest fail-open | 未签名快照默认拒绝（`allow_unsigned_snapshot` 显式开启）；校验 `network_id` 与 epoch 回退；LSA 不再自授权前缀；manifest 仅 leader 可签 | `control_client` 4 个单测；follower manifest 503 单测 |
 | P1 动态 membership | `/v1/raft/learner`、`/v1/raft/membership`（admin） | 单测 + `test-real-raft-membership.sh`：3→4 voters、learner 转正、1 follower 宕机仍可写 |
+| P1 relay 路径 | 新增 `transport.disable_discovery` 强制 relay-only；单测断言数据确实经 relay | 真正 shutdown 第一个 relay 后 60s 内不迁移、`send_datagram` 失败：自动 failover **未实现** |
 | P1 配置 no-op | `transport.listen=false`、`rib_mode!=full`、`set_path_hint` 直接报错；新增 `Match.zone` 并实现匹配 | config/routing 单测 |
 | P1 空 secret / TLS 配对 / QoS 校验 | 全部为 validate 错误；QoS 两条路径都校验 0 值 | config/policy 单测 |
 | P1 route TTL 不生效 | runtime 每秒调用 `RouteEngine::expire()` | routing 单测 |
@@ -215,10 +216,12 @@ P0 证据速查：
 
 ### 7.2 仍开放的 P1/P2 边界
 
-- **relay failover 路径选择**：测试已改名为“一个 relay 消失后连接不断”，不再声称完成 failover；relay1→relay2 的实际选择仍无证据（iroh 内部行为）。
+- **relay 自动 failover（P1-9）**：已确认当前实现下不会迁移——强制 relay-only 后 shutdown 第一个 relay，60s 内第二个 relay 无流量、`send_datagram` 失败；需要传输层重连/多 relay 策略。测试不再声称 failover。
 - **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
+- **relay 自动 failover**：见上，需要传输层改动。
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。
-- **大模型追赶性能**：LSA 过期已批量，但每次 apply 仍重写整份 raft-log/state（O(n²)），5k 条写入需要约 10 分钟；未做日志分片/增量持久化。
+- **大模型追赶性能**：LSA 过期已批量，但每次 apply 仍重写整份 raft-log/state（O(n²)），5k 条写入约 10 分钟；未做日志分片/增量持久化。
+- **iroh 大帧**：8 MiB 已验证；>64 MiB 仍会失败（无分块）。
 - **P2 未动**：metrics/audit 细化、IPv6 <1280、network_hash、默认开放 discovery、relay_urls 语义、ACL 不回 ICMP、macOS NAT、打包/CI 矩阵、真 multipath、应用层重组、真实互联网 PMTUD 等。
 
 ### 7.3 本轮新增的配置/行为变化（升级注意）
