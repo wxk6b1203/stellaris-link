@@ -282,7 +282,7 @@ H1=... H2=... H3=... ./scripts/test-real-wan-loss-ha.sh
 边界：只验证了"单次 leader 故障 + 20% 丢包"；没有做长时间 soak，也没有在
 丢包下测滚动重启和 >4MiB snapshot（见 §3.10）。
 
-### 3.10 >4MiB snapshot 跨 WAN：传输/安装通过，中断续传部分通过
+### 3.10 >4MiB snapshot 跨 WAN：通过（含中断续传）
 
 做法：三 controller 正常起（TOML 1000ms），停掉 ctrl3，从 leader 本机并发写入
 5100 条 LSA（每条 24 个 prefix，8 线程），写入耗时 331s（每条命令都重写整份
