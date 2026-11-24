@@ -68,6 +68,25 @@ bind="127.0.0.1:46221"
 TOML
 done
 A=$($BIN --config "$DIR/a.toml" --print-id); B=$($BIN --config "$DIR/b.toml" --print-id); C=$($BIN --config "$DIR/c.toml" --print-id)
+# b forwards a<->c traffic, so it needs the transit capability; plain
+# members may only source their own overlay/prefixes.
+cat >> "$DIR/controller.toml" <<TOML
+
+[[control.members]]
+node_id = "$A"
+overlay_ip = "10.115.0.1"
+capabilities = ["member"]
+
+[[control.members]]
+node_id = "$B"
+overlay_ip = "10.115.0.2"
+capabilities = ["member", "transit"]
+
+[[control.members]]
+node_id = "$C"
+overlay_ip = "10.115.0.3"
+capabilities = ["member"]
+TOML
 cat >> "$DIR/a.toml" <<TOML
 [[peers]]
 name="b"

@@ -34,8 +34,15 @@ trap cleanup EXIT
 status_of(){ sshx "${hosts[$1]}" "curl -s --max-time 3 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/status'" 2>/dev/null || true; }
 leader_of(){ status_of "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("leader") or "")' 2>/dev/null || true; }
 snapshot_has_member(){
-  sshx "${hosts[$1]}" "curl -fsS --max-time 10 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/snapshot?node=$NODE'" 2>/dev/null \
-    | grep -q "$NODE"
+  local i=$1
+  for _ in $(seq 1 20); do
+    if sshx "${hosts[$i]}" "curl -fsS --max-time 10 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/snapshot?node=$NODE'" 2>/dev/null \
+      | grep -q "$NODE"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
 }
 
 for h in "${hosts[@]}"; do sshx "$h" "pkill -9 -f '[c]trl[1-3].toml' 2>/dev/null; rm -rf $DIR; mkdir -p $DIR; tc qdisc del dev eth0 root >/dev/null 2>&1" >/dev/null 2>&1; done

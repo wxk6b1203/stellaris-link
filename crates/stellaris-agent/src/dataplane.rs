@@ -227,7 +227,7 @@ fn spawn_route_reconciler(
                 .filter(|p| !overlay.contains(&p.network()))
                 .filter(|p| {
                     if is_default_prefix(p) && !allow_default_route {
-                        debug!(%p, "refusing to install a default route without dataplane.allow_default_route");
+                        warn!(%p, "refusing to install a default route without dataplane.allow_default_route");
                         false
                     } else {
                         true
@@ -288,7 +288,7 @@ fn spawn_route_reconciler(
 /// Routes we install are tagged with a private protocol number so that route
 /// ownership can be checked and only our routes are removed.
 #[cfg(target_os = "linux")]
-const ROUTE_PROTO: &str = "186";
+const ROUTE_PROTO: &str = "240";
 
 #[allow(dead_code)] // variants are only constructed by the Linux route probe
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

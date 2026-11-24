@@ -111,11 +111,15 @@ raft_bootstrap = true
 TOML
 RUST_LOG=info "$BIN" --config "$DEF/default.toml" >"$DEF/default.log" 2>&1 &
 PIDS+=($!)
-for _ in $(seq 1 100); do grep -q "controller raft enabled" "$DEF/default.log" 2>/dev/null && break; sleep 0.1; done
-grep -q "election_timeout_min_ms=1000" "$DEF/default.log" || {
-  echo "FAIL: cross-region default timing not applied" >&2; cat "$DEF/default.log" >&2; exit 1; }
-grep -q 'timing_source="default-cross-region"' "$DEF/default.log" || {
-  echo "FAIL: cross-region default timing source not reported" >&2; exit 1; }
+for _ in $(seq 1 100); do
+  curl -fsS --max-time 2 -H "x-stellaris-secret: $SECRET" http://127.0.0.1:47799/v1/status >/dev/null 2>&1 && break
+  sleep 0.1
+done
+DEFAULT_TIMING=$(curl -fsS --max-time 3 -H "x-stellaris-secret: $SECRET" http://127.0.0.1:47799/v1/status \
+  | python3 -c 'import json,sys;r=json.load(sys.stdin).get("raft") or {};print(r.get("election_timeout_min_ms"), r.get("election_timeout_max_ms"), r.get("heartbeat_interval_ms"), r.get("source"))')
+[[ "$DEFAULT_TIMING" == "1000 2000 250 default-cross-region" ]] || {
+  echo "FAIL: cross-region default timing not applied (status: $DEFAULT_TIMING)" >&2
+  cat "$DEF/default.log" >&2; exit 1; }
 echo "default timing ok: min=1000ms max=2000ms heartbeat=250ms source=default-cross-region"
 # join and LSA on the leader
 JOIN=$(python3 - <<'PY'
