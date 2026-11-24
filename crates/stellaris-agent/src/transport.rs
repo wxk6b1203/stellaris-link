@@ -45,6 +45,8 @@ pub struct IrohTransport {
     control_tx: Option<mpsc::Sender<ControlEvent>>,
     conns: Arc<RwLock<HashMap<NodeId, iroh::endpoint::Connection>>>,
     conn_ids: Arc<RwLock<HashMap<NodeId, usize>>>,
+    /// Configured relays tried when reconnecting to a peer, in order.
+    relay_fallbacks: Vec<RelayUrl>,
 }
 
 impl IrohTransport {
@@ -103,6 +105,12 @@ impl IrohTransport {
             control_tx: control_tx.clone(),
             conns: Arc::new(RwLock::new(HashMap::new())),
             conn_ids: Arc::new(RwLock::new(HashMap::new())),
+            relay_fallbacks: config
+                .transport
+                .relay_urls
+                .iter()
+                .filter_map(|url| url.parse().ok())
+                .collect(),
         });
 
         // Accept loop: authenticated iroh connection -> peer reader.
@@ -395,6 +403,14 @@ async fn connect_loop(
             Err(e) => warn!(peer = %peer.name, error = %e, "invalid relay_url"),
         }
     }
+    // Fall back to every configured relay so a dead home relay does not pin
+    // reconnects to the same dead endpoint.
+    for relay in &transport.relay_fallbacks {
+        let candidate = TransportAddr::Relay(relay.clone());
+        if !addrs.contains(&candidate) {
+            addrs.push(candidate);
+        }
+    }
     let addr = EndpointAddr::from_parts(remote, addrs);
     loop {
         match transport.endpoint.connect(addr.clone(), DATA_ALPN).await {
@@ -542,9 +558,9 @@ bind = "127.0.0.1:0"
     }
 
     #[tokio::test]
-    async fn endpoint_uses_a_relay_when_direct_discovery_is_disabled() {
+    async fn endpoint_fails_over_to_the_second_relay_when_the_active_relay_dies() {
         let (relay1, url1) = start_relay().await;
-        let (_relay2, url2) = start_relay().await;
+        let (relay2, url2) = start_relay().await;
         let base =
             std::env::temp_dir().join(format!("stellaris-relay-use-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&base).unwrap();
@@ -646,22 +662,86 @@ cidr = "10.8.0.0/16"
         let peer = a.peers.get(&b_id).expect("peer");
         assert!(peer.connected);
         assert_eq!(peer.path.as_deref(), Some("relay"));
-        let before = relay1.metrics().server.send_packets_recv.get()
-            + _relay2.metrics().server.send_packets_recv.get();
+        let before1 = relay1.metrics().server.send_packets_recv.get();
+        let before2 = relay2.metrics().server.send_packets_recv.get();
         a.send(b_id, Bytes::from_static(b"relay-probe"))
             .await
             .unwrap();
-        for _ in 0..30 {
-            let now = relay1.metrics().server.send_packets_recv.get()
-                + _relay2.metrics().server.send_packets_recv.get();
-            if now > before {
+        let mut carried = false;
+        for _ in 0..50 {
+            if relay1.metrics().server.send_packets_recv.get() > before1
+                || relay2.metrics().server.send_packets_recv.get() > before2
+            {
+                carried = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let after = relay1.metrics().server.send_packets_recv.get()
-            + _relay2.metrics().server.send_packets_recv.get();
-        assert!(after > before, "datagram did not traverse a relay");
+        assert!(carried, "datagram did not traverse a relay");
+
+        // Kill the relay that actually carried traffic and require the peer to
+        // reconnect through the other configured relay.
+        let mut r1 = Some(relay1);
+        let mut r2 = Some(relay2);
+        let use_first = r1
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .server
+            .send_packets_recv
+            .get()
+            > before1;
+        let survivor_before = if use_first {
+            r2.as_ref()
+                .unwrap()
+                .metrics()
+                .server
+                .send_packets_recv
+                .get()
+        } else {
+            r1.as_ref()
+                .unwrap()
+                .metrics()
+                .server
+                .send_packets_recv
+                .get()
+        };
+        if use_first {
+            r1.take().unwrap().shutdown().await.unwrap();
+        } else {
+            r2.take().unwrap().shutdown().await.unwrap();
+        }
+        let mut recovered = false;
+        for _ in 0..900 {
+            let survivor_now = if use_first {
+                r2.as_ref()
+                    .unwrap()
+                    .metrics()
+                    .server
+                    .send_packets_recv
+                    .get()
+            } else {
+                r1.as_ref()
+                    .unwrap()
+                    .metrics()
+                    .server
+                    .send_packets_recv
+                    .get()
+            };
+            if a.send(b_id, Bytes::from_static(b"relay-failover-probe"))
+                .await
+                .is_ok()
+                && survivor_now > survivor_before
+            {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            recovered,
+            "traffic did not move to the second relay after the active relay died"
+        );
         drop(a);
         drop(b);
         std::fs::remove_dir_all(base).unwrap();
