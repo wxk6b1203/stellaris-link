@@ -21,6 +21,7 @@ NODE="0101010101010101010101010101010101010101010101010101010101010101"
 hosts=("$H1" "$H2" "$H3"); ips=("$IP1" "$IP2" "$IP3")
 TMP="$(mktemp -d /tmp/stellaris-wan2.XXXXXX)"
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
+fail(){ log "FAIL: $*"; exit 1; }
 sshx(){ ssh -o BatchMode=yes -o ConnectTimeout=6 "$@"; }
 cleanup(){
   log "cleanup"
@@ -30,18 +31,22 @@ cleanup(){
   rm -rf "$TMP"
 }
 trap cleanup EXIT
-status_of(){ sshx "${hosts[$1]}" "curl -s --max-time 3 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/status'" 2>/dev/null; }
-leader_of(){ status_of "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("leader") or "")' 2>/dev/null; }
+status_of(){ sshx "${hosts[$1]}" "curl -s --max-time 3 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/status'" 2>/dev/null || true; }
+leader_of(){ status_of "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("leader") or "")' 2>/dev/null || true; }
+snapshot_has_member(){
+  sshx "${hosts[$1]}" "curl -fsS --max-time 10 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/snapshot?node=$NODE'" 2>/dev/null \
+    | grep -q "$NODE"
+}
 
 for h in "${hosts[@]}"; do sshx "$h" "pkill -9 -f '[c]trl[1-3].toml' 2>/dev/null; rm -rf $DIR; mkdir -p $DIR; tc qdisc del dev eth0 root >/dev/null 2>&1" >/dev/null 2>&1; done
 log "baseline ping from $IP1 to peers"
-sshx "$H1" 'ping -c 3 -q 47.107.226.187 2>/dev/null | tail -2; ping -c 3 -q 8.153.179.142 2>/dev/null | tail -2'
+sshx "$H1" "ping -c 3 -q $IP2 2>/dev/null | tail -2; ping -c 3 -q $IP3 2>/dev/null | tail -2"
 log "apply netem loss=$LOSS delay=$DELAY on egress to peer controllers"
 for i in 0 1 2; do
   h="${hosts[$i]}"; a="${ips[$(((i+1)%3))]}"; b="${ips[$(((i+2)%3))]}"
   sshx "$h" "tc qdisc replace dev eth0 root handle 1: prio && tc qdisc replace dev eth0 parent 1:3 handle 30: netem delay $DELAY loss $LOSS && tc filter add dev eth0 parent 1:0 protocol ip prio 1 u32 match ip dst $a/32 flowid 1:3 && tc filter add dev eth0 parent 1:0 protocol ip prio 1 u32 match ip dst $b/32 flowid 1:3" || { log "FAIL: netem on $h"; exit 1; }
 done
-sshx "$H1" 'ping -c 5 -q 47.107.226.187 2>/dev/null | tail -2'
+sshx "$H1" "ping -c 5 -q $IP2 2>/dev/null | tail -2"
 
 for i in 0 1 2; do
   boot=false; [ "$i" = 0 ] && boot=true
@@ -97,15 +102,16 @@ log "raft timing: $TIMING"
 [ "$TIMING" = "$ELECTION_MS $((ELECTION_MS / 4)) config" ] || { log "FAIL: unexpected raft timing $TIMING"; exit 1; }
 JOIN='{"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.248.0.10","token":"join-wan"}'
 LSA1='{"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":1,"zone":null,"links":[],"prefixes":[{"prefix":"192.168.252.0/24","metric":0}],"overlay_ip":"10.248.0.10","addrs":[]}'
-post(){ sshx "${hosts[$2]}" "curl -s --max-time 20 -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$1' 'http://127.0.0.1:$C_PORT$3'" >/dev/null; }
-post "$JOIN" "$((L-1))" /v1/join
-post "$LSA1" "$((L-1))" /v1/lsa
+post(){ sshx "${hosts[$2]}" "curl -fsS --max-time 20 -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$1' 'http://127.0.0.1:$C_PORT$3'" >/dev/null; }
+post "$JOIN" "$((L-1))" /v1/join || fail "join failed on leader $L"
+post "$LSA1" "$((L-1))" /v1/lsa || fail "lsa write failed on leader $L"
 log "joined member and wrote lsa=1 on leader $L"
-sshx "${hosts[$((L-1))]}" "curl -s --max-time 10 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/snapshot?node=$NODE'" | grep -q 0101010101010101 && log "snapshot members ok on leader"
+snapshot_has_member "$((L-1))" || fail "snapshot missing member on leader $L"
+log "snapshot members ok on leader"
 
 OLD=$L
 log "kill leader $OLD"
-sshx "${hosts[$((OLD-1))]}" "kill -9 \$(cat $DIR/ctrl$OLD.pid)" || log "WARN: kill command returned nonzero"
+sshx "${hosts[$((OLD-1))]}" "kill -9 \$(cat $DIR/ctrl$OLD.pid)" || fail "could not kill leader $OLD"
 T0=$(python3 -c 'import time;print(time.time())')
 NL=""
 for _ in $(seq 1 120); do
@@ -119,7 +125,8 @@ done
 [ -n "$NL" ] || { log "FAIL: no new leader within 60s under loss"; for i in 0 1 2; do sshx "${hosts[$i]}" "tail -5 $DIR/ctrl$((i+1)).log"; done; exit 1; }
 log "new leader=$NL after $(python3 -c "import time;print(round(time.time()-$T0,1))")s"
 LSA2='{"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":2,"zone":null,"links":[],"prefixes":[{"prefix":"192.168.252.0/24","metric":0}],"overlay_ip":"10.248.0.10","addrs":[]}'
-post "$LSA2" "$((NL-1))" /v1/lsa
+post "$LSA2" "$((NL-1))" /v1/lsa || fail "lsa write failed on new leader $NL"
 log "wrote lsa=2 on new leader"
-sshx "${hosts[$((NL-1))]}" "curl -s --max-time 10 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/snapshot?node=$NODE'" | grep -q 0101010101010101 && log "failover snapshot ok"
+snapshot_has_member "$((NL-1))" || fail "snapshot missing member after failover"
+log "failover snapshot ok"
 log "OK: 3-region controller HA survives $LOSS loss + $DELAY delay"
