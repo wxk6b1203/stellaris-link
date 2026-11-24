@@ -205,19 +205,20 @@ P0 证据速查：
 | P1 join 无签名 | `require_join_signature` + nonce + Ed25519 签名；member agent 始终签名；未签名 curl 可显式关闭 | 同上：未签 403、agent 加入成功并复制 |
 | P1 无特权分离 | `control.admin_secret`：revoke/routes 需要 admin；member secret 被拒 | 同上 + 单测 |
 | P1 snapshot/manifest fail-open | 未签名快照默认拒绝（`allow_unsigned_snapshot` 显式开启）；校验 `network_id` 与 epoch 回退；LSA 不再自授权前缀；manifest 仅 leader 可签 | `control_client` 4 个单测；follower manifest 503 单测 |
-| P1 动态 membership | `/v1/raft/learner`、`/v1/raft/membership`（admin） | 单测：鉴权/校验/非阻塞 add_learner |
+| P1 动态 membership | `/v1/raft/learner`、`/v1/raft/membership`（admin） | 单测 + `test-real-raft-membership.sh`：3→4 voters、learner 转正、1 follower 宕机仍可写 |
 | P1 配置 no-op | `transport.listen=false`、`rib_mode!=full`、`set_path_hint` 直接报错；新增 `Match.zone` 并实现匹配 | config/routing 单测 |
 | P1 空 secret / TLS 配对 / QoS 校验 | 全部为 validate 错误；QoS 两条路径都校验 0 值 | config/policy 单测 |
 | P1 route TTL 不生效 | runtime 每秒调用 `RouteEngine::expire()` | routing 单测 |
-| P1 iroh 4 MiB 上限 | 控制帧上限提高到 64 MiB | 代码；未做 >4MiB iroh 端到端 |
+| P1 iroh 4 MiB 上限 | 控制帧上限提高到 64 MiB | `test-real-iroh-large-snapshot.sh`：8 MiB 模型经 iroh-only member 同步并 ACK |
+| P1 LSA 过期洪泛 | 新增批量 `ExpireLsas`，每轮一条 Raft 写 | 模型单测；修复了 5100 条 LSA 同时过期导致复制/追赶被拖慢的问题 |
 | P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 152 |
 
 ### 7.2 仍开放的 P1/P2 边界
 
 - **relay failover 路径选择**：测试已改名为“一个 relay 消失后连接不断”，不再声称完成 failover；relay1→relay2 的实际选择仍无证据（iroh 内部行为）。
 - **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
-- **动态 membership 端到端**：接口与单测已有，但没有起第 4 个控制器进程做 add_learner → change_membership 的完整演练。
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。
+- **大模型追赶性能**：LSA 过期已批量，但每次 apply 仍重写整份 raft-log/state（O(n²)），5k 条写入需要约 10 分钟；未做日志分片/增量持久化。
 - **P2 未动**：metrics/audit 细化、IPv6 <1280、network_hash、默认开放 discovery、relay_urls 语义、ACL 不回 ICMP、macOS NAT、打包/CI 矩阵、真 multipath、应用层重组、真实互联网 PMTUD 等。
 
 ### 7.3 本轮新增的配置/行为变化（升级注意）

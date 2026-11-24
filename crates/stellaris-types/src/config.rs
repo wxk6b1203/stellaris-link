@@ -422,6 +422,9 @@ pub struct TransportConfig {
     /// Disable iroh relays entirely (LAN/direct-only tests).
     #[serde(default)]
     pub disable_relay: bool,
+    /// Disable direct-address discovery so tests can force relay-only paths.
+    #[serde(default)]
+    pub disable_discovery: bool,
     /// Fixed UDP port for iroh (None = random).
     #[serde(default)]
     pub listen_port: Option<u16>,
@@ -455,6 +458,7 @@ impl Default for TransportConfig {
             relay_urls: Vec::new(),
             listen: true,
             disable_relay: false,
+            disable_discovery: false,
             listen_port: None,
             advertise: Vec::new(),
             bind_ip: None,

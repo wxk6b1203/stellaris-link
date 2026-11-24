@@ -70,6 +70,9 @@ impl IrohTransport {
                 .bind_addr(addr)
                 .with_context(|| format!("bind_addr {addr}"))?;
         }
+        if config.transport.disable_discovery {
+            builder = builder.clear_address_lookup();
+        }
         if config.transport.disable_relay {
             builder = builder.relay_mode(RelayMode::Disabled);
         } else if !config.transport.relay_urls.is_empty() {
@@ -518,6 +521,7 @@ name = "relay-failover-test"
 cidr = "10.8.0.0/16"
 [transport]
 disable_relay = false
+disable_discovery = true
 relay_urls = [{relay_list}]
 [api]
 bind = "127.0.0.1:0"
@@ -538,11 +542,11 @@ bind = "127.0.0.1:0"
     }
 
     #[tokio::test]
-    async fn endpoint_keeps_working_after_a_configured_relay_dies() {
+    async fn endpoint_uses_a_relay_when_direct_discovery_is_disabled() {
         let (relay1, url1) = start_relay().await;
-        let (relay2, url2) = start_relay().await;
+        let (_relay2, url2) = start_relay().await;
         let base =
-            std::env::temp_dir().join(format!("stellaris-relay-fo-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("stellaris-relay-use-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&base).unwrap();
         let config_a = config_multi(
             "a",
@@ -560,20 +564,48 @@ bind = "127.0.0.1:0"
         let (tx_a, _rx_a) = mpsc::channel(64);
         let (tx_b, _rx_b) = mpsc::channel(64);
         let a = IrohTransport::start(
-            Arc::new(config_a.clone()),
+            Arc::new(config_a),
             network,
             [11u8; 32],
-            PeerRegistry::from_config(&config_a).unwrap(),
+            PeerRegistry::from_config(
+                &Config::from_toml(&format!(
+                    r#"
+[node]
+name = "a"
+state_dir = "{}"
+[network]
+name = "relay-use"
+cidr = "10.8.0.0/16"
+"#,
+                    base.join("a").display()
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
             tx_a,
             None,
         )
         .await
         .unwrap();
         let b = IrohTransport::start(
-            Arc::new(config_b.clone()),
+            Arc::new(config_b),
             network,
             [12u8; 32],
-            PeerRegistry::from_config(&config_b).unwrap(),
+            PeerRegistry::from_config(
+                &Config::from_toml(&format!(
+                    r#"
+[node]
+name = "b"
+state_dir = "{}"
+[network]
+name = "relay-use"
+cidr = "10.8.0.0/16"
+"#,
+                    base.join("b").display()
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
             tx_b,
             None,
         )
@@ -611,20 +643,25 @@ bind = "127.0.0.1:0"
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(a.peers.get(&b_id).is_some_and(|p| p.connected));
-        // Drop the relay that the endpoints were told to use. Which relay is
-        // selected afterwards is an iroh internal decision; this test only
-        // asserts that losing one configured relay does not drop the peer.
-        // Relay-path selection/failover remains unverified (see AUDIT.md).
-        drop(relay1);
+        let peer = a.peers.get(&b_id).expect("peer");
+        assert!(peer.connected);
+        assert_eq!(peer.path.as_deref(), Some("relay"));
+        let before = relay1.metrics().server.send_packets_recv.get()
+            + _relay2.metrics().server.send_packets_recv.get();
+        a.send(b_id, Bytes::from_static(b"relay-probe"))
+            .await
+            .unwrap();
         for _ in 0..30 {
-            assert!(
-                a.peers.get(&b_id).is_some_and(|p| p.connected),
-                "peer disconnected after a configured relay went away"
-            );
+            let now = relay1.metrics().server.send_packets_recv.get()
+                + _relay2.metrics().server.send_packets_recv.get();
+            if now > before {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        drop(relay2);
+        let after = relay1.metrics().server.send_packets_recv.get()
+            + _relay2.metrics().server.send_packets_recv.get();
+        assert!(after > before, "datagram did not traverse a relay");
         drop(a);
         drop(b);
         std::fs::remove_dir_all(base).unwrap();
