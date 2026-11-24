@@ -71,6 +71,25 @@ fn default_role() -> String {
     "member".to_string()
 }
 
+/// How a controller admits new members.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionMode {
+    /// Existing behaviour: one-time join token, or static allowlist.
+    #[default]
+    Legacy,
+    /// Signed join request is queued; an admin approves/denies it.
+    Approve,
+    /// Only members already configured in `control.members` may join.
+    Allowlist,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmissionConfig {
+    #[serde(default)]
+    pub mode: AdmissionMode,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RaftPeerConfig {
     pub id: u64,
@@ -187,6 +206,13 @@ pub struct ControlConfig {
     /// enable it for agent-driven joins.
     #[serde(default)]
     pub require_join_signature: bool,
+    /// Controller-side admission policy.
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+    /// Member side: request admission even without a join token (used with
+    /// `admission.mode = "approve"`).
+    #[serde(default)]
+    pub request_admission: bool,
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
@@ -305,6 +331,8 @@ impl Default for ControlConfig {
             secret: None,
             admin_secret: None,
             require_join_signature: false,
+            admission: AdmissionConfig::default(),
+            request_admission: false,
             epoch: None,
             leader_id: None,
             previous_secrets: Vec::new(),
@@ -425,6 +453,10 @@ pub struct TransportConfig {
     /// Disable direct-address discovery so tests can force relay-only paths.
     #[serde(default)]
     pub disable_discovery: bool,
+    /// Allow UDP/mDNS discovery while `network.auth.mode = "none"`.
+    /// Development only; discovery is rejected without an authenticator by default.
+    #[serde(default)]
+    pub allow_unauthenticated_discovery: bool,
     /// Fixed UDP port for iroh (None = random).
     #[serde(default)]
     pub listen_port: Option<u16>,
@@ -459,6 +491,7 @@ impl Default for TransportConfig {
             listen: true,
             disable_relay: false,
             disable_discovery: false,
+            allow_unauthenticated_discovery: false,
             listen_port: None,
             advertise: Vec::new(),
             bind_ip: None,
@@ -756,6 +789,17 @@ impl Config {
                 "control.raft_tls_require_client_cert requires raft_tls_client_cert/key".into(),
             ));
         }
+        if self.control.admission.mode == AdmissionMode::Approve && self.control.raft_dir.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "control.admission.mode = approve requires control.raft_dir".into(),
+            ));
+        }
+        if self.control.admission.mode == AdmissionMode::Approve && self.control.secret.is_none() {
+            return Err(ConfigError::Invalid(
+                "control.admission.mode = approve requires control.secret".into(),
+            ));
+        }
         if self.control.raft_dir.is_some() {
             if self
                 .control
@@ -956,6 +1000,22 @@ impl Config {
                     class.name
                 )));
             }
+        }
+        let discovery_enabled = self.transport.discovery_port.is_some() || self.transport.mdns;
+        if discovery_enabled
+            && self.network.auth.mode == AuthMode::None
+            && !self.transport.allow_unauthenticated_discovery
+        {
+            return Err(ConfigError::Invalid(
+                "discovery (discovery_port/mdns) requires network.auth.mode = psk; \
+                 set transport.allow_unauthenticated_discovery only for isolated labs"
+                    .into(),
+            ));
+        }
+        if self.transport.disable_relay && !self.transport.relay_urls.is_empty() {
+            return Err(ConfigError::Invalid(
+                "transport.disable_relay conflicts with transport.relay_urls".into(),
+            ));
         }
         if !self.transport.listen {
             return Err(ConfigError::Invalid(
@@ -1227,6 +1287,55 @@ dscp = 0
             let error = Config::from_toml(&toml).unwrap_err().to_string();
             assert!(error.contains(field), "{field}: {error}");
         }
+    }
+
+    #[test]
+    fn discovery_requires_authentication_by_default() {
+        let base = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[transport]
+mdns = true
+"#;
+        let error = Config::from_toml(base).unwrap_err().to_string();
+        assert!(error.contains("discovery"), "{error}");
+        let with_psk = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[network.auth]
+mode = "psk"
+secret = "s"
+[transport]
+mdns = true
+"#;
+        assert!(Config::from_toml(with_psk).is_ok());
+        let lab = base.replace(
+            "[transport]",
+            "[transport]\nallow_unauthenticated_discovery = true",
+        );
+        assert!(Config::from_toml(&lab).is_ok());
+    }
+
+    #[test]
+    fn relay_settings_must_not_conflict() {
+        let toml = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[transport]
+disable_relay = true
+relay_urls = ["https://relay.example.com"]
+"#;
+        let error = Config::from_toml(toml).unwrap_err().to_string();
+        assert!(error.contains("disable_relay"), "{error}");
     }
 
     #[test]

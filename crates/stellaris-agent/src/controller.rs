@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, bail};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderValue;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -25,8 +25,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use stellaris_linkstate::{LinkStateDb, Lsa};
 use stellaris_types::{
-    Config, ControllerMemberConfig, JoinTokenConfig, NetworkId, NodeId, RaftTiming, RouteEntry,
-    RouteId, RouteSource, RouteState,
+    AdmissionMode, Config, ControllerMemberConfig, JoinTokenConfig, NetworkId, NodeId, RaftTiming,
+    RouteEntry, RouteId, RouteSource, RouteState,
 };
 use uuid::Uuid;
 
@@ -79,6 +79,7 @@ pub struct ControllerState {
     manifest_ttl: u64,
     lsa_ttl_secs: u64,
     require_join_signature: bool,
+    admission: AdmissionMode,
     pub epoch: u64,
     generation: Arc<AtomicU64>,
 }
@@ -344,6 +345,7 @@ impl ControllerState {
             manifest_ttl: config.control.manifest_ttl_secs,
             lsa_ttl_secs: config.control.lsa_ttl_secs,
             require_join_signature: config.control.require_join_signature,
+            admission: config.control.admission.mode,
             epoch,
             generation: Arc::new(AtomicU64::new(if loaded_lsas > 0 { 2 } else { 1 })),
         })
@@ -356,6 +358,32 @@ impl ControllerState {
     ) {
         self.raft = Some(raft);
         self.raft_store = Some(store);
+    }
+
+    async fn known_member(&self, node: NodeId) -> bool {
+        self.model_current().await.members.contains_key(&node)
+    }
+
+    /// Queue a signed admission request; returns true when already a member.
+    async fn request_admission(
+        &self,
+        node: NodeId,
+        overlay: std::net::IpAddr,
+    ) -> Result<bool, (u16, String)> {
+        let model = self.model_current().await;
+        if model.members.contains_key(&node) {
+            return Ok(true);
+        }
+        let Some(raft) = &self.raft else {
+            return Err((503, "admission.mode = approve requires raft".into()));
+        };
+        raft.client_write(ControllerCommand::RequestAdmission {
+            node,
+            overlay_ip: overlay,
+        })
+        .await
+        .map(|_| false)
+        .map_err(|e| (503, format!("raft admission request failed: {e}")))
     }
 
     fn config_require_join_signature(&self) -> bool {
@@ -1424,6 +1452,9 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/ack", post(ack))
         .route("/v1/raft/learner", post(raft_add_learner))
         .route("/v1/raft/membership", post(raft_change_membership))
+        .route("/v1/admissions", get(list_admissions))
+        .route("/v1/admissions/{node}/approve", post(approve_admission))
+        .route("/v1/admissions/{node}/deny", post(deny_admission))
         .with_state(state)
 }
 
@@ -1576,7 +1607,7 @@ async fn join(
             return (StatusCode::BAD_REQUEST, format!("invalid overlay_ip: {e}")).into_response();
         }
     };
-    if state.config_require_join_signature() {
+    if state.config_require_join_signature() || state.admission == AdmissionMode::Approve {
         if req.nonce.trim().is_empty() || req.signature.trim().is_empty() {
             return (StatusCode::FORBIDDEN, "signed join required".to_string()).into_response();
         }
@@ -1595,17 +1626,138 @@ async fn join(
                 .into_response();
         }
     }
-    match state.join_current(node, overlay, &req.token).await {
-        Ok(()) => {
-            let model = state.model_current().await;
-            Json(json!({
-                "joined": node.to_string(),
-                "generation": model.generation,
-                "epoch": model.epoch,
-            }))
-            .into_response()
+    match state.admission {
+        AdmissionMode::Approve => match state.request_admission(node, overlay).await {
+            Ok(true) => {
+                let model = state.model_current().await;
+                Json(json!({
+                    "joined": node.to_string(),
+                    "generation": model.generation,
+                    "epoch": model.epoch,
+                }))
+                .into_response()
+            }
+            Ok(false) => (
+                StatusCode::ACCEPTED,
+                Json(json!({"pending": true, "node": node.to_string()})),
+            )
+                .into_response(),
+            Err((code, message)) => controller_error(&state, code, message).await,
+        },
+        AdmissionMode::Allowlist => {
+            if state.known_member(node).await {
+                let model = state.model_current().await;
+                Json(json!({"joined": node.to_string(), "generation": model.generation, "epoch": model.epoch}))
+                    .into_response()
+            } else {
+                (
+                    StatusCode::FORBIDDEN,
+                    "node is not on the admission allowlist",
+                )
+                    .into_response()
+            }
         }
-        Err((code, message)) => controller_error(&state, code, message).await,
+        AdmissionMode::Legacy => match state.join_current(node, overlay, &req.token).await {
+            Ok(()) => {
+                let model = state.model_current().await;
+                Json(json!({
+                    "joined": node.to_string(),
+                    "generation": model.generation,
+                    "epoch": model.epoch,
+                }))
+                .into_response()
+            }
+            Err((code, message)) => controller_error(&state, code, message).await,
+        },
+    }
+}
+
+async fn list_admissions(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let model = state.model_current().await;
+    let pending: Vec<_> = model
+        .pending_admissions
+        .iter()
+        .map(|(node, admission)| {
+            json!({
+                "node": node.to_string(),
+                "overlay_ip": admission.overlay_ip.to_string(),
+            })
+        })
+        .collect();
+    Json(json!({"pending": pending})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ApproveAdmissionRequest {
+    #[serde(default)]
+    prefixes: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+async fn approve_admission(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+    Json(req): Json<ApproveAdmissionRequest>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match node.parse() {
+        Ok(node) => node,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
+    };
+    let model = state.model_current().await;
+    let Some(pending) = model.pending_admissions.get(&node) else {
+        return (StatusCode::NOT_FOUND, "no pending admission for node").into_response();
+    };
+    for prefix in &req.prefixes {
+        if prefix.parse::<IpNet>().is_err() {
+            return (StatusCode::BAD_REQUEST, format!("invalid prefix: {prefix}")).into_response();
+        }
+    }
+    let member = crate::controller_model::MemberRecord {
+        overlay_ip: Some(pending.overlay_ip),
+        prefixes: req.prefixes.clone(),
+        capabilities: req.capabilities.clone(),
+    };
+    let Some(raft) = state.raft.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "raft is not enabled").into_response();
+    };
+    match raft
+        .client_write(ControllerCommand::ApproveAdmission { node, member })
+        .await
+    {
+        Ok(_) => Json(json!({"approved": node.to_string()})).into_response(),
+        Err(error) => (StatusCode::CONFLICT, format!("approve failed: {error}")).into_response(),
+    }
+}
+
+async fn deny_admission(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match node.parse() {
+        Ok(node) => node,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
+    };
+    let Some(raft) = state.raft.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "raft is not enabled").into_response();
+    };
+    match raft
+        .client_write(ControllerCommand::DenyAdmission { node })
+        .await
+    {
+        Ok(_) => Json(json!({"denied": node.to_string()})).into_response(),
+        Err(error) => (StatusCode::CONFLICT, format!("deny failed: {error}")).into_response(),
     }
 }
 
@@ -3171,6 +3323,186 @@ epoch = 1
             );
             panic!("learner endpoint failed");
         }
+    }
+
+    #[tokio::test]
+    async fn admission_approval_flow_is_signed_and_admin_scoped() {
+        let network_id = "22222222-2222-4222-8222-222222222222";
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "admission"
+id = "{network_id}"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+admin_secret = "admin"
+raft_dir = "/tmp/stellaris-admission-test"
+raft_secret = "raft-secret"
+
+[control.admission]
+mode = "approve"
+"#,
+            temp_state_dir()
+        );
+        let mut leader_state =
+            ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let models = (0..3)
+            .map(|_| ControllerModel::new(leader_state.network, leader_state.epoch))
+            .collect();
+        let (rafts, stores) = crate::controller_raft::start_cluster(models).await.unwrap();
+        let mut leader = None;
+        for _ in 0..50 {
+            for (id, raft) in rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(*id);
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let leader = leader.expect("leader");
+        let raft = rafts.read().await.get(&leader).cloned().unwrap();
+        leader_state.set_raft(Arc::new(raft), stores[(leader - 1) as usize].clone());
+        let app = router(leader_state);
+        let secret = [9u8; 32];
+        let node = NodeId::new(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+        let overlay = "10.7.0.9";
+        let signed_join = |nonce: &str| {
+            let payload = join_payload_bytes(network_id, &node.to_string(), overlay, "", nonce);
+            serde_json::json!({
+                "node_id": node.to_string(),
+                "overlay_ip": overlay,
+                "token": "",
+                "nonce": nonce,
+                "signature": sign_ed25519(&secret, &payload),
+            })
+        };
+        // Unsigned requests cannot enter the approval queue.
+        let unsigned = serde_json::json!({
+            "node_id": node.to_string(),
+            "overlay_ip": overlay,
+            "token": ""
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(unsigned.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(signed_join("nonce-1").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/v1/admissions")
+                    .header("x-stellaris-secret", "admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let pending = json(response).await;
+        assert!(
+            pending["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["node"] == node.to_string())
+        );
+
+        // The member secret may not approve, the admin secret may.
+        let approve = serde_json::json!({
+            "prefixes": ["192.168.66.0/24"],
+            "capabilities": ["member"]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/admissions/{node}/approve"))
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(approve.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/admissions/{node}/approve"))
+                    .header("x-stellaris-secret", "admin")
+                    .header("content-type", "application/json")
+                    .body(Body::from(approve.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for store in &stores {
+            for _ in 0..50 {
+                if store.model().await.members.contains_key(&node) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(store.model().await.members.contains_key(&node));
+        }
+
+        // After approval the same signed request is accepted.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(signed_join("nonce-2").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -23,10 +23,24 @@ pub enum AclDirection {
     Both,
 }
 
+/// What to do with a packet denied by ACL.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AclDenyAction {
+    /// Silent drop (default; matches classic firewall behavior).
+    #[default]
+    Drop,
+    /// Return ICMP admin-prohibited to the source (where the agent can).
+    Reject,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AclConfig {
     #[serde(default)]
     pub default_action: AclAction,
+    /// `drop` (default) or `reject` (ICMP admin-prohibited).
+    #[serde(default)]
+    pub deny_action: AclDenyAction,
     #[serde(default)]
     pub rules: Vec<AclRule>,
 }

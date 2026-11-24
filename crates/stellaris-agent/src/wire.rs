@@ -419,6 +419,66 @@ pub fn icmp_too_big(original: &[u8], mtu: u16, local: IpAddr) -> Option<Vec<u8>>
     }
 }
 
+/// True when the packet is itself an ICMP error (never answer those again).
+fn is_icmp_error(original: &[u8]) -> bool {
+    let Some(info) = PacketInfo::parse(original) else {
+        return true;
+    };
+    match info.protocol {
+        1 => matches!(original.get(20), Some(3 | 4 | 5 | 11 | 12)),
+        58 => matches!(original.get(40), Some(1..=4)),
+        _ => false,
+    }
+}
+
+/// Build an ICMP administratively-prohibited error for a denied packet.
+///
+/// Quoting is limited to the IP header + 8 bytes as required by RFC 792/4443.
+pub fn icmp_admin_prohibited(original: &[u8], local: IpAddr) -> Option<Vec<u8>> {
+    let info = PacketInfo::parse(original)?;
+    if is_icmp_error(original) {
+        return None; // never generate errors for errors
+    }
+    match (local, info.src) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let quote = original.len().min(28);
+            let total = 20 + 8 + quote;
+            let mut out = vec![0u8; total];
+            out[0] = 0x45;
+            out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            out[8] = 64;
+            out[9] = 1;
+            out[12..16].copy_from_slice(&src.octets());
+            out[16..20].copy_from_slice(&dst.octets());
+            recompute_ipv4_checksum(&mut out);
+            out[20] = 3; // destination unreachable
+            out[21] = 13; // administratively prohibited
+            out[28..28 + quote].copy_from_slice(&original[..quote]);
+            let sum = checksum(&out[20..]);
+            out[22..24].copy_from_slice(&sum.to_be_bytes());
+            Some(out)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let quote = original.len().min(1232);
+            let total = 40 + 8 + quote;
+            let mut out = vec![0u8; total];
+            out[0] = 0x60;
+            out[4..6].copy_from_slice(&((8 + quote) as u16).to_be_bytes());
+            out[6] = 58;
+            out[7] = 64;
+            out[8..24].copy_from_slice(&src.octets());
+            out[24..40].copy_from_slice(&dst.octets());
+            out[40] = 1; // destination unreachable
+            out[41] = 1; // administratively prohibited
+            out[48..48 + quote].copy_from_slice(&original[..quote]);
+            let sum = checksum_v6(&src.octets(), &dst.octets(), 58, &out[40..]);
+            out[42..44].copy_from_slice(&sum.to_be_bytes());
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
@@ -684,6 +744,42 @@ mod tests {
         assert_eq!(err[21], 4);
         assert_eq!(u16::from_be_bytes([err[26], err[27]]), 1200);
         assert_eq!(&err[16..20], &[10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn builds_icmp_admin_prohibited_v4() {
+        let mut orig = vec![0u8; 30];
+        orig[0] = 0x45;
+        orig[9] = 17;
+        orig[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        orig[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let err = icmp_admin_prohibited(&orig, "10.0.0.99".parse().unwrap()).unwrap();
+        assert_eq!(err[9], 1);
+        assert_eq!(err[20], 3);
+        assert_eq!(err[21], 13);
+        assert_eq!(&err[12..16], &[10, 0, 0, 99]);
+        // The ICMP checksum must validate.
+        assert_eq!(checksum(&err[20..]), 0);
+        // ICMP errors are never answered with another error ...
+        orig[9] = 1;
+        orig[20] = 3; // destination unreachable
+        assert!(icmp_admin_prohibited(&orig, "10.0.0.99".parse().unwrap()).is_none());
+        // ... but an echo request may be rejected (ping shows the error).
+        orig[20] = 8;
+        assert!(icmp_admin_prohibited(&orig, "10.0.0.99".parse().unwrap()).is_some());
+    }
+
+    #[test]
+    fn builds_icmp_admin_prohibited_v6() {
+        let mut orig = vec![0u8; 60];
+        orig[0] = 0x60;
+        orig[6] = 17;
+        orig[8..24].copy_from_slice(&"fd00::1".parse::<Ipv6Addr>().unwrap().octets());
+        orig[24..40].copy_from_slice(&"fd00::2".parse::<Ipv6Addr>().unwrap().octets());
+        let err = icmp_admin_prohibited(&orig, "fd00::99".parse().unwrap()).unwrap();
+        assert_eq!(err[6], 58);
+        assert_eq!(err[40], 1);
+        assert_eq!(err[41], 1);
     }
 
     #[test]

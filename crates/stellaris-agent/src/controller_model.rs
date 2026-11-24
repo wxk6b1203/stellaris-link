@@ -19,6 +19,11 @@ pub struct MemberRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingAdmission {
+    pub overlay_ip: IpAddr,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AckRecord {
     pub generation: u64,
     pub epoch: u64,
@@ -40,6 +45,19 @@ pub enum ControllerCommand {
     /// retire many stale LSAs instead of one entry per origin.
     ExpireLsas {
         entries: Vec<(NodeId, u64)>,
+    },
+    /// Signed join request waiting for an administrator decision.
+    RequestAdmission {
+        node: NodeId,
+        overlay_ip: IpAddr,
+    },
+    /// Administrator approval: grants exactly the supplied member record.
+    ApproveAdmission {
+        node: NodeId,
+        member: MemberRecord,
+    },
+    DenyAdmission {
+        node: NodeId,
     },
     UpsertMember {
         node: NodeId,
@@ -83,6 +101,9 @@ pub struct ControllerModel {
     /// Controller-pushed routes: prefix -> next hop -> metric.
     #[serde(default)]
     pub routes: BTreeMap<String, BTreeMap<NodeId, u32>>,
+    /// Signed join requests awaiting an admin decision.
+    #[serde(default)]
+    pub pending_admissions: BTreeMap<NodeId, PendingAdmission>,
 }
 
 impl ControllerModel {
@@ -97,6 +118,7 @@ impl ControllerModel {
             consumed_join_tokens: BTreeSet::new(),
             join_config_hash: None,
             routes: BTreeMap::new(),
+            pending_admissions: BTreeMap::new(),
         }
     }
 
@@ -197,6 +219,27 @@ impl ControllerModel {
                 }
                 changed
             }
+            ControllerCommand::RequestAdmission { node, overlay_ip } => {
+                if self.members.contains_key(&node) || self.pending_admissions.contains_key(&node) {
+                    false
+                } else {
+                    self.pending_admissions
+                        .insert(node, PendingAdmission { overlay_ip });
+                    true
+                }
+            }
+            ControllerCommand::ApproveAdmission { node, member } => {
+                let changed = self.members.get(&node) != Some(&member);
+                self.members.insert(node, member);
+                self.pending_admissions.remove(&node);
+                // Approvals always change authorization, even when the member
+                // record is unchanged (idempotent re-approval still bumps generation).
+                let _ = changed;
+                true
+            }
+            ControllerCommand::DenyAdmission { node } => {
+                self.pending_admissions.remove(&node).is_some()
+            }
             ControllerCommand::UpsertRoute {
                 prefix,
                 via,
@@ -239,6 +282,7 @@ impl ControllerModel {
             consumed_join_tokens: Vec<&'a String>,
             join_config_hash: Option<&'a String>,
             routes: Vec<(&'a String, Vec<(&'a NodeId, &'a u32)>)>,
+            pending_admissions: Vec<(&'a NodeId, &'a PendingAdmission)>,
         }
         let snapshot = Snapshot {
             network: &self.network,
@@ -254,6 +298,7 @@ impl ControllerModel {
                 .iter()
                 .map(|(prefix, vias)| (prefix, vias.iter().collect()))
                 .collect(),
+            pending_admissions: self.pending_admissions.iter().collect(),
         };
         serde_json::to_vec(&snapshot).unwrap_or_default()
     }
@@ -393,6 +438,47 @@ mod tests {
         assert!(!model.lsas.contains_key(&a));
         // b's LSA is newer than the requested sequence and must survive.
         assert!(model.lsas.contains_key(&b));
+    }
+
+    #[test]
+    fn admission_requests_are_queued_and_approved_deterministically() {
+        let node = NodeId::new([9u8; 32]);
+        let mut a = ControllerModel::new(NetworkId::new(), 1);
+        let mut b = ControllerModel::new(a.network, 1);
+        let request = ControllerCommand::RequestAdmission {
+            node,
+            overlay_ip: "10.7.0.9".parse().unwrap(),
+        };
+        assert!(a.apply(request.clone()));
+        assert!(b.apply(request));
+        assert_eq!(a.pending_admissions.len(), 1);
+        assert!(a.pending_admissions.contains_key(&node));
+        let member = MemberRecord {
+            overlay_ip: Some("10.7.0.9".parse().unwrap()),
+            prefixes: vec!["192.168.77.0/24".into()],
+            capabilities: vec!["member".into()],
+        };
+        assert!(a.apply(ControllerCommand::ApproveAdmission {
+            node,
+            member: member.clone(),
+        }));
+        b.apply(ControllerCommand::ApproveAdmission { node, member });
+        assert!(a.members.contains_key(&node));
+        assert!(a.pending_admissions.is_empty());
+        assert_eq!(a.snapshot_bytes(), b.snapshot_bytes());
+        // Approving again is idempotent but still changes authorization state.
+        assert!(a.apply(ControllerCommand::ApproveAdmission {
+            node,
+            member: MemberRecord::default(),
+        }));
+        // Deny removes a pending request only.
+        let other = NodeId::new([10u8; 32]);
+        a.apply(ControllerCommand::RequestAdmission {
+            node: other,
+            overlay_ip: "10.7.0.10".parse().unwrap(),
+        });
+        assert!(a.apply(ControllerCommand::DenyAdmission { node: other }));
+        assert!(!a.pending_admissions.contains_key(&other));
     }
 
     #[test]

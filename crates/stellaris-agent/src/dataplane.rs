@@ -79,7 +79,12 @@ pub async fn start(
         "dataplane up"
     );
 
-    spawn_mtu_monitor(dev.clone(), transport.clone(), state.config.dataplane.mtu);
+    spawn_mtu_monitor(
+        dev.clone(),
+        transport.clone(),
+        state.config.dataplane.mtu,
+        state.config.node.overlay_ip.is_some_and(|ip| ip.is_ipv6()),
+    );
     spawn_route_reconciler(
         state.routes.clone(),
         tun_name.clone(),
@@ -472,18 +477,41 @@ fn install_os_route(_prefix: ipnet::IpNet, _tun: &str) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn remove_os_route(_prefix: ipnet::IpNet, _tun: &str) {}
 
-fn spawn_mtu_monitor(dev: Arc<AsyncDevice>, transport: Arc<IrohTransport>, configured_max: u16) {
+/// Effective TUN MTU for a given underlay datagram limit.
+///
+/// IPv6 links must carry at least 1280-byte packets; shrinking the TUN below
+/// that would silently disable IPv6, so we clamp and keep generating PTBs via
+/// the path-MTU logic instead.
+fn effective_mtu(configured_max: u16, max_datagram: usize, ipv6: bool) -> u16 {
+    let floor = if ipv6 { 1280 } else { 576 };
+    max_datagram
+        .saturating_sub(HEADER_LEN + 32)
+        .min(configured_max as usize)
+        .max(floor as usize) as u16
+}
+
+fn spawn_mtu_monitor(
+    dev: Arc<AsyncDevice>,
+    transport: Arc<IrohTransport>,
+    configured_max: u16,
+    ipv6: bool,
+) {
     tokio::spawn(async move {
         let mut current = configured_max.min(1100);
+        let mut warned = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let Some(max) = transport.max_datagram_size() else {
                 continue;
             };
-            let target = max
-                .saturating_sub(HEADER_LEN + 32)
-                .min(configured_max as usize)
-                .max(576) as u16;
+            let target = effective_mtu(configured_max, max, ipv6);
+            if ipv6 && max < 1280 + HEADER_LEN + 32 && !warned {
+                warned = true;
+                warn!(
+                    underlay_max = max,
+                    "IPv6 requires at least 1280-byte packets; TUN MTU held at 1280 and oversized packets rely on PTB/MSS"
+                );
+            }
             if target != current {
                 match dev.set_mtu(target) {
                     Ok(()) => {
@@ -783,6 +811,47 @@ async fn handle_inbound(
             }
         }
         InboundAction::Drop(reason) => {
+            match reason {
+                "acl denied" => {
+                    // `inbound.packet` still carries the mesh header; ICMP
+                    // must quote the inner IP packet only.
+                    let original = inbound
+                        .packet
+                        .get(HEADER_LEN..)
+                        .unwrap_or_default()
+                        .to_vec();
+                    if state.config.acl.deny_action == stellaris_types::AclDenyAction::Reject
+                        && let Some(local) = state.config.node.overlay_ip
+                        && let Some(icmp) = wire::icmp_admin_prohibited(&original, local)
+                        && let Some(info) = PacketInfo::parse(&original)
+                    {
+                        let header = MeshHeader::new(state.network, 64, flow_hash(&info));
+                        let mut frame = Vec::with_capacity(HEADER_LEN + icmp.len());
+                        frame.extend_from_slice(&header.encode());
+                        frame.extend_from_slice(&icmp);
+                        match transport
+                            .send(inbound.from, bytes::Bytes::from(frame))
+                            .await
+                        {
+                            Ok(()) => {
+                                crate::stats::Stats::inc(&state.stats.acl_rejected);
+                                tracing::info!(
+                                    target: "stellaris_audit",
+                                    action = "reject",
+                                    from = %inbound.from.short(),
+                                    src = %info.src,
+                                    dst = %info.dst,
+                                    protocol = info.protocol,
+                                    "acl rejected with icmp administratively prohibited"
+                                );
+                            }
+                            Err(e) => debug!(error = %e, "failed to send acl reject icmp"),
+                        }
+                    }
+                }
+                "spoofed source" => crate::stats::Stats::inc(&state.stats.spoof_dropped),
+                _ => {}
+            }
             debug!(from = %inbound.from.short(), reason, "inbound packet dropped");
         }
     }
@@ -1263,6 +1332,14 @@ overlay_ip = "10.7.0.2"
             InboundAction::Deliver(p)
         );
     }
+    #[test]
+    fn ipv6_mtu_never_drops_below_1280() {
+        assert_eq!(effective_mtu(1400, 1200, true), 1280);
+        assert_eq!(effective_mtu(1400, 1200, false), 1152);
+        assert_eq!(effective_mtu(1280, 1500, true), 1280);
+        assert_eq!(effective_mtu(900, 1500, false), 900);
+    }
+
     #[test]
     fn default_routes_are_opt_in() {
         assert!(is_default_prefix(&"0.0.0.0/0".parse().unwrap()));

@@ -54,8 +54,13 @@ async fn run_http(
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
-        if !joined && state.config.control.join_token.is_some() {
-            joined = try_join(&client, &base, &state, secret.as_deref()).await;
+        if !joined
+            && (state.config.control.join_token.is_some() || state.config.control.request_admission)
+        {
+            joined = matches!(
+                try_join(&client, &base, &state, secret.as_deref()).await,
+                JoinOutcome::Joined
+            );
         }
         if !state.config.control.controller_keys.is_empty()
             && last_manifest.elapsed() >= Duration::from_secs(10)
@@ -368,18 +373,25 @@ fn verify_manifest(
     Some(controller)
 }
 
+enum JoinOutcome {
+    Joined,
+    Pending,
+    Rejected,
+}
+
 async fn try_join(
     client: &reqwest::Client,
     base: &str,
     state: &AgentState,
     secret: Option<&str>,
-) -> bool {
-    let Some(token) = state.config.control.join_token.as_deref() else {
-        return true;
-    };
+) -> JoinOutcome {
+    if state.config.control.join_token.is_none() && !state.config.control.request_admission {
+        return JoinOutcome::Joined;
+    }
+    let token = state.config.control.join_token.as_deref().unwrap_or("");
     let Some(overlay) = state.config.node.overlay_ip else {
-        tracing::warn!("join_token requires node.overlay_ip");
-        return true;
+        tracing::warn!("join requires node.overlay_ip");
+        return JoinOutcome::Joined;
     };
     let nonce = uuid::Uuid::now_v7().to_string();
     let payload = crate::controller::join_payload_bytes(
@@ -403,17 +415,21 @@ async fn try_join(
         request = request.header("x-stellaris-secret", secret);
     }
     match request.send().await {
+        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
+            tracing::info!(%base, "join request queued for administrator approval");
+            JoinOutcome::Pending
+        }
         Ok(response) if response.status().is_success() => {
             tracing::info!(%base, "controller admitted member");
-            true
+            JoinOutcome::Joined
         }
         Ok(response) => {
             tracing::warn!(%base, status = %response.status(), "join rejected");
-            false
+            JoinOutcome::Rejected
         }
         Err(e) => {
             tracing::debug!(%base, error = %e, "join request failed");
-            false
+            JoinOutcome::Rejected
         }
     }
 }

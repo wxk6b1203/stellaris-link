@@ -362,6 +362,7 @@ mod tests {
                 peer: None,
                 zone: None,
             }],
+            ..Default::default()
         };
         let policy = Policy::from_config(acl, QosConfig::default());
         let info = PacketInfo::parse(&https_packet()).unwrap();
@@ -390,6 +391,7 @@ mod tests {
                 peer: None,
                 zone: None,
             }],
+            ..Default::default()
         };
         let policy = Policy::from_config(acl, QosConfig::default());
         let src = "10.7.0.1".parse().unwrap();
