@@ -87,6 +87,9 @@ impl Entry {
             let total_len = header.len() + total;
             header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
             header[6..8].copy_from_slice(&0u16.to_be_bytes()); // clear MF/offset
+            // The first fragment carries a valid header checksum; zero it
+            // before recomputing over the reassembled header.
+            header[10..12].copy_from_slice(&[0, 0]);
             let mut packet = header;
             packet.extend_from_slice(&payload);
             let checksum = ipv4_checksum(&packet[..20]);
@@ -155,9 +158,10 @@ impl Reassembler {
         if !more && offset == 0 {
             return Outcome::Pass;
         }
-        // `total` is the length of the *original* datagram; an individual
-        // fragment packet is shorter, so only sanity-check the lower bound.
-        if total < ihl {
+        // Every fragment's IPv4 total-length field describes that fragment,
+        // not the original datagram; the full length is inferred from the
+        // last fragment's offset + payload.
+        if packet.len() < ihl || total < ihl {
             return Outcome::Dropped("bad ipv4 length");
         }
         let payload = &packet[ihl..];
@@ -180,7 +184,7 @@ impl Reassembler {
             payload,
             offset,
             more,
-            Some(total - ihl),
+            None,
             packet[..ihl].to_vec(),
             false,
             now,
@@ -327,6 +331,7 @@ mod tests {
         p[6..8].copy_from_slice(&flags.to_be_bytes());
         p[8] = 64;
         p[9] = 17;
+        p[10..12].copy_from_slice(&0xdeadu16.to_be_bytes()); // stale header checksum
         p[12..16].copy_from_slice(&[10, 0, 0, 1]);
         p[16..20].copy_from_slice(&[10, 0, 0, 2]);
         p.extend_from_slice(payload);
