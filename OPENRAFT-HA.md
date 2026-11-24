@@ -259,7 +259,7 @@ raft_dir = "/var/lib/stellaris/raft"
 raft_id = 2
 raft_bind = "0.0.0.0:5701"
 raft_secret = "change-me"
-# [[control.raft_peers]] 见 examples/ 与 scripts/ 中的完整配置
+# [[control.raft_peers]] 完整示例见 scripts/test-controller-raft-3node.sh
 
 # 最小选举超时（毫秒）。max = 2x，heartbeat = min/4。
 # 省略即使用跨地域默认值 1000ms。
