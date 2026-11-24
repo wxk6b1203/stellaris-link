@@ -219,7 +219,7 @@ PMTUD：
 
 ### 4.3 Controller HA
 
-- **三地滚动重启已通过**：默认 150ms election timeout 对跨地域 vote RPC 太短；设置 1000ms 后 follower/leader 滚动重启通过。正式 TOML 配置待补。
+- **三地滚动重启已通过**：openraft 默认 150ms election timeout 对跨地域 vote RPC 太短；已把选举超时产品化为 `control.raft_election_timeout_ms`，跨地域默认 1000ms（2000ms/250ms），本机 3 进程验证生效值与越界报错。真实三地脚本已改写入 TOML，但当前无测试主机，未复跑。
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。

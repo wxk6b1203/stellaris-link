@@ -1,4 +1,4 @@
-# 真实环境测试记录（2026-11-23）
+# 真实环境测试记录（2026-11-23 ~ 11-24）
 
 > 关联：[GAPS.md](GAPS.md)、[README.md](README.md)、[PLAN.md](PLAN.md)
 
@@ -21,8 +21,8 @@
 
 ```text
 cargo fmt --check                          ✅
-cargo clippy --all-targets -- -D warnings  ✅
-cargo test                                 112 passed
+cargo clippy -p stellaris-types -p stellaris-agent --all-targets -- -D warnings  ✅
+cargo test --workspace                     118 passed
 ```
 
 ---
@@ -119,7 +119,7 @@ snapshot_transfer_survives_http_restart
 
 公网端口 5701/5801 + mTLS。
 
-关键修正：
+关键修正（当时用环境变量，现已产品化，见 §3.7）：
 
 ```text
 STELLARIS_RAFT_ELECTION_TIMEOUT_MS=1000
@@ -165,7 +165,54 @@ OK: cross-region 3-controller rolling restart works.
 - 选举超时目前用环境变量覆盖，尚未暴露正式 TOML 配置
 - 本轮滚动重启没有制造大 snapshot 传输；snapshot transfer 重启续传仍是单独单测验证
 
-### 3.7 仍未验证
+### 3.7 选举超时 TOML 配置：本机通过（2026-11-24）
+
+背景：§3.6 的三地滚动重启依赖环境变量。现已产品化为
+`control.raft_election_timeout_ms`，省略时使用跨地域默认值 1000ms
+（max 2000ms、heartbeat 250ms），越界（`50..=60000` 之外）在配置加载阶段报错。
+
+本机（macOS）三进程 Raft 实测：
+
+```bash
+./scripts/test-controller-raft-3node.sh
+# leader=1
+# raft timing ok: min=300ms max=600ms heartbeat=75ms source=config
+# invalid timing rejected: control.raft_election_timeout_ms must be between 50 and 60000 ms (got 10)
+# snapshot ok
+# new leader=3
+# failover snapshot ok
+# crash recovery ok
+# OK: 3-controller raft join/LSA/snapshot/failover/crash-recovery works.
+```
+
+不配置该项时的生效值（单进程 + Raft，读 `/v1/status`）：
+
+```text
+raft election timing election_timeout_min_ms=1000 election_timeout_max_ms=2000 heartbeat_interval_ms=250 source="default-cross-region"
+"raft": {"election_timeout_min_ms":1000,"election_timeout_max_ms":2000,"heartbeat_interval_ms":250,"source":"default-cross-region"}
+```
+
+优先级实测：
+
+| 配置 | 生效 min/max/heartbeat | source |
+|---|---|---|
+| 都不设 | 1000 / 2000 / 250 | `default-cross-region` |
+| 只设 env=1200 | 1200 / 2400 / 300 | `env`（带废弃 warn） |
+| TOML=300 + env=1200 | 300 / 600 / 75 | `config`（env 被忽略并 warn） |
+| env 非法值 | 1000 / 2000 / 250 | `default-cross-region` |
+
+本机三进程集群在跨地域默认值下同样通过换主/崩溃恢复：
+
+```bash
+ELECTION_MS=1000 ./scripts/test-controller-raft-3node.sh
+# raft timing ok: min=1000ms max=2000ms heartbeat=250ms source=config
+# new leader=3
+# crash recovery ok
+```
+
+未验证：真实三地用 TOML 复跑滚动重启（当前无测试主机）；WAN 丢包/抖动下的选举稳定性。
+
+### 3.8 仍未验证
 
 - snapshot 传输中断后 agent/controller **重启续传**
 - 磁盘慢 IO / fsync 失败注入

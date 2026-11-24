@@ -58,7 +58,7 @@
 
 ---
 
-## 3. 三地 rolling restart：已通过，配置待产品化
+## 3. 三地 rolling restart：已通过，选举超时已产品化
 
 已用 Shenzhen/Shanghai/Chengdu 三地公网 + mTLS 跑通：
 
@@ -67,19 +67,31 @@
 - 新 leader 选出
 - 旧 leader 重新加入
 
-根因：默认 `election_timeout_min=150ms` 对跨地域 vote RPC 太短，出现 `timeout after 150ms when Vote`；设置：
+根因：默认 `election_timeout_min=150ms` 对跨地域 vote RPC 太短，出现 `timeout after 150ms when Vote`；当时用环境变量 `STELLARIS_RAFT_ELECTION_TIMEOUT_MS=1000` 后通过。
 
-```text
-STELLARIS_RAFT_ELECTION_TIMEOUT_MS=1000
-```
+已完成产品化（2026-11-24）：
 
-后通过。
+- 新增正式 TOML 配置 `control.raft_election_timeout_ms`，省略时使用跨地域默认值
+  `1000ms`（max `2000ms`、heartbeat `250ms`），即上面验证通过的值。
+- 越界值（`50..=60000` 之外）在配置加载阶段报错。
+- `/v1/status.raft` 与启动日志给出生效值和来源（`config` / `default-cross-region` / 废弃的 `env`）。
+- 环境变量降级为兼容回退：仅当 TOML 未配置时生效并打 warn。
+- `scripts/test-controller-raft-3node.sh` 改用 TOML 并断言生效值；本机 3 进程实测通过。
+- `scripts/test-real-rolling-restart-ha.sh` 也改为写 TOML（未复跑，当前无测试主机）。
 
-仍需：
+仍需真实主机验证：
 
-- 把选举超时暴露为正式 TOML 配置，而不是仅环境变量
 - 在滚动重启期间制造 >4MiB snapshot transfer，验证真实 transfer 续传
-- 观测 WAN 丢包/抖动下的选举稳定性
+- 观测 WAN 丢包/抖动下的选举稳定性（默认值是按已通过的单次三地测试定的，不是丢包场景的结论）
+
+资源需求（本轮无测试主机，只记录待开）：
+
+- 3 台 Linux（Ubuntu 22.04/24.04，x86_64，1 vCPU / 1-2 GB / 20 GB）分属 3 个地域，
+  都有公网 IP，互相可达 TCP `5689-6000`（脚本用 5701 raft / 5801 HTTP）。
+- root + SSH key（22）；`tc`/`iproute2` 可用来注入 RTT/丢包。
+- 二进制可在本机交叉编译后 scp，不必在每台机装 Rust。
+- 用途：`scripts/test-real-rolling-restart-ha.sh` 用 TOML 复跑；netem 注入 20% 丢包/100ms RTT
+  观察选举；制造 >4MiB snapshot 观察跨 WAN 续传。
 
 ## 3.1 其他后续
 

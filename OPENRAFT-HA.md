@@ -240,6 +240,85 @@ append_entries / vote / full_snapshot
 
 ---
 
+### 5.6 选举超时：TOML 配置与跨地域默认值
+
+openraft 默认 `election_timeout_min=150ms`、`election_timeout_max=300ms`、
+`heartbeat_interval=50ms`。这个预算对同机/同机房够用，但对跨地域 vote RPC
+太短。深圳/上海/成都真实滚动重启时出现过：
+
+```text
+timeout after 150ms when Vote 3->2
+```
+
+当时只能用环境变量 `STELLARIS_RAFT_ELECTION_TIMEOUT_MS=1000` 临时救场，follower
+和 leader 滚动重启才通过。现在该值已是正式配置项：
+
+```toml
+[control]
+raft_dir = "/var/lib/stellaris/raft"
+raft_id = 2
+raft_bind = "0.0.0.0:5701"
+raft_secret = "change-me"
+# [[control.raft_peers]] 见 examples/ 与 scripts/ 中的完整配置
+
+# 最小选举超时（毫秒）。max = 2x，heartbeat = min/4。
+# 省略即使用跨地域默认值 1000ms。
+raft_election_timeout_ms = 1000
+```
+
+派生规则与默认值：
+
+| 字段 | 值 | 说明 |
+|---|---|---|
+| `election_timeout_min` | `raft_election_timeout_ms`，默认 `1000` | 跨地域默认值取自已验证通过的三地滚动重启 |
+| `election_timeout_max` | `2 * min` | openraft 要求 `min < max` |
+| `heartbeat_interval` | `max(min / 4, 10)` | 必须严格小于 `min` |
+
+取值约束：`50..=60000` ms。越界在配置加载阶段直接报错，不做静默 clamp：
+
+```text
+control.raft_election_timeout_ms must be between 50 and 60000 ms (got 10)
+```
+
+同机房/同城部署可以显式调小（例如 `300`）以缩短 leader 故障后的换主时间；
+跨地域部署不要低于默认值，20% 丢包/抖动场景仍需真实主机验证（见 [FOLLOWUP.md](FOLLOWUP.md) §3）。
+
+优先级：
+
+```text
+control.raft_election_timeout_ms   (正式配置)
+        >  STELLARIS_RAFT_ELECTION_TIMEOUT_MS  (已废弃，仅为旧脚本兼容；会打 warn)
+        >  跨地域默认值 1000ms
+```
+
+生效值可观测：
+
+- 启动日志：`raft election timing election_timeout_min_ms=1000 ... source="default-cross-region"`
+- `/v1/status` 的 `raft` 字段：
+
+```json
+"raft": {
+  "election_timeout_min_ms": 1000,
+  "election_timeout_max_ms": 2000,
+  "heartbeat_interval_ms": 250,
+  "source": "default-cross-region"
+}
+```
+
+本机验证：
+
+```bash
+./scripts/test-controller-raft-3node.sh
+# leader=1
+# raft timing ok: min=300ms max=600ms heartbeat=75ms source=config
+# invalid timing rejected: control.raft_election_timeout_ms must be between 50 and 60000 ms (got 10)
+```
+
+真实三地验证脚本已改为写 TOML（不再注入环境变量），并断言每个节点都记录
+生效值：`scripts/test-real-rolling-restart-ha.sh`（当前无可用测试主机，未复跑）。
+
+---
+
 ## 6. 与现有 API 的兼容
 
 ### 6.1 写路径
@@ -507,12 +586,17 @@ single_node_raft_recovers_from_disk
 
 ```text
 leader=1
+raft timing ok: min=300ms max=600ms heartbeat=75ms source=config
+invalid timing rejected: control.raft_election_timeout_ms must be between 50 and 60000 ms (got 10)
 snapshot ok
 new leader=3
 failover snapshot ok
 crash recovery ok
 OK: 3-controller raft join/LSA/snapshot/failover/crash-recovery works.
 ```
+
+脚本里的 `raft_election_timeout_ms` 来自 `ELECTION_MS`（默认 300ms，本机回环）；
+不配该项时控制器使用跨地域默认值 1000ms。
 
 额外验证：`kill -9` leader 后重启原 leader，进程从落盘 Raft log/state 恢复，
 识别新 leader、降为 follower，并通过 `/v1/model` 追平 seq=2。

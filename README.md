@@ -168,6 +168,38 @@ secret = "change-me"
 
 controller 集群内部通过 `raft_peers` + mTLS 复制。旧 `control.urls` active-active fanout 已移除；配置中出现会直接报错。
 
+选举超时是正式配置项，默认值按**跨地域**部署取值（深圳/上海/成都三地滚动重启验证通过的值）：
+
+```toml
+[control]
+raft_dir = "/var/lib/stellaris/raft"
+raft_id = 2
+raft_bind = "0.0.0.0:5701"
+raft_secret = "change-me"
+raft_bootstrap = false
+
+# 最小选举超时（ms）；省略即跨地域默认 1000。
+# max = 2x，heartbeat = min/4；允许范围 50..=60000。
+raft_election_timeout_ms = 1000
+
+[[control.raft_peers]]
+id = 1
+addr = "203.0.113.10:5701"
+[[control.raft_peers]]
+id = 2
+addr = "203.0.113.11:5701"
+[[control.raft_peers]]
+id = 3
+addr = "203.0.113.12:5701"
+```
+
+- 省略 `raft_election_timeout_ms` → `1000/2000/250` ms（min/max/heartbeat），日志
+  `source="default-cross-region"`。
+- 同机房希望更快换主可显式设 `300`（`600/75`）；跨地域不要低于默认值。
+- 越界值（`<50` 或 `>60000`）在配置加载时报错，不静默 clamp。
+- `/v1/status` 的 `raft` 字段返回生效的 min/max/heartbeat 与来源。
+- 环境变量 `STELLARIS_RAFT_ELECTION_TIMEOUT_MS` 已废弃：仅在 TOML 未配置时生效并打 warn。
+
 ### 9. iroh controller demo（不需要 HTTP 轮询）
 
 ```bash
