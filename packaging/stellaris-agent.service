@@ -1,0 +1,30 @@
+[Unit]
+Description=Stellaris Linking overlay agent
+Documentation=https://github.com/stellaris-linking/stellaris-linking
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stellaris
+Group=stellaris
+ExecStart=/usr/local/bin/stellaris-agent --config /etc/stellaris/agent.toml
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+
+# TUN creation + route installation need CAP_NET_ADMIN; raw sockets are used
+# only by the optional reachability probe.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+ReadWritePaths=/var/lib/stellaris /run/stellaris
+StateDirectory=stellaris
+RuntimeDirectory=stellaris
+
+[Install]
+WantedBy=multi-user.target

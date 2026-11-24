@@ -3,7 +3,7 @@
 **A fully controllable, Rust-native L3 overlay network with optional control plane, per-node route query, and route adjustment.**
 
 > 状态：**controller HA + P1 数据面生产化基线已完成**（2026-11-23）。3 节点 openraft/mTLS/快照/故障恢复、真实物理三主机 HA、IPv4/IPv6 overlay、NAT44/66、public exit、MSS/MTU/PTB、fragment ACL、direct→relay 切换、per-class queue 已验证。
-> **2026-11-24 已按 [AUDIT.md](AUDIT.md) 修复 P0 与大部分 P1**：LSA Ed25519 签名、transit capability、OS 路由防护、iroh 走 Raft、Raft 鉴权/超时、routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、动态 membership 等；剩余边界（真 multipath、应用层重组、relay 路径选择、真实互联网 PMTUD、macOS NAT）仍以 AUDIT.md 为准。设计记录见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
+> **2026-11-24 已按 [AUDIT.md](AUDIT.md) 修复 P0/P1 并继续完成 P2**：LSA Ed25519 签名、transit capability、OS 路由防护、iroh 走 Raft、Raft 鉴权/超时、routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、动态 membership、签名审批入网、ACL ICMP reject、应用层分片重组、IPv6 最小 MTU、discovery/relay 配置校验、metrics/audit、systemd/CI。剩余边界（真 multipath、真实互联网 PTB 未观测、macOS NAT、Windows）仍以 AUDIT.md 为准。设计记录见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。
 
 ## MVP 已实现
@@ -20,15 +20,14 @@
 - **数据面**：TUN（Linux/macOS）+ 16 字节 MeshHeader；IPv4 + IPv6 overlay；TTL/转发/anti-spoof；subnet gateway；NAT44/NAT66 public exit；fragment 解析/ACL；TCP MSS clamp、peer path MTU、ICMPv4/v6 PTB；初始 MTU 1100 + 自适应；需要 root/CAP_NET_ADMIN。
 - **API/控制面**：非 loopback `api.bind` 必须配置 `api.token`；`api.read_token` 只允许读操作，写操作仍需要 admin token；`api.previous_tokens` / `control.previous_secrets` 支持轮换窗口；controller 可配置 `control.leader_id`，legacy 路径非 leader 拒绝写入（Raft 路径由 quorum/leader hint 处理）；非 loopback `control.bind`/controller iroh 必须配置 `control.secret`。
 - **入网安全**：`network.auth.mode = "psk"` 双向 HMAC challenge/response + 可选 allowlist；controller snapshot 支持 Ed25519 签名；`control.members` 支持 allowlist/prefix grant；一次性 `control.join_token` → `POST /v1/join`；member 侧 LSA 前缀 grant、数据面 source grant（转发他人源地址需要 `transit` capability）、`POST /v1/revoke`（可用 `control.admin_secret` 与 member secret 分权）、可选签名 `POST /v1/join`（`require_join_signature`）；join token 配置 hash 入 Raft，配置不一致 join 409。
-- **RoutePolicy**：配置化 policy engine（Accept/Deny/SetLocalPref/SetMetric/SetAdminDistance/SetWeight），在 RIB→FIB 前执行；AZ 目前只有 `region` 匹配（`zone` 字段未实现）。
+- **RoutePolicy**：配置化 policy engine（Accept/Deny/SetLocalPref/SetMetric/SetAdminDistance/SetWeight），在 RIB→FIB 前执行；`Match.zone` 已实现 AZ 匹配。
 - **测试**：FIB/路由/持久化/报文解析/数据面决策/ACL/QoS/API 鉴权/controller 签名/SPF 单元测试；`demo-two-node.sh` 双节点 iroh；`docker-two-node-tun.sh` 双容器 TUN；`docker-subnet-gateway.sh` a→b→c 1000B ping；`demo-linkstate.sh`/`demo-distributed-linkstate.sh` 自动路由与 `TEST_FAILOVER=1` 撤路；`demo-iroh-controller.sh` iroh control；`demo-controller-discovery.sh` controller 自动发现成员；`test-real-3host-ha.sh` / `test-real-3host-overlay.sh` / `test-real-3host-ipv6.sh` / `test-real-3host-roaming.sh` 真实物理三主机 HA、IPv4/IPv6、roaming。
 
 ## 尚未实现（剩余硬化）
 
 - 真实物理三主机 controller/overlay 已完成；真实物理 **多路径/公网 NAT** 仍待覆盖。
-- 完整 PMTUD 状态机（现有 peer path MTU + MSS + ICMP PTB）。
-- 应用层 fragment reassembly（当前依赖目的端内核重组）。
-- 强制 multipath（已有 direct→relay roaming）。
+- 完整 PMTUD 状态机：现有 peer path MTU + MSS + ICMP PTB；真实互联网路径 MTU 均为 1500，未观测到路由器 PTB（见 TEST-RESULTS）。
+- 强制 multipath（已有 direct→relay roaming / relay 故障重连）。
 - 磁盘满/撕裂写注入（只读磁盘已测）。
 - Windows、低功耗 gateway/leaf、macOS NAT。
 
@@ -174,7 +173,15 @@ H1=root@<chengdu> H2=root@<shenzhen> H3=root@<shanghai> \
 
 # root + netns：OS 路由安全（默认路由 opt-in、外部路由不覆盖、proto 标记）
 sudo BIN=./target/release/stellaris-agent ./scripts/test-netns-route-safety.sh
+
+# root + netns：ACL reject/drop 语义（reject 回 ICMP admin-prohibited）
+sudo BIN=./target/release/stellaris-agent ./scripts/test-netns-acl-reject.sh
+
+# root + netns：应用层分片重组（600/1500 MTU 阶梯，ping 1000B）
+sudo BIN=./target/release/stellaris-agent ./scripts/test-netns-reassembly.sh
 ```
+
+systemd 单元与安装步骤见 [packaging/README.md](packaging/README.md)。
 
 member 只配置一个入口：
 
@@ -602,17 +609,57 @@ examples/               # 示例 TOML
 | [stellaris-linking-architecture.md](stellaris-linking-architecture.md) | 早期架构与 Rust 选型 |
 | [virtual-network-survey-2026-11.md](virtual-network-survey-2026-11.md) | 方案调研 |
 
+### 13. 入网审批（admission.mode = approve）
+
+不需要给每台新成员分发 join token：成员用 Ed25519 私钥签 `POST /v1/join`，
+controller 把请求放进 Raft 复制的待审队列，管理员审批后才授予前缀/能力。
+
+```toml
+[control]
+secret = "member-secret"
+admin_secret = "admin-secret"
+raft_dir = "/var/lib/stellaris/raft"
+raft_secret = "raft-secret"
+[control.admission]
+mode = "approve"
+```
+
+成员侧：
+
+```toml
+[control]
+url = "http://controller:5801"
+secret = "member-secret"
+request_admission = true   # 无 join_token；签名后轮询审批结果
+```
+
+审批：
+
+```bash
+curl -H "x-stellaris-secret: admin-secret" http://controller:5801/v1/admissions
+curl -X POST -H "x-stellaris-secret: admin-secret" -H 'content-type: application/json' \
+  -d '{"prefixes":["192.168.50.0/24"],"capabilities":["member"]}' \
+  http://controller:5801/v1/admissions/<node-id>/approve
+curl -X POST -H "x-stellaris-secret: admin-secret" \
+  http://controller:5801/v1/admissions/<node-id>/deny
+```
+
+`mode = "allowlist"` 时只接受 `control.members` 里已存在的节点；默认 `legacy`
+保持旧 token 行为。待审请求在 Raft 快照里，leader 切换不丢失。完整测试见
+[test-real-raft-membership.sh](scripts/test-real-raft-membership.sh) 与
+`controller::tests::admission_approval_flow_is_signed_and_admin_scoped`。
+
 ## 已知限制
 
 - controller 已完成 openraft quorum/leader election/mTLS/snapshot/failover；member 入口仍是单 URL（可指向 LB/任一 controller）。旧 fanout 已移除。
-- 数据面 IPv4/IPv6 overlay 已启用；应用层 fragment reassembly/完整 PMTUD 状态机仍未实现。
+- 数据面 IPv4/IPv6 overlay 已启用；应用层分片重组、ACL ICMP reject、IPv6 ≥1280 MTU 已实现；完整 PMTUD 状态机仍以 iroh/内核为主。
 - 初始 bootstrap 仍需要 controller URL 或静态 peer；之后可由 controller manifest/LSA `overlay_ip/addrs` 自动发现/连接。
 - agent 的路由写 API 只接受 `scope=local`；network scope 目前只能通过 controller 配置/静态路由（`api.rs:365-369` 会拒绝 network scope）。
 - ACL/QoS 支持 API 动态更新 + token-bucket + per-priority/per-class queue depth/bytes + DSCP；内置静态 Web UI（`crates/stellaris-agent/static/index.html`）只覆盖 peers/routes/status/policy。anti-spoof 允许 peer 自身 overlay IP + 它广告的前缀；subnet gateway 的 NAT66 目前仅 Linux（macOS 待做）。
 - **控制帧没有 per-member 签名/Hello 挑战**：iroh 连接有 `network.auth.mode = "psk"` 双向认证，但控制帧本身没有逐成员签名；不要把这个 MVP 直接暴露在不可信网络。
 - relay 建连、direct→relay 切换已测；relay 故障后会在旧连接关闭时经 `transport.relay_urls` 列表重连（实测约 60s，非秒级切换；多 relay 同时承载未实现）。生产建议自建 relay 并监控（见 AUDIT.md）。
 - 2026-11-24 完成静态审计（[AUDIT.md](AUDIT.md)）并修复 P0：LSA 签名、transit 强制、OS 路由防护、iroh 走 Raft、Raft RPC 必须配 `raft_secret` 且有超时、签名 join、admin secret、routes/LSA TTL/epoch 入 Raft、动态 membership。仍没有第三方安全审计，MVP 仅用于开发/实验。
-- 2026-11-24 新增的配置：`control.admin_secret`、`control.require_join_signature`、`control.lsa_ttl_secs`、`dataplane.allow_default_route`、`dataplane.replace_existing_routes`、`transport.disable_discovery`（测试用：强制 relay-only）；`transport.listen=false`、`routing.rib_mode!=full`、`set_path_hint` 现在会直接报错（此前被静默忽略）。子网网关/exit 转发需要给对应成员 grant `capabilities = ["transit"]`。MeshHeader 的 `network_hash` 已改为 SHA-256 前 32 位，混合版本节点需要一起升级。
+- 2026-11-24 新增的配置：`control.admin_secret`、`control.require_join_signature`、`control.lsa_ttl_secs`、`control.admission.mode`、`control.request_admission`、`dataplane.allow_default_route`、`dataplane.replace_existing_routes`、`transport.disable_discovery`（测试用：强制 relay-only）、`transport.allow_unauthenticated_discovery`（仅隔离实验）、`transport.relay_mode`（auto/n0/custom/disabled，`custom` 必须带 `relay_urls`）、`acl.deny_action`；`transport.listen=false`、`routing.rib_mode!=full`、`set_path_hint` 现在会直接报错（此前被静默忽略）。子网网关/exit 转发需要给对应成员 grant `capabilities = ["transit"]`。MeshHeader 的 `network_hash` 已改为 SHA-256 前 32 位，混合版本节点需要一起升级。
 
 ## 贡献
 

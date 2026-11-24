@@ -23,7 +23,7 @@
 ```text
 cargo fmt --check                          ✅
 cargo clippy --workspace --all-targets -- -D warnings  ✅
-cargo test --workspace                     154 passed
+cargo test --workspace                     167 passed
 ```
 
 ---
@@ -412,7 +412,21 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 连接关闭后会经第二个 relay 重建，数据恢复（实测约 60s，受 QUIC idle timeout 限制）。
 多 relay 同时承载/秒级切换仍未实现。
 
-### 3.12 仍未验证### 3.12 仍未验证### 3.11 仍未验证
+### 3.12 2026-11-24 晚 P2 验证
+
+| 项 | 环境/脚本 | 结果 |
+|---|---|---|
+| 应用层分片重组（v4） | `scripts/test-netns-reassembly.sh`，a MTU 600 / b MTU 1500，ping 1000B | ✅ 请求在 b 重组 3 次、回复在 a 重组 3 次，ping 3/3，0% 丢包 |
+| ACL reject/drop | `scripts/test-netns-acl-reject.sh` | ✅ reject: ping "Packet filtered"，acl_rejected=52；drop: 100% 超时 |
+| 入网审批 | controller 集成测试（Raft，3 副本） | ✅ 未签名 403；签名后 202 待审；member secret 审批 401；admin 批准后 200 且三副本可见 |
+| metrics/audit | `api::metrics_endpoint_exposes_counters` | ✅ 新增 acl_rejected/spoof/frag/reassembly 指标；审计事件带 rule/src/dst/proto/peer |
+| 真实互联网 PMTU | 成都 8.137.217.116 → 深圳 47.112.117.96 | 本机/路径 MTU 1500；payload 1472（1500B）可达，1473 被本机 "message too long" 拒绝；tracepath 报告 pmtu 1500；**未观测到路由器 PTB**（云网络无更小 MTU 链路） |
+| systemd / CI 矩阵 | `packaging/*.service`、`.github/workflows/ci.yml` | 文件已加并与本地 `cargo`/`bash -n` 校验；GitHub 上未实际跑过 |
+| 单元测试总数 | `cargo test --workspace` | **167 passed** |
+
+> 真实互联网 PTB 的边界：需要 MTU <1500 的链路或可控路由器才能验证；当前 8 台云主机跨地域路径均为 1500，且 1473B 探测先被本机 MTU 拦截，因此"真实路由器生成 PTB"仍属未验证。
+
+### 3.13 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot

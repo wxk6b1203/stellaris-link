@@ -6,7 +6,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: cargo (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -14,8 +19,38 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
       - run: cargo build --bins
-      - run: ./scripts/test-tls.sh
-      - run: BIN="$PWD/target/debug/stellaris-agent" ./scripts/test-docker-mdns.sh
+
+  linux-integration:
+    name: linux integration (netns/TUN/docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --bins
+      - name: TLS controller integration
+        run: ./scripts/test-tls.sh
+      - name: Docker mDNS discovery
+        run: BIN="$PWD/target/debug/stellaris-agent" ./scripts/test-docker-mdns.sh
+      - name: netns TUN overlay
+        run: sudo BIN="$PWD/target/release/stellaris-agent" ./scripts/test-linux-netns-tun.sh
+      - name: netns ACL reject/drop
+        run: sudo BIN="$PWD/target/release/stellaris-agent" ./scripts/test-netns-acl-reject.sh
+      - name: netns fragment reassembly
+        run: sudo BIN="$PWD/target/release/stellaris-agent" ./scripts/test-netns-reassembly.sh
+      - name: netns 3-node controller
+        run: sudo BIN="$PWD/target/release/stellaris-agent" CTRL="$PWD/target/release/stellaris-controller" ./scripts/test-linux-netns-3node-controller.sh
+
+  scripts:
+    name: script lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: for f in scripts/*.sh; do bash -n "$f"; done
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # Only fail on real errors; the scripts intentionally use some idioms
+      # shellcheck flags as style warnings.
+      - run: shellcheck -S error scripts/*.sh

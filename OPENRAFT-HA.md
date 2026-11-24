@@ -336,6 +336,9 @@ control.raft_election_timeout_ms   (正式配置)
   origin 私钥签名；member agent 始终签名，curl 引导脚本需显式关闭或自行签名。
 - **权限**：`control.admin_secret` 存在时，`revoke` 与 `routes` 只接受 admin
   secret，member secret 仅能读快照/写 LSA/加入。
+- **入网审批**：`admission.mode = approve` 时，签名 join 以 `RequestAdmission`
+  进入 Raft 待审队列；`GET /v1/admissions` 列出，管理员通过
+  `POST /v1/admissions/{node}/approve|deny` 授予/拒绝（前缀与能力由管理员显式给出）。
 - **动态成员**：`POST /v1/raft/learner {id, addr}` 与
   `POST /v1/raft/membership {voters:[{id,addr}]}`（admin）分别封装
   `add_learner`（非阻塞）与 `change_membership`。

@@ -133,5 +133,5 @@ routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、snapshot/manifest f
 1. relay 切换时延/多 relay：现在是旧连接关闭后经配置列表重连（约 60s），需要 QUIC 层多路径/更快失败检测。
 2. 持续慢链路下 60s transfer TTL / 大快照续传。
 3. 大模型写入/追赶性能：每次 apply 重写整份 raft JSON，5k 条约 10 分钟。
-4. 真 multipath、应用层 fragment reassembly、真实互联网 PMTUD、macOS NAT、打包/CI 矩阵。
-（动态 membership 与 iroh 8 MiB 快照已在 2026-11-24 晚验证。）
+4. 真 multipath、真实互联网 PTB（需要小 MTU 链路/可控路由器）、macOS NAT/Windows、磁盘满/慢 IO 注入。
+（分片重组、ACL ICMP、IPv6 最小 MTU、审批入网、metrics/打包/CI 已在 2026-11-24 晚完成。）

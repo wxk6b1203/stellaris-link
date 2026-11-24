@@ -128,7 +128,7 @@ Raft 保证“副本一致”，不保证“写入合法”。所以先做：
 2. 应用层 fragment reassembly / 完整 PMTUD 状态机
 3. relay 切换时延（现为重连，约 60s；未做多 relay 同时承载）
 4. 持续慢链路 TTL、大模型写入/追赶的 O(n²) 持久化
-5. 磁盘慢 IO/撕裂写注入、公网 NAT 矩阵、Windows/macOS NAT、打包/service/tracing
+5. 磁盘慢 IO/撕裂写注入、公网 NAT 矩阵、Windows/macOS NAT；打包/CI 已补（未在 GitHub 实跑）
 
 修复记录见 [AUDIT.md](AUDIT.md) §7。
 

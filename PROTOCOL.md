@@ -4,7 +4,7 @@
 > 配套：`ARCHITECTURE.md`
 > 范围：控制面 wire protocol、RouteQuery/RouteAdjust HTTP API、CLI 映射、版本/安全约定。
 >
-> **实现状态（2026-11-24）**：HTTP controller 已含 openraft HA、mTLS、snapshot/manifest、join/revoke/ack、`/v1/raft/*` 成员操作；iroh control 已实现 JSON 帧（签名 LSA/ACK、线性化快照）并走 Raft。本文中的 protobuf/8MiB/Hello/nonce/Delta、`/v1/paths`、SSE、history/rollback 等仍是设计目标，未实现项以 [AUDIT.md](AUDIT.md) §5/§7 为准。
+> **实现状态（2026-11-24）**：HTTP controller 已含 openraft HA、mTLS、snapshot/manifest、join/revoke/ack、`/v1/admissions` 审批、`/v1/raft/*` 成员操作；iroh control 已实现 JSON 帧（签名 LSA/ACK、线性化快照）并走 Raft；ACL 支持 `deny_action=reject` 回 ICMP，数据面做分片重组。本文中的 protobuf/8MiB/Hello/nonce/Delta、`/v1/paths`、SSE、history/rollback 等仍是设计目标，未实现项以 [AUDIT.md](AUDIT.md) §5/§7 为准。
 
 ---
 

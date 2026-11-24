@@ -20,7 +20,7 @@
 |---|---:|---|
 | P0 | 6 | LSA 可伪造、transit 放行任意成员源、OS 路由无 owner、iroh 绕过 Raft、Raft RPC fail-open、脚本假绿 |
 | P1 | 17 | `/v1/routes` 不进 Raft、LSA TTL 不执行、epoch 语义、join 无签名、snapshot/manifest fail-open、动态 membership、relay failover 空断言、TTL/path hint 缺失、配置 no-op、空 secret、零测试模块…… |
-| P2 | 14+ | metrics/audit、IPv6 MTU、discovery 默认开放、relay_urls 语义、CI/打包/许可、文档漂移…… |
+| P2 | 已关闭 9 项（metrics/audit、IPv6 MTU、discovery 默认、relay_mode 语义、ACL ICMP、打包/CI、应用层重组、network_hash、文档漂移）；真实互联网 PTB、真 multipath、macOS NAT 仍开放 | 见 §7.2 / §7.3 |
 
 ---
 
@@ -31,8 +31,8 @@
 | 级别 | 修复 | 仍有边界 |
 |---|---|---|
 | P0 | 6 / 6 已修复并在真实主机/本机验证 | 无已知 P0 残留 |
-| P1 | 17 / 17 修复或关闭（relay failover 为“旧连接关闭后经配置 relay 列表重连”，恢复需数十秒） | 见 §7.2 的残余边界 |
-| P2 | 文档与 CI 少量项处理，其余仍开放 | 见 §7.3 |
+| P1 | 17 / 17 修复或关闭（relay failover 为“旧连接关闭后经配置 relay 列表重连”，恢复需数十秒） | 见 §7.3 的残余边界 |
+| P2 | 已关闭 9 项；真实互联网 PTB、真 multipath、macOS NAT 仍开放 | 见 §7.2 / §7.3 |
 
 P0 证据速查：
 
@@ -216,9 +216,23 @@ P0 证据速查：
 | P1 route TTL 不生效 | runtime 每秒调用 `RouteEngine::expire()` | routing 单测 |
 | P1 iroh 4 MiB 上限 | 控制帧上限提高到 64 MiB | `test-real-iroh-large-snapshot.sh`：8 MiB 模型经 iroh-only member 同步并 ACK |
 | P1 LSA 过期洪泛 | 新增批量 `ExpireLsas`，每轮一条 Raft 写 | 模型单测；修复了 5100 条 LSA 同时过期导致复制/追赶被拖慢的问题 |
-| P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 154 |
+| P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 167 |
 
-### 7.2 仍开放的 P1/P2 边界
+### 7.2 2026-11-24 晚 P2 第二批（已完成）
+
+| 项 | 修复 | 证据 |
+|---|---|---|
+| 应用层分片重组 | 有界 IPv4/IPv6 重组（256 流/128 片/30s），ACL 前完成；IPv6 重叠拒绝、超限丢弃 | 5 个单测 + netns 600/1500 MTU 阶梯（请求 3/回复 3 重组，0% 丢包） |
+| ACL 不回 ICMP | `acl.deny_action = reject` 回 ICMP admin-prohibited；echo 可回、ICMP error 不回 | 单测 + `test-netns-acl-reject.sh`（ping "Packet filtered"，acl_rejected>0；drop 静默超时） |
+| IPv6 <1280 | TUN MTU 不再低于 1280；路径更小时告警并依赖 PTB/MSS | `ipv6_mtu_never_drops_below_1280` 单测 |
+| discovery 默认开放 | 开 discovery 必须 PSK，除非显式 `allow_unauthenticated_discovery` | config 单测 |
+| relay_urls 语义 | 新增 `transport.relay_mode = auto/n0/custom/disabled`：`custom` 必须带 urls，`n0`/`disabled` 带 urls 报错，`disable_relay` 视为 disabled | config 单测 + README |
+| metrics/audit 细化 | `/metrics` 新增 acl_rejected/spoof/fragment/reassembly；ACL 审计带 rule/src/dst/proto/peer | API 单测 |
+| 打包/CI 矩阵 | systemd 两个 unit（capability 最小化）+ packaging 文档；CI ubuntu/macos + netns/TLS/docker + 脚本语法 | 文件已加；GitHub CI 未实际跑过 |
+| 真实互联网 PMTUD | 实测成都→深圳路径 MTU 1500（payload 1472 通、1473 报错）；tracepath pmtu 1500 | `TEST-RESULTS.md` §3.12；云网络无更小 MTU 链路，路由器 PTB 生成未观测 |
+| 入网 ACL | `admission.mode = approve/allowlist`：签名申请入 Raft 待审队列，admin 审批时显式授予前缀/能力 | 模型单测 + controller 集成测试（未签名 403、待审 202、member secret 不能审批、批准后 200） |
+
+### 7.3 仍开放的 P1/P2 边界
 
 - **relay failover 的恢复时延**：修复为“旧连接关闭后经配置 relay 列表重连”，实测约 60s（QUIC idle timeout + 2s 重连间隔），不是秒级切换；多 relay 同时承载仍未实现。
 - **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
@@ -226,9 +240,9 @@ P0 证据速查：
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。
 - **大模型追赶性能**：LSA 过期已批量，但每次 apply 仍重写整份 raft-log/state（O(n²)），5k 条写入约 10 分钟；未做日志分片/增量持久化。
 - **iroh 大帧**：8 MiB 已验证；>64 MiB 仍会失败（无分块）。
-- **P2 未动**：metrics/audit 细化、IPv6 <1280、默认开放 discovery、relay_urls 语义、ACL 不回 ICMP、macOS NAT、打包/CI 矩阵、真 multipath、应用层重组、真实互联网 PMTUD 等。
+- **P2 未动**：真 multipath、真实互联网 PTB（无小 MTU 链路可测）、macOS NAT/Windows、磁盘满/慢 IO 注入、CI 仓库推送与实跑。
 
-### 7.3 本轮新增的配置/行为变化（升级注意）
+### 7.4 本轮新增的配置/行为变化（升级注意）
 
 - 新增：`control.admin_secret`、`control.require_join_signature`、`control.lsa_ttl_secs`、`dataplane.allow_default_route`、`dataplane.replace_existing_routes`。
 - Raft 模式现在**强制** `raft_secret`；只配 `raft_tls_cert` 不配 key 会报错（之前静默退化为 HTTP）。
@@ -237,3 +251,8 @@ P0 证据速查：
 - 未配置 `controller_keys`/`control.secret` 且未开 `allow_unsigned_snapshot` 的 member 会拒绝控制器快照。
 - iroh LSA/Ack 现在要求签名；旧版本 agent 与新版 controller 的 iroh 入口不兼容。
 - `network_hash` 从 UUIDv7 前 4 字节改为 SHA-256 前 32 位：混合版本节点的数据面会互不匹配，需同时升级。
+- 新增 `control.admission.mode`（legacy/approve/allowlist）与成员侧 `control.request_admission`；`approve` 必须配合 raft。
+- 新增 `acl.deny_action = "drop" | "reject"`；`reject` 仅对非 ICMP-error 包回 ICMP admin-prohibited。
+- 开启 `discovery_port`/`mdns` 且 `auth.mode = "none"` 现在会配置报错；隔离实验需显式 `transport.allow_unauthenticated_discovery = true`。
+- `disable_relay` 与 `relay_urls` 同时配置会报错（此前静默忽略 relay_urls）。
+- 分片重组在 ACL 前执行；超限/重叠（IPv6）分片会被丢弃并计入 `frag_dropped`。

@@ -1,7 +1,8 @@
 # 入网与成员授权 — 设计
 
 > 实现状态（2026-11-24）：签名 `POST /v1/join`（`require_join_signature`）、
-> `control.admin_secret` 读写分权、动态 Raft membership 接口、快照/manifest 默认
+> `control.admin_secret` 读写分权、`admission.mode=approve` 签名申请+管理员审批、
+> 动态 Raft membership 接口、快照/manifest 默认
 > fail-closed 已落地；Hello 挑战、per-member key、threshold、manifest 过期只读等
 > 仍是设计目标，详见 [AUDIT.md](AUDIT.md) §7。
 

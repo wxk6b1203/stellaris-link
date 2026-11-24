@@ -75,7 +75,13 @@ impl IrohTransport {
         if config.transport.disable_discovery {
             builder = builder.clear_address_lookup();
         }
-        if config.transport.disable_relay {
+        let relay_disabled = match config.transport.relay_mode {
+            stellaris_types::RelayModeConfig::Disabled => true,
+            stellaris_types::RelayModeConfig::Custom => false,
+            stellaris_types::RelayModeConfig::N0 => false,
+            stellaris_types::RelayModeConfig::Auto => config.transport.disable_relay,
+        };
+        if relay_disabled {
             builder = builder.relay_mode(RelayMode::Disabled);
         } else if !config.transport.relay_urls.is_empty() {
             let urls: Vec<RelayUrl> = config
@@ -88,7 +94,7 @@ impl IrohTransport {
             builder = builder.relay_mode(RelayMode::custom(urls));
         }
         let endpoint = builder.bind().await.context("bind iroh endpoint")?;
-        if !config.transport.disable_relay {
+        if !relay_disabled {
             endpoint.online().await;
         }
         let me = endpoint.id();

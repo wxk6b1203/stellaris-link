@@ -1,0 +1,24 @@
+[Unit]
+Description=Stellaris Linking controller (openraft HA member)
+Documentation=https://github.com/stellaris-linking/stellaris-linking
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stellaris
+Group=stellaris
+ExecStart=/usr/local/bin/stellaris-controller --config /etc/stellaris/controller.toml
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/stellaris /run/stellaris
+StateDirectory=stellaris
+RuntimeDirectory=stellaris
+
+[Install]
+WantedBy=multi-user.target

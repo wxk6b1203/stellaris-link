@@ -165,7 +165,7 @@ impl Reassembler {
             return Outcome::Dropped("bad ipv4 length");
         }
         let payload = &packet[ihl..];
-        if payload.len() % 8 != 0 && more {
+        if !payload.len().is_multiple_of(8) && more {
             return Outcome::Dropped("unaligned fragment");
         }
         let key = Key {

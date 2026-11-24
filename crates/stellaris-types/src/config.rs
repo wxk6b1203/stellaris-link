@@ -90,6 +90,18 @@ pub struct AdmissionConfig {
     pub mode: AdmissionMode,
 }
 
+/// Explicit relay policy; `auto` keeps backwards-compatible behaviour:
+/// custom relays when `relay_urls` is non-empty, otherwise the N0 preset.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayModeConfig {
+    #[default]
+    Auto,
+    N0,
+    Custom,
+    Disabled,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RaftPeerConfig {
     pub id: u64,
@@ -448,8 +460,12 @@ pub struct TransportConfig {
     #[serde(default = "default_true")]
     pub listen: bool,
     /// Disable iroh relays entirely (LAN/direct-only tests).
+    /// Deprecated alias for `relay_mode = "disabled"`.
     #[serde(default)]
     pub disable_relay: bool,
+    /// Relay policy: auto/n0/custom/disabled. `custom` requires relay_urls.
+    #[serde(default)]
+    pub relay_mode: RelayModeConfig,
     /// Disable direct-address discovery so tests can force relay-only paths.
     #[serde(default)]
     pub disable_discovery: bool,
@@ -490,6 +506,7 @@ impl Default for TransportConfig {
             relay_urls: Vec::new(),
             listen: true,
             disable_relay: false,
+            relay_mode: RelayModeConfig::Auto,
             disable_discovery: false,
             allow_unauthenticated_discovery: false,
             listen_port: None,
@@ -1012,9 +1029,29 @@ impl Config {
                     .into(),
             ));
         }
-        if self.transport.disable_relay && !self.transport.relay_urls.is_empty() {
+        let relay_mode = match (self.transport.relay_mode, self.transport.disable_relay) {
+            (RelayModeConfig::Auto, true) => RelayModeConfig::Disabled,
+            (RelayModeConfig::Auto, false) => RelayModeConfig::Auto,
+            (RelayModeConfig::Disabled, false) => RelayModeConfig::Disabled,
+            (RelayModeConfig::Custom, false) => RelayModeConfig::Custom,
+            (RelayModeConfig::N0, false) => RelayModeConfig::N0,
+            (_, true) => {
+                return Err(ConfigError::Invalid(
+                    "transport.disable_relay conflicts with transport.relay_mode".into(),
+                ));
+            }
+        };
+        if relay_mode == RelayModeConfig::Custom && self.transport.relay_urls.is_empty() {
             return Err(ConfigError::Invalid(
-                "transport.disable_relay conflicts with transport.relay_urls".into(),
+                "transport.relay_mode = custom requires transport.relay_urls".into(),
+            ));
+        }
+        if relay_mode != RelayModeConfig::Custom
+            && relay_mode != RelayModeConfig::Auto
+            && !self.transport.relay_urls.is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "transport.relay_urls is only valid with relay_mode = custom or auto".into(),
             ));
         }
         if !self.transport.listen {
@@ -1335,7 +1372,32 @@ disable_relay = true
 relay_urls = ["https://relay.example.com"]
 "#;
         let error = Config::from_toml(toml).unwrap_err().to_string();
-        assert!(error.contains("disable_relay"), "{error}");
+        assert!(error.contains("relay"), "{error}");
+    }
+
+    #[test]
+    fn relay_mode_semantics_are_explicit() {
+        let base = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[transport]
+"#;
+        let custom_empty = format!("{base}relay_mode = \"custom\"\n");
+        let error = Config::from_toml(&custom_empty).unwrap_err().to_string();
+        assert!(error.contains("requires transport.relay_urls"), "{error}");
+        let n0_with_urls =
+            format!("{base}relay_mode = \"n0\"\nrelay_urls = [\"https://relay.example.com\"]\n");
+        let error = Config::from_toml(&n0_with_urls).unwrap_err().to_string();
+        assert!(error.contains("relay_urls is only valid"), "{error}");
+        let custom = format!(
+            "{base}relay_mode = \"custom\"\nrelay_urls = [\"https://relay.example.com\"]\n"
+        );
+        assert!(Config::from_toml(&custom).is_ok());
+        let disabled = format!("{base}relay_mode = \"disabled\"\n");
+        assert!(Config::from_toml(&disabled).is_ok());
     }
 
     #[test]
