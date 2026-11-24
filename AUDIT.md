@@ -238,7 +238,7 @@ P0 证据速查：
 - **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
 - **relay 自动 failover**：见上，需要传输层改动。
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。
-- **大模型追赶性能**：LSA 过期已批量，但每次 apply 仍重写整份 raft-log/state（O(n²)），5k 条写入约 10 分钟；未做日志分片/增量持久化。
+- **大状态写入/追赶性能（措辞修正）**：`LogStore::append` 每次重写整份 `raft-log.json`，`apply` 每条重写整份 `raft-state.json`。**批量导入 n 条且模型随每条增长时**总 I/O 为 Θ(n²)：5,100 LSA×24 前缀实测约 **5 分 50 秒**（state 5.84 MB、log 1.51 MB）。已安装 snapshot 的 follower 追赶尾部 m 条时，成本是 **Θ(m×状态大小)**，不是严格 O(m²)；只有从空状态重放全部 n 条（无 snapshot）才是 Θ(n²)。此前 LSA 过期逐条写会造成 m×大状态 的长时间追赶，已改为批量 `ExpireLsas`。未做日志分片/增量持久化。
 - **iroh 大帧**：8 MiB 已验证；>64 MiB 仍会失败（无分块）。
 - **P2 未动**：真 multipath、真实互联网 PTB（无小 MTU 链路可测）、macOS NAT/Windows、磁盘满/慢 IO 注入、CI 仓库推送与实跑。
 
