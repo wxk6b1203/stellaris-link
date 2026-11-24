@@ -210,6 +210,15 @@ ELECTION_MS=1000 ./scripts/test-controller-raft-3node.sh
 # crash recovery ok
 ```
 
+未配置该项的 mTLS 三进程集群（默认 1000ms）同样通过：
+
+```bash
+./scripts/test-controller-raft-tls-3node.sh
+# tls leader=1
+# tls snapshot ok
+# OK: 3-controller raft TLS join/LSA/snapshot works.
+```
+
 未验证：真实三地用 TOML 复跑滚动重启（当前无测试主机）；WAN 丢包/抖动下的选举稳定性。
 
 ### 3.8 仍未验证
