@@ -272,3 +272,98 @@ async fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn parses_status_and_peer_commands() {
+        assert!(matches!(
+            parse(&["stellaris", "status"]).cmd,
+            Command::Status
+        ));
+        assert!(matches!(
+            parse(&["stellaris", "peer", "list"]).cmd,
+            Command::Peer { cmd: PeerCmd::List }
+        ));
+    }
+
+    #[test]
+    fn parses_route_mutations() {
+        let cli = parse(&[
+            "stellaris",
+            "route",
+            "add",
+            "10.9.0.0/16",
+            "--via",
+            "0202020202020202020202020202020202020202020202020202020202020202",
+            "--metric",
+            "7",
+            "--pin",
+            "--dry-run",
+            "--reason",
+            "test",
+        ]);
+        match cli.cmd {
+            Command::Route {
+                cmd:
+                    RouteCmd::Add {
+                        prefix,
+                        via,
+                        metric,
+                        pin,
+                        dry_run,
+                        reason,
+                        ..
+                    },
+            } => {
+                assert_eq!(prefix, "10.9.0.0/16");
+                assert!(via.starts_with("0202"));
+                assert_eq!(metric, Some(7));
+                assert!(pin && dry_run);
+                assert_eq!(reason, "test");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["stellaris", "route", "delete", "abc"]).cmd,
+            Command::Route {
+                cmd: RouteCmd::Delete { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["stellaris", "route", "lookup", "10.0.0.1"]).cmd,
+            Command::Route {
+                cmd: RouteCmd::Lookup { .. }
+            }
+        ));
+        let cli = parse(&[
+            "stellaris",
+            "route",
+            "pin",
+            "10.9.0.0/16",
+            "--via",
+            "0202020202020202020202020202020202020202020202020202020202020202",
+            "--ttl",
+            "30",
+        ]);
+        assert!(matches!(
+            cli.cmd,
+            Command::Route {
+                cmd: RouteCmd::Pin { ttl: Some(30), .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_required_arguments() {
+        assert!(Cli::try_parse_from(["stellaris", "route", "add", "10.9.0.0/16"]).is_err());
+        assert!(Cli::try_parse_from(["stellaris", "route"]).is_err());
+        assert!(Cli::try_parse_from(["stellaris", "unknown"]).is_err());
+    }
+}

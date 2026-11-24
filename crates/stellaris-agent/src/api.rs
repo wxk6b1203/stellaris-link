@@ -771,6 +771,131 @@ previous_tokens = ["old"]
     }
 
     #[tokio::test]
+    async fn route_endpoints_handle_lookup_pin_drain_reset_delete() {
+        let state = state(Some("tok"));
+        let via = NodeId::new([2u8; 32]);
+        let prefix: IpNet = "192.168.90.0/24".parse().unwrap();
+        state
+            .routes
+            .add_static(prefix, via, None, None, None, false, None, "test")
+            .unwrap();
+        let readd = state.clone();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/routes/lookup?dst=192.168.90.5")
+                    .header("authorization", "Bearer tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["matched"], true);
+        // Route ids are only exposed by the RIB view.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/routes?view=rib")
+                    .header("authorization", "Bearer tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rib: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = rib["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["prefix"] == "192.168.90.0/24")
+            .and_then(|route| route["id"].as_str())
+            .unwrap()
+            .to_string();
+
+        for uri in ["/v1/routes/explain?dst=192.168.90.5"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer tok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        // Unauthenticated reads are rejected when a token is configured.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/routes/lookup?dst=192.168.90.5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Delete by id first (later drain/reset remove the route).
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/routes/{id}"))
+                    .header("authorization", "Bearer tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Re-add the route for the remaining mutations.
+        readd
+            .routes
+            .add_static(prefix, via, None, None, None, false, None, "test")
+            .unwrap();
+        for (uri, body) in [
+            (
+                "/v1/routes/pin",
+                json!({"prefix": "192.168.90.0/24", "next_hop": via.to_string()}),
+            ),
+            ("/v1/routes/unpin", json!({"prefix": "192.168.90.0/24"})),
+            (
+                "/v1/routes/drain",
+                json!({"node": via.to_string(), "grace_secs": 0}),
+            ),
+            ("/v1/routes/reset", json!({"prefix": null})),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", "Bearer tok")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[tokio::test]
     async fn auth_required_when_token_set() {
         let app = router(state(Some("secret")));
         let response = app

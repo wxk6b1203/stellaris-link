@@ -31,7 +31,7 @@ use stellaris_types::{
 use uuid::Uuid;
 
 use crate::controller_raft::{StateMachineStore, TypeConfig};
-use openraft::{Raft, ReadPolicy};
+use openraft::{BasicNode, Raft, ReadPolicy};
 
 use crate::controller_model::{ControllerCommand, ControllerModel, MemberRecord};
 
@@ -78,6 +78,7 @@ pub struct ControllerState {
     leader: Option<NodeId>,
     manifest_ttl: u64,
     lsa_ttl_secs: u64,
+    require_join_signature: bool,
     pub epoch: u64,
     generation: Arc<AtomicU64>,
 }
@@ -212,6 +213,12 @@ pub fn snapshot_signature(
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Sign an arbitrary payload with a node's Ed25519 identity key.
+pub fn sign_ed25519(secret: &[u8; 32], payload: &[u8]) -> String {
+    let key = SigningKey::from_bytes(secret);
+    hex::encode(key.sign(payload).to_bytes())
+}
+
 pub fn verify_ed25519(signer: NodeId, payload: &[u8], signature: &str) -> anyhow::Result<()> {
     let key = VerifyingKey::from_bytes(signer.as_bytes())?;
     let bytes = hex::decode(signature)?;
@@ -257,7 +264,13 @@ impl ControllerState {
             }
         }
         let loaded_lsas = link_state.len();
-        let epoch = config.control.epoch.unwrap_or_else(now_epoch);
+        // A replicated model must start deterministically: replicas only agree
+        // once the leader publishes a wall-clock epoch through Raft.
+        let epoch = match (config.control.raft_dir.is_some(), config.control.epoch) {
+            (_, Some(epoch)) => epoch,
+            (true, None) => 0,
+            (false, None) => now_epoch(),
+        };
         let mut grants = HashMap::new();
         for member in &config.control.members {
             let node: NodeId = member
@@ -330,6 +343,7 @@ impl ControllerState {
                 .context("control.leader_id")?,
             manifest_ttl: config.control.manifest_ttl_secs,
             lsa_ttl_secs: config.control.lsa_ttl_secs,
+            require_join_signature: config.control.require_join_signature,
             epoch,
             generation: Arc::new(AtomicU64::new(if loaded_lsas > 0 { 2 } else { 1 })),
         })
@@ -342,6 +356,10 @@ impl ControllerState {
     ) {
         self.raft = Some(raft);
         self.raft_store = Some(store);
+    }
+
+    fn config_require_join_signature(&self) -> bool {
+        self.require_join_signature
     }
 
     /// Record this controller's Raft node id (used for leader-only tasks).
@@ -1398,6 +1416,8 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/model", get(model))
         .route("/v1/revoke", post(revoke))
         .route("/v1/ack", post(ack))
+        .route("/v1/raft/learner", post(raft_add_learner))
+        .route("/v1/raft/membership", post(raft_change_membership))
         .with_state(state)
 }
 
@@ -1513,6 +1533,21 @@ struct JoinRequest {
     node_id: String,
     overlay_ip: String,
     token: String,
+    #[serde(default)]
+    nonce: String,
+    #[serde(default)]
+    signature: String,
+}
+
+/// Canonical bytes a joining node signs to prove it owns `node_id`.
+pub fn join_payload_bytes(
+    network: &str,
+    node: &str,
+    overlay_ip: &str,
+    token: &str,
+    nonce: &str,
+) -> Vec<u8> {
+    format!("stellaris-join-v1|{network}|{node}|{overlay_ip}|{token}|{nonce}").into_bytes()
 }
 
 async fn join(
@@ -1529,12 +1564,31 @@ async fn join(
             return (StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")).into_response();
         }
     };
-    let overlay = match req.overlay_ip.parse() {
+    let overlay: std::net::IpAddr = match req.overlay_ip.parse() {
         Ok(ip) => ip,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("invalid overlay_ip: {e}")).into_response();
         }
     };
+    if state.config_require_join_signature() {
+        if req.nonce.trim().is_empty() || req.signature.trim().is_empty() {
+            return (StatusCode::FORBIDDEN, "signed join required".to_string()).into_response();
+        }
+        let payload = join_payload_bytes(
+            &state.network.to_string(),
+            &node.to_string(),
+            &overlay.to_string(),
+            &req.token,
+            &req.nonce,
+        );
+        if let Err(error) = verify_ed25519(node, &payload, &req.signature) {
+            return (
+                StatusCode::FORBIDDEN,
+                format!("invalid join signature: {error}"),
+            )
+                .into_response();
+        }
+    }
     match state.join_current(node, overlay, &req.token).await {
         Ok(()) => {
             let model = state.model_current().await;
@@ -1605,6 +1659,93 @@ async fn ack(
     match state.ack_current(node, req.generation, req.epoch).await {
         Ok(()) => Json(json!({"acked": req.generation, "node": node.to_string()})).into_response(),
         Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LearnerRequest {
+    id: u64,
+    addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MembershipRequest {
+    voters: Vec<LearnerRequest>,
+}
+
+async fn raft_add_learner(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Json(req): Json<LearnerRequest>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(raft) = state.raft.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "raft is not enabled").into_response();
+    };
+    if req.id == 0 || req.addr.parse::<std::net::SocketAddr>().is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "id must be non-zero and addr must be a socket address",
+        )
+            .into_response();
+    }
+    match raft
+        .add_learner(req.id, BasicNode::new(req.addr.clone()), false)
+        .await
+    {
+        Ok(_) => Json(json!({"learner": req.id, "addr": req.addr})).into_response(),
+        Err(error) => {
+            (StatusCode::CONFLICT, format!("add_learner failed: {error}")).into_response()
+        }
+    }
+}
+
+async fn raft_change_membership(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Json(req): Json<MembershipRequest>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(raft) = state.raft.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "raft is not enabled").into_response();
+    };
+    let mut voters = std::collections::BTreeSet::new();
+    for voter in &req.voters {
+        if voter.id == 0 || voter.addr.parse::<std::net::SocketAddr>().is_err() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "voters need non-zero ids and socket addresses",
+            )
+                .into_response();
+        }
+        if !voters.insert(voter.id) {
+            return (StatusCode::BAD_REQUEST, "duplicate voter id").into_response();
+        }
+    }
+    if voters.is_empty() {
+        return (StatusCode::BAD_REQUEST, "voters must not be empty").into_response();
+    }
+    // Register the addresses first so the membership edit can resolve each
+    // voter to its Raft node, then replace the voter set in one joint step.
+    for voter in &req.voters {
+        if let Err(error) = raft
+            .add_learner(voter.id, BasicNode::new(voter.addr.clone()), false)
+            .await
+        {
+            tracing::debug!(%error, id = voter.id, "add_learner before membership change failed");
+        }
+    }
+    match raft.change_membership(voters, false).await {
+        Ok(_) => Json(json!({"voters": req.voters.len()})).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("change_membership failed: {error}"),
+        )
+            .into_response(),
     }
 }
 
@@ -2830,6 +2971,7 @@ cidr = "10.7.0.0/16"
 
 [control]
 secret = "s3cret"
+epoch = 3
 
 [[control.join_tokens]]
 token = "join"
@@ -2915,6 +3057,214 @@ epoch = 1
                 .iter()
                 .any(|m| m.node_id == node.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn raft_membership_endpoints_are_admin_only_and_validated() {
+        let state = state();
+        let app = router(state);
+        let learner = serde_json::json!({"id": 4, "addr": "127.0.0.1:5999"});
+        // No admin/member secret at all is unauthorized.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/raft/learner")
+                    .header("content-type", "application/json")
+                    .body(Body::from(learner.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Authenticated but no Raft instance in this state.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/raft/learner")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(learner.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bad = serde_json::json!({"id": 0, "addr": "nope"});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/raft/membership")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"voters": [bad]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn raft_learner_endpoint_accepts_a_dead_node_without_blocking() {
+        let mut leader_state = state();
+        let models = (0..3)
+            .map(|_| ControllerModel::new(leader_state.network, leader_state.epoch))
+            .collect();
+        let (rafts, stores) = crate::controller_raft::start_cluster(models).await.unwrap();
+        let mut leader = None;
+        for _ in 0..50 {
+            for (id, raft) in rafts.read().await.iter() {
+                if raft.current_leader().await == Some(*id) {
+                    leader = Some(*id);
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let leader = leader.expect("leader");
+        let raft = rafts.read().await.get(&leader).cloned().unwrap();
+        leader_state.set_raft(
+            Arc::new(raft.clone()),
+            stores[(leader - 1) as usize].clone(),
+        );
+        // The leader must commit a log of its own term before membership edits.
+        raft.client_write(ControllerCommand::SetEpoch { epoch: 1_000_000 })
+            .await
+            .unwrap();
+        let response = router(leader_state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/raft/learner")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": 4, "addr": "127.0.0.1:5999"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        if status != StatusCode::OK {
+            eprintln!(
+                "learner status={status} body={:?}",
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|b| String::from_utf8_lossy(&b.to_bytes()).to_string())
+            );
+            panic!("learner endpoint failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_join_is_enforced_when_configured() {
+        let network_id = "11111111-1111-4111-8111-111111111111";
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+id = "{network_id}"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+require_join_signature = true
+
+[[control.join_tokens]]
+token = "signed-join"
+prefixes = ["192.168.62.0/24"]
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let app = router(state);
+        let secret = [9u8; 32];
+        let key = SigningKey::from_bytes(&secret);
+        let node = NodeId::new(key.verifying_key().to_bytes());
+        let overlay = "10.7.0.9";
+        let nonce = "nonce-1";
+        let payload =
+            join_payload_bytes(network_id, &node.to_string(), overlay, "signed-join", nonce);
+        let signature = sign_ed25519(&secret, &payload);
+
+        let unsigned = serde_json::json!({
+            "node_id": node.to_string(),
+            "overlay_ip": overlay,
+            "token": "signed-join"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(unsigned.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let forged = serde_json::json!({
+            "node_id": node.to_string(),
+            "overlay_ip": overlay,
+            "token": "signed-join",
+            "nonce": nonce,
+            "signature": sign_ed25519(&[7u8; 32], &payload)
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(forged.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let signed = serde_json::json!({
+            "node_id": node.to_string(),
+            "overlay_ip": overlay,
+            "token": "signed-join",
+            "nonce": nonce,
+            "signature": signature
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(signed.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

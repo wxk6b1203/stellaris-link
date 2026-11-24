@@ -8,7 +8,10 @@ use stellaris_linkstate::Lsa;
 use crate::controller::Snapshot;
 
 pub const CONTROL_ALPN: &[u8] = b"stellaris/control/1";
-const MAX_FRAME: usize = 4 << 20;
+/// Control frames carry JSON snapshots. A single QUIC stream handles tens of
+/// megabytes, so the cap is raised well above the largest controller model we
+/// support; oversized frames fail with a clear error instead of hanging.
+pub(crate) const MAX_FRAME: usize = 64 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

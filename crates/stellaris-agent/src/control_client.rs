@@ -381,12 +381,23 @@ async fn try_join(
         tracing::warn!("join_token requires node.overlay_ip");
         return true;
     };
+    let nonce = uuid::Uuid::now_v7().to_string();
+    let payload = crate::controller::join_payload_bytes(
+        &state.network.to_string(),
+        &state.node_id.to_string(),
+        &overlay.to_string(),
+        token,
+        &nonce,
+    );
+    let signature = crate::controller::sign_ed25519(&state.identity_secret, &payload);
     let mut request = client
         .post(format!("{base}/v1/join"))
         .json(&serde_json::json!({
             "node_id": state.node_id.to_string(),
             "overlay_ip": overlay.to_string(),
             "token": token,
+            "nonce": nonce,
+            "signature": signature,
         }));
     if let Some(secret) = secret {
         request = request.header("x-stellaris-secret", secret);

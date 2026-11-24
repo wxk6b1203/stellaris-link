@@ -182,6 +182,11 @@ pub struct ControlConfig {
     /// when unset; setting it separates member and admin authority.
     #[serde(default)]
     pub admin_secret: Option<String>,
+    /// Require `/v1/join` requests to be signed by the joining node's key.
+    /// Disabled by default because HTTP/curl bootstrap scripts cannot sign;
+    /// enable it for agent-driven joins.
+    #[serde(default)]
+    pub require_join_signature: bool,
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
@@ -299,6 +304,7 @@ impl Default for ControlConfig {
             bind: None,
             secret: None,
             admin_secret: None,
+            require_join_signature: false,
             epoch: None,
             leader_id: None,
             previous_secrets: Vec::new(),
