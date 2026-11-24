@@ -423,7 +423,7 @@ iroh datagram recv
 ```
 
 - `ver=1`；`flags`：bit0=control，bit1=ECN，其余保留。
-- `network_hash`：`xxhash64(network_id)[..4]`；manifest 保证无碰撞（或启动时检测）。
+- `network_hash`：`SHA-256(network_id)[..4]`；manifest 保证无碰撞（或启动时检测）。
 - `flow_hash`：5 元组哈希，用于 ECMP/QoS；0 表示未计算。
 - `ttl`：默认 64；每跳减一；0 丢弃（可选 ICMP time exceeded）。
 - 头部固定 16 字节（4 字节字段 + 4 字节 network_hash + 4 字节 flow_hash + 4 字节 reserved）；`#[repr(C)]`，网络字节序。

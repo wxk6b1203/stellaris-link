@@ -313,7 +313,7 @@ ALPN: stellaris/data/1
 - 网络字节序；`ver=1`。
 - `flags`：bit0=control，bit1=ECN；其余 0。
 - `ttl`：默认 64；转发减一；0 丢弃。
-- `network_hash`：`xxhash64(network_id)` 低 32 位；manifest 启动时检测碰撞。
+- `network_hash`：`SHA-256(network_id)` 前 32 位（不再使用 xxhash64）；manifest 启动时检测碰撞。
 - `flow_hash`：5 元组哈希；0 表示未计算。
 - 最大 datagram = `HEADER(16) + IP packet`；MTU 由 `max_datagram_size()` 推导。
 

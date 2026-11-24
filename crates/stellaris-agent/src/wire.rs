@@ -57,9 +57,15 @@ impl MeshHeader {
     }
 }
 
+/// Stable 32-bit network discriminator carried in the mesh header.
+///
+/// Derived from a SHA-256 of the network UUID rather than raw UUID bytes: a
+/// UUIDv7 starts with a millisecond timestamp, so raw prefixes collide for
+/// networks created in the same ~65 s window.
 pub fn network_hash(network: NetworkId) -> u32 {
-    let bytes = network.0.as_bytes();
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(network.0.as_bytes());
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -641,6 +647,14 @@ mod tests {
         );
         assert_eq!(info.src_port, None);
     }
+    #[test]
+    fn network_hash_is_stable_and_discriminating() {
+        let a = NetworkId::new();
+        let b = NetworkId::new();
+        assert_eq!(network_hash(a), network_hash(a));
+        assert_ne!(network_hash(a), network_hash(b));
+    }
+
     #[test]
     fn fragments_hash_without_ports() {
         let mut first = vec![0u8; 40];
