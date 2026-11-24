@@ -365,7 +365,7 @@ md5 `9306484038210dce706ec406a41a71eb` 分发到其余 7 台。
 | 三地 >4MiB snapshot（重跑） | 临时编排 | ✅ 5.2 MiB 模型、2MiB 分块、中断后续传追平（generation 5103） |
 | 动态 membership 3→4 voter + learner 转正 | `scripts/test-real-raft-membership.sh` | ✅；1 follower 宕机仍可写 |
 | iroh 入口同步 >4MiB 模型 | `scripts/test-real-iroh-large-snapshot.sh` | ✅ 8 MiB 模型，member ACK |
-| relay 路径（禁用 discovery 强制 relay） | `transport` 单测 | ✅ 数据确实经 relay；relay 真正 shutdown 后 60s 未迁移（failover 未实现） |
+| relay 故障重连（禁用 discovery 强制 relay） | `transport` 单测 | ✅ shutdown 承载流量的 relay 后数据改走第二个 relay（约 60s） |
 
 state-ha 关键输出：
 
@@ -407,10 +407,10 @@ WAN loss rerun: initial leader=1 under loss; new leader=3 after 4.6s;
 failover snapshot ok; OK
 ```
 
-relay failover 的否定证据（本轮新增）：用 `clear_address_lookup` 强制 relay-only、
-真正 `shutdown()` 第一个 relay 后，60s 内第二个 relay 没有收到数据，
-`send_datagram` 开始失败，peer 仍显示 connected。说明当前**没有**自动迁移到第二个 relay；
-单测已改为断言“经 relay 传输”，failover 留作后续。
+relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-only，先确认数据经
+某个 relay，再 `shutdown()` 该 relay；重连地址现已包含全部 `transport.relay_urls`，
+连接关闭后会经第二个 relay 重建，数据恢复（实测约 60s，受 QUIC idle timeout 限制）。
+多 relay 同时承载/秒级切换仍未实现。
 
 ### 3.12 仍未验证### 3.12 仍未验证### 3.11 仍未验证
 

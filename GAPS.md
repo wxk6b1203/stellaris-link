@@ -236,7 +236,7 @@ iroh 入口走 Raft、Raft RPC 鉴权/超时/checksum、routes/LSA TTL/epoch 入
 签名 join、admin secret 分权、snapshot/manifest 默认 fail-closed、动态 membership 接口、
 配置 no-op 报错、route TTL、QoS 校验对称。
 
-仍开放：relay 自动 failover（已确认未实现）、持续慢链路 60s TTL、
+仍开放：relay 秒级切换/多 relay 同时承载（现为旧连接关闭后重连，约 60s）、持续慢链路 60s TTL、
 大模型写入/追赶的 O(n²) 持久化、真 multipath、应用层重组、真实互联网 PMTUD、macOS NAT。
 （动态 membership 3→4 与 iroh 8 MiB 快照已在 2026-11-24 晚验证通过。）
 

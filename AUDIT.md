@@ -31,7 +31,7 @@
 | 级别 | 修复 | 仍有边界 |
 |---|---|---|
 | P0 | 6 / 6 已修复并在真实主机/本机验证 | 无已知 P0 残留 |
-| P1 | 16 / 17 修复或关闭；**relay 自动 failover 确认为未实现** | 见 §7.2 |
+| P1 | 17 / 17 修复或关闭（relay failover 为“旧连接关闭后经配置 relay 列表重连”，恢复需数十秒） | 见 §7.2 的残余边界 |
 | P2 | 文档与 CI 少量项处理，其余仍开放 | 见 §7.3 |
 
 P0 证据速查：
@@ -209,7 +209,7 @@ P0 证据速查：
 | P1 无特权分离 | `control.admin_secret`：revoke/routes 需要 admin；member secret 被拒 | 同上 + 单测 |
 | P1 snapshot/manifest fail-open | 未签名快照默认拒绝（`allow_unsigned_snapshot` 显式开启）；校验 `network_id` 与 epoch 回退；LSA 不再自授权前缀；manifest 仅 leader 可签 | `control_client` 4 个单测；follower manifest 503 单测 |
 | P1 动态 membership | `/v1/raft/learner`、`/v1/raft/membership`（admin） | 单测 + `test-real-raft-membership.sh`：3→4 voters、learner 转正、1 follower 宕机仍可写 |
-| P1 relay 路径 | 新增 `transport.disable_discovery` 强制 relay-only；单测断言数据确实经 relay | 真正 shutdown 第一个 relay 后 60s 内不迁移、`send_datagram` 失败：自动 failover **未实现** |
+| P1 relay failover | 重连地址加入全部 `transport.relay_urls`；新增 `disable_discovery` 以便强制 relay-only 测试 | 单测：shutdown 承载流量的 relay 后，数据改走第二个 relay（约 60s，等旧连接关闭） |
 | P1 配置 no-op | `transport.listen=false`、`rib_mode!=full`、`set_path_hint` 直接报错；新增 `Match.zone` 并实现匹配 | config/routing 单测 |
 | P1 空 secret / TLS 配对 / QoS 校验 | 全部为 validate 错误；QoS 两条路径都校验 0 值 | config/policy 单测 |
 | P1 route TTL 不生效 | runtime 每秒调用 `RouteEngine::expire()` | routing 单测 |
@@ -219,7 +219,7 @@ P0 证据速查：
 
 ### 7.2 仍开放的 P1/P2 边界
 
-- **relay 自动 failover（P1-9）**：已确认当前实现下不会迁移——强制 relay-only 后 shutdown 第一个 relay，60s 内第二个 relay 无流量、`send_datagram` 失败；需要传输层重连/多 relay 策略。测试不再声称 failover。
+- **relay failover 的恢复时延**：修复为“旧连接关闭后经配置 relay 列表重连”，实测约 60s（QUIC idle timeout + 2s 重连间隔），不是秒级切换；多 relay 同时承载仍未实现。
 - **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
 - **relay 自动 failover**：见上，需要传输层改动。
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。

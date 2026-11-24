@@ -130,7 +130,7 @@ routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、snapshot/manifest f
 动态 membership 接口、配置 no-op、route TTL、QoS 校验、CLI/API/discovery 测试。
 
 下一步（按优先级）：
-1. relay 路径选择/多 relay：现有测试只断言 relay 消失后连接不断；需要自建双 relay + 注入验证实际切换。
+1. relay 切换时延/多 relay：现在是旧连接关闭后经配置列表重连（约 60s），需要 QUIC 层多路径/更快失败检测。
 2. 持续慢链路下 60s transfer TTL / 大快照续传。
 3. 大模型写入/追赶性能：每次 apply 重写整份 raft JSON，5k 条约 10 分钟。
 4. 真 multipath、应用层 fragment reassembly、真实互联网 PMTUD、macOS NAT、打包/CI 矩阵。

@@ -126,7 +126,7 @@ Raft 保证“副本一致”，不保证“写入合法”。所以先做：
 
 1. 真 multipath（双 direct/双 relay 同时承载、按 RTT/丢包调度、去重）
 2. 应用层 fragment reassembly / 完整 PMTUD 状态机
-3. relay 路径选择验证（现有测试只断言 relay 消失后不断线）
+3. relay 切换时延（现为重连，约 60s；未做多 relay 同时承载）
 4. 持续慢链路 TTL、大模型写入/追赶的 O(n²) 持久化
 5. 磁盘慢 IO/撕裂写注入、公网 NAT 矩阵、Windows/macOS NAT、打包/service/tracing
 
