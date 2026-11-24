@@ -1,6 +1,6 @@
-# 能力与测试审计（2026-11-23）
+# 能力与测试审计（2026-11-23，2026-11-24 更新）
 
-> 关联：[README.md](README.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、[TEST-RESULTS.md](TEST-RESULTS.md)
+> 关联：[AUDIT.md](AUDIT.md)（2026-11-24 静态审计，未实现/未验证/文档不一致的完整清单）、[README.md](README.md)、[PLAN.md](PLAN.md)、[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、[TEST-RESULTS.md](TEST-RESULTS.md)
 
 本文只记录**已验证**、**未验证**和**代码未实现**的内容，避免把设计/演示当成生产结论。
 
@@ -34,7 +34,7 @@
 ```text
 cargo fmt --check                                          ✅
 cargo clippy --all-targets -- -D warnings                  ✅
-cargo test                                                 112 passed
+cargo test                                                 118 passed
 ```
 
 覆盖：
@@ -225,8 +225,9 @@ PMTUD：
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。
-- agent 客户端重启/整集群滚动重启后的 snapshot 续传未验证。
-- 动态 Raft membership、WAN 丢包/抖动、large snapshot 跨 WAN 未验证。
+- agent 客户端重启后的 snapshot 续传未验证（controller 侧 + 整集群滚动后的续传已在 TEST-RESULTS §3.10 验证）。
+- 动态 Raft membership 未实现（不是"未验证"）；WAN 丢包/大 snapshot 已测单次，未做 soak。
+- 2026-11-24 审计发现：iroh 控制入口绕过 Raft、`POST /v1/routes` 不进 Raft、Raft 模式 LSA TTL 不执行、epoch 不复制、Raft RPC 可无鉴权等，详见 [AUDIT.md](AUDIT.md)。
 
 ### 4.4 平台/运维
 

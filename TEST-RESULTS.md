@@ -220,7 +220,7 @@ ELECTION_MS=1000 ./scripts/test-controller-raft-3node.sh
 # OK: 3-controller raft TLS join/LSA/snapshot works.
 ```
 
-未验证：真实三地用 TOML 复跑滚动重启（当前无测试主机）；WAN 丢包/抖动下的选举稳定性。
+真实三地用 TOML 复跑滚动重启见 §3.8；WAN 丢包/时延下的选举见 §3.9。
 
 ### 3.8 三地 TOML 滚动重启：通过（2026-11-24）
 
@@ -282,6 +282,10 @@ H1=... H2=... H3=... ./scripts/test-real-wan-loss-ha.sh
 边界：只验证了"单次 leader 故障 + 20% 丢包"；没有做长时间 soak，也没有在
 丢包下测滚动重启和 >4MiB snapshot（见 §3.10）。
 
+证据等级说明：本脚本最初只做日志输出、`OK` 无条件打印；2026-11-24 审计后已改为
+`curl -fsS` + 逐项失败退出（`scripts/test-real-wan-loss-ha.sh`），但加固版没有在
+主机释放前复跑。上面记录的是当时观察到的 leader 切换/LSA/snapshot 输出。
+
 ### 3.10 >4MiB snapshot 跨 WAN：通过（含中断续传）
 
 做法：三 controller 正常起（TOML 1000ms），停掉 ctrl3，从 leader 本机并发写入
@@ -323,6 +327,10 @@ LSA 把状态推进到 generation 5402，再清空 ctrl3 并限速启动：
 机制：`begin` 按 `total+checksum` 幂等，返回已收 `received`，sender 从该 offset
 继续；上面的 2097152 字节（正好一个 2MiB chunk）在进程重启前后保持一致，随后
 安装完成并继续追日志。
+
+证据等级：本节是**手工编排**（5100 条 LSA 生成、netem 限速、中断/重启都是临时
+命令），仓库里没有对应脚本，换环境不能一键复现；要固化成
+`scripts/test-real-wan-snapshot-ha.sh` 才算回归证据。
 
 仍未验证：
 
