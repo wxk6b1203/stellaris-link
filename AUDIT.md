@@ -215,7 +215,7 @@ P0 证据速查：
 | P1 route TTL 不生效 | runtime 每秒调用 `RouteEngine::expire()` | routing 单测 |
 | P1 iroh 4 MiB 上限 | 控制帧上限提高到 64 MiB | `test-real-iroh-large-snapshot.sh`：8 MiB 模型经 iroh-only member 同步并 ACK |
 | P1 LSA 过期洪泛 | 新增批量 `ExpireLsas`，每轮一条 Raft 写 | 模型单测；修复了 5100 条 LSA 同时过期导致复制/追赶被拖慢的问题 |
-| P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 152 |
+| P1 零测试模块 | 新增 control_client/discovery/CLI/路由 API/成员接口测试 | 测试数 118 -> 153 |
 
 ### 7.2 仍开放的 P1/P2 边界
 
