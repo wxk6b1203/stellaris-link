@@ -83,13 +83,13 @@
 
 - 三地滚动重启用 TOML 复跑通过（`status.raft.source=config`）。
 - 20% 丢包 + 50ms 单向时延下，leader 故障后 3.6s 选出新 leader，写/LSA/snapshot 正常。
-- 5.57 MiB 模型走 2MiB 分块 snapshot 传输；2mbit 限速中断后部分数据保留（2097152 字节，重启前后一致）；全速重跑安装成功（follower generation 追平 leader）。
+- 5.57 MiB 模型走 2MiB 分块 snapshot 传输；2mbit 限速中断后部分数据保留（2097152 字节，重启前后一致）；恢复链路后**续传完成**并继续追日志，follower 与 leader 都到 generation 5402。
 
 仍需：
 
-- 限速中断后的"续传到完成"没观察到（90s 窗口 + 后续复测被编排问题打断），需要单独实验；
-- 60s transfer TTL 在 2mbit 级慢链路上是否够用，需要和上面一起验证；
-- 丢包/抖动下的滚动重启与 >4MiB snapshot；
+- 60s transfer TTL 在持续 2mbit 级慢链路上是否够用（本轮续传是重启后恢复链路完成，没有在持续慢链路上压到 TTL）；
+- 丢包/抖动叠加慢链路时的大 snapshot；
+- 丢包/抖动下的滚动重启；
 - 长时间 soak。
 
 资源需求（本轮无测试主机，只记录待开）：

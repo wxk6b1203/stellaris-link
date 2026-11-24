@@ -193,7 +193,7 @@ PMTUD：
 | 应用层 fragment reassembly | ❌ | 2000-byte ping 依赖目的端 Linux 内核重组；agent 没有重组缓存 |
 | 公网 NAT/安全组 | ⚠️ | 批1↔批2、深圳↔上海公网 direct/relay 已测；public exit NAT 云上未测 |
 | 磁盘满/撕裂写 | ⚠️ | ENOSPC→503、撕裂 log 启动失败已验证；慢 IO/fsync 未注入 |
-| snapshot 跨进程续传 | ⚠️ | controller HTTP 重启 + sender 重新 begin 续传已实现/单测；真实三地 >4MiB（5.57 MiB）分块传输+全速安装通过；限速中断后"续传到完成"未观察 |
+| snapshot 跨进程续传 | ✅ | 真实三地 5.57 MiB 分块传输；限速中断（保留 2097152 字节）→ 重启 → 续传安装完成 → 日志追平（gen 5402）；持续慢链路下 TTL 未验证 |
 | 真实物理跨地域 | ✅ | 深圳↔上海 25 ms TUN overlay 已测 |
 | Docker 测试复跑 | ⚠️ | Docker pull/容器内 agent 手测通过；标准 Dockerfile apt 构建未完成 |
 | macOS NAT/pf、Windows | ❌ | 只有 Linux NAT |
@@ -221,7 +221,7 @@ PMTUD：
 
 - **三地滚动重启已通过**：openraft 默认 150ms election timeout 对跨地域 vote RPC 太短；已把选举超时产品化为 `control.raft_election_timeout_ms`，跨地域默认 1000ms（2000ms/250ms）。2026-11-24 在成都/深圳/上海新主机上用 TOML（`source=config`）复跑滚动重启通过。
 - **WAN 丢包/时延**：只对 controller 间流量注入 20% 丢包 + 50ms 单向时延（RTT ~136ms），leader 故障后 3.6s 选出新 leader，写和 snapshot 正常；未做 soak。
-- **大 snapshot 跨 WAN**：5.57 MiB 模型走 2MiB 分块传输；限速中断后部分数据在重启后保留；全速重跑安装成功。限速中断后的续传完成未观察。
+- **大 snapshot 跨 WAN**：5.57 MiB 模型走 2MiB 分块传输；限速中断后部分数据（2097152 字节）在重启后保留，重启并恢复链路后续传安装完成，日志追平 leader（generation 5402）。持续 2mbit 慢链路下 60s TTL 是否够用未验证。
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。

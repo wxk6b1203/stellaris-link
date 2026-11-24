@@ -305,16 +305,35 @@ leader generation=5102
 全速重跑后 ctrl3 追平：`ctrl3 generation=5102`，即 5.84MB 的 Raft snapshot 在
 三地公网上通过分块路径完成传输和安装。
 
-未完成/未验证：
+**中断后续传到完成：通过（复测）**。为拿到"续传完成"的证据，先写 300 条小
+LSA 把状态推进到 generation 5402，再清空 ctrl3 并限速启动：
 
-- 限速 + 中断之后"续传到完成"没有在 90s 窗口内看到；随后一次复测被编排脚本
-  自身 `pkill` 误杀和 ctrl3 未进入 snapshot 路径打断，因此不能写成通过。
-- 60s transfer TTL 与 2mbit 级慢链路是否冲突，需要单独实验（这正是
-  [FOLLOWUP.md](FOLLOWUP.md) 里"transfer TTL 与滚动重启窗口协调"那条）。
+```text
+[13:23:12] throttle leader->ctrl3, wipe ctrl3 raft dir, restart ctrl3
+[13:23:27] partial=2097152
+[13:23:28] killed mid-transfer, partial before restart=2097152
+[13:23:30] partial after restart=2097152
+[13:23:37] ctrl3 gen after resume=5102      # snapshot 安装完成（leader 5402）
+后续日志复制：5182 -> 5245 -> 5296 -> 5350 -> 5402   # 追平 leader
+```
+
+收尾状态：`n3/raft/raft-state.json=5920027`、`raft-log.json=103038`（snapshot 后
+已 purge）、`snapshot-transfers` 目录清空。
+
+机制：`begin` 按 `total+checksum` 幂等，返回已收 `received`，sender 从该 offset
+继续；上面的 2097152 字节（正好一个 2MiB chunk）在进程重启前后保持一致，随后
+安装完成并继续追日志。
+
+仍未验证：
+
+- 这次续传是在重启后**恢复链路**的情况下完成的；持续 2mbit 慢链路上 60s
+  transfer TTL 是否够用，没有单独验证（对应 [FOLLOWUP.md](FOLLOWUP.md) 里
+  "transfer TTL 与滚动重启窗口协调"）。
+- 丢包/抖动叠加慢链路时的大 snapshot 没有测。
 
 ### 3.11 仍未验证
 
-- snapshot 传输中断后 **续传到完成**（§3.10 只验证了部分数据和全速安装）
+- 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot
 - 长时间 soak / 性能
 - 磁盘慢 IO / fsync 失败注入
