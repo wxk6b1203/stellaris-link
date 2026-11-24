@@ -10,6 +10,9 @@ trap cleanup EXIT
 SECRET="controller-secret"
 RAFT_SECRET="raft-secret"
 NODE="0101010101010101010101010101010101010101010101010101010101010101"
+# This lab runs on loopback, so use the configurable floor explicitly instead of
+# the cross-region default (1000 ms). The script asserts the value is applied.
+ELECTION_MS="${ELECTION_MS:-300}"
 for i in 1 2 3; do
   mkdir -p "$TMP/n$i/raft" "$TMP/n$i/state"
   BOOT=false; [[ "$i" == 1 ]] && BOOT=true
@@ -32,6 +35,7 @@ raft_id = $i
 raft_bind = "127.0.0.1:4780$i"
 raft_secret = "$RAFT_SECRET"
 raft_bootstrap = $BOOT
+raft_election_timeout_ms = $ELECTION_MS
 
 [[control.raft_peers]]
 id = 1
@@ -64,6 +68,55 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 [[ -n "${L:-}" ]] || { echo "FAIL: no leader" >&2; for i in 1 2 3; do echo "--- n$i"; tail -20 "$TMP/n$i.log"; done; exit 1; }
+# The configured TOML value must be the one Raft actually runs with.
+read -r T_MIN T_MAX T_HB T_SRC < <(status "$L" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("raft") or {}; print(r.get("election_timeout_min_ms"), r.get("election_timeout_max_ms"), r.get("heartbeat_interval_ms"), r.get("source"))')
+WANT="$ELECTION_MS $((ELECTION_MS * 2)) $((ELECTION_MS / 4)) config"
+[[ "$T_MIN $T_MAX $T_HB $T_SRC" == "$WANT" ]] || {
+  echo "FAIL: status raft timing '$T_MIN $T_MAX $T_HB $T_SRC', want '$WANT'" >&2; exit 1; }
+for i in 1 2 3; do
+  grep -q "raft election timing" "$TMP/n$i.log" || { echo "FAIL: n$i did not log raft timing" >&2; exit 1; }
+done
+echo "raft timing ok: min=${T_MIN}ms max=${T_MAX}ms heartbeat=${T_HB}ms source=$T_SRC"
+# Out-of-range values are rejected at config load, not silently clamped.
+BAD_DIR="$TMP/bad"; mkdir -p "$BAD_DIR/state"
+cp "$TMP/n1.toml" "$BAD_DIR/bad.toml"
+sed -i.bak "s/^raft_election_timeout_ms = .*/raft_election_timeout_ms = 10/" "$BAD_DIR/bad.toml"
+if "$BIN" --config "$BAD_DIR/bad.toml" >"$BAD_DIR/bad.log" 2>&1; then
+  echo "FAIL: out-of-range raft_election_timeout_ms was accepted" >&2; exit 1
+fi
+grep -q "raft_election_timeout_ms must be between" "$BAD_DIR/bad.log" || {
+  echo "FAIL: unexpected error for out-of-range timing:" >&2; cat "$BAD_DIR/bad.log" >&2; exit 1; }
+echo "invalid timing rejected: $(grep -o 'control.raft_election_timeout_ms must be between.*' "$BAD_DIR/bad.log" | head -1)"
+# Omitting the key must resolve to the cross-region default (1000/2000/250).
+DEF="$TMP/default"; mkdir -p "$DEF/state" "$DEF/raft"
+cat > "$DEF/default.toml" <<TOML
+[node]
+name = "c-default"
+role = "controller"
+state_dir = "$DEF/state"
+overlay_ip = "10.8.0.1"
+
+[network]
+name = "raft-default"
+cidr = "10.8.0.0/16"
+
+[control]
+bind = "127.0.0.1:47799"
+secret = "$SECRET"
+raft_dir = "$DEF/raft"
+raft_id = 1
+raft_bind = "127.0.0.1:47798"
+raft_secret = "$RAFT_SECRET"
+raft_bootstrap = true
+TOML
+RUST_LOG=info "$BIN" --config "$DEF/default.toml" >"$DEF/default.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 100); do grep -q "controller raft enabled" "$DEF/default.log" 2>/dev/null && break; sleep 0.1; done
+grep -q "election_timeout_min_ms=1000" "$DEF/default.log" || {
+  echo "FAIL: cross-region default timing not applied" >&2; cat "$DEF/default.log" >&2; exit 1; }
+grep -q 'timing_source="default-cross-region"' "$DEF/default.log" || {
+  echo "FAIL: cross-region default timing source not reported" >&2; exit 1; }
+echo "default timing ok: min=1000ms max=2000ms heartbeat=250ms source=default-cross-region"
 # join and LSA on the leader
 JOIN=$(python3 - <<'PY'
 import json

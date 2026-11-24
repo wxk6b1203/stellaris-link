@@ -25,8 +25,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use stellaris_linkstate::{LinkStateDb, Lsa};
 use stellaris_types::{
-    Config, ControllerMemberConfig, JoinTokenConfig, NetworkId, NodeId, RouteEntry, RouteId,
-    RouteSource, RouteState,
+    Config, ControllerMemberConfig, JoinTokenConfig, NetworkId, NodeId, RaftTiming, RouteEntry,
+    RouteId, RouteSource, RouteState,
 };
 use uuid::Uuid;
 
@@ -70,6 +70,7 @@ pub struct ControllerState {
     signer: Option<NodeId>,
     raft: Option<Arc<Raft<TypeConfig, StateMachineStore>>>,
     raft_store: Option<StateMachineStore>,
+    raft_timing: Option<RaftTiming>,
     leader: Option<NodeId>,
     manifest_ttl: u64,
     pub epoch: u64,
@@ -311,6 +312,7 @@ impl ControllerState {
             signer: None,
             raft: None,
             raft_store: None,
+            raft_timing: None,
             leader: config
                 .control
                 .leader_id
@@ -331,6 +333,15 @@ impl ControllerState {
     ) {
         self.raft = Some(raft);
         self.raft_store = Some(store);
+    }
+
+    /// Record the Raft election timing this controller runs with, for status.
+    pub fn set_raft_timing(&mut self, timing: RaftTiming) {
+        self.raft_timing = Some(timing);
+    }
+
+    pub fn raft_timing(&self) -> Option<RaftTiming> {
+        self.raft_timing
     }
 
     pub fn set_signing_key(&mut self, secret: [u8; 32]) {
@@ -1245,6 +1256,12 @@ async fn status(State(state): State<ControllerState>, headers: HeaderMap) -> Res
         "acks": model.acks.len(),
         "leader": state.leader_hint().await,
         "join_config_hash": state.join_config_hash(),
+        "raft": state.raft_timing().map(|timing| json!({
+            "election_timeout_min_ms": timing.election_timeout_min_ms,
+            "election_timeout_max_ms": timing.election_timeout_max_ms,
+            "heartbeat_interval_ms": timing.heartbeat_interval_ms,
+            "source": timing.source.as_str(),
+        })),
     }))
     .into_response()
 }
@@ -1466,6 +1483,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(raft_dir) = &config.control.raft_dir {
         let dir = PathBuf::from(raft_dir);
         std::fs::create_dir_all(&dir)?;
+        let timing = crate::controller_raft::resolve_raft_timing(&config.control);
         let model = ControllerModel::new(state.network, state.epoch);
         let id = config.control.raft_id.unwrap_or(1);
         let bind: SocketAddr = config
@@ -1512,6 +1530,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 Some(dir.clone()),
                 config.control.raft_secret.clone(),
                 config.control.raft_bootstrap,
+                timing,
                 tls,
             )
             .await?
@@ -1524,10 +1543,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 Some(dir.clone()),
                 config.control.raft_secret.clone(),
                 config.control.raft_bootstrap,
+                timing,
             )
             .await?
         };
-        tracing::info!(dir = %dir.display(), id, addr = %node.address, "controller raft enabled");
+        tracing::info!(
+            dir = %dir.display(),
+            id,
+            addr = %node.address,
+            election_timeout_min_ms = timing.election_timeout_min_ms,
+            election_timeout_max_ms = timing.election_timeout_max_ms,
+            heartbeat_interval_ms = timing.heartbeat_interval_ms,
+            timing_source = timing.source.as_str(),
+            "controller raft enabled"
+        );
+        state.set_raft_timing(timing);
         state.set_raft(Arc::new(node.raft), node.store);
         let publish_state = state.clone();
         tokio::spawn(async move {

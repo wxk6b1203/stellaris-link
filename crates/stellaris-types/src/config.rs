@@ -77,6 +77,93 @@ pub struct RaftPeerConfig {
     pub addr: String,
 }
 
+/// Default minimum Raft election timeout, sized for the supported three-region
+/// controller topology (Shenzhen / Shanghai / Chengdu).
+///
+/// openraft's default of 150 ms is too short for vote RPCs that cross regions:
+/// the real three-region rolling restart failed with
+/// `timeout after 150ms when Vote` until this value was raised. 1000 ms is the
+/// value that made that rolling restart pass, so it is the default here.
+pub const DEFAULT_RAFT_ELECTION_TIMEOUT_MS: u64 = 1000;
+
+/// Lower bound for `control.raft_election_timeout_ms`.
+///
+/// Below this the derived heartbeat (`min / 4`) and the openraft validation
+/// rule `heartbeat_interval < election_timeout_min` leave no room for RPC
+/// jitter, so a smaller value buys nothing.
+pub const MIN_RAFT_ELECTION_TIMEOUT_MS: u64 = 50;
+
+/// Upper bound for `control.raft_election_timeout_ms`.
+///
+/// Beyond a minute a wedged leader keeps serving reads for too long and a
+/// crashed controller stalls the control plane for over two minutes.
+pub const MAX_RAFT_ELECTION_TIMEOUT_MS: u64 = 60_000;
+
+/// Resolved openraft election/heartbeat timing.
+///
+/// Derived from `control.raft_election_timeout_ms`, or from the cross-region
+/// default when that key is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftTiming {
+    /// `election_timeout_min` handed to openraft.
+    pub election_timeout_min_ms: u64,
+    /// `election_timeout_max`, always twice the minimum.
+    pub election_timeout_max_ms: u64,
+    /// `heartbeat_interval`, always a quarter of the minimum.
+    pub heartbeat_interval_ms: u64,
+    /// Where the minimum came from.
+    pub source: RaftTimingSource,
+}
+
+/// Origin of the effective Raft election timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RaftTimingSource {
+    /// No explicit value: [`DEFAULT_RAFT_ELECTION_TIMEOUT_MS`].
+    #[serde(rename = "default-cross-region")]
+    DefaultCrossRegion,
+    /// `control.raft_election_timeout_ms`.
+    #[serde(rename = "config")]
+    Config,
+    /// Deprecated `STELLARIS_RAFT_ELECTION_TIMEOUT_MS` environment override.
+    #[serde(rename = "env")]
+    Env,
+}
+
+impl RaftTimingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DefaultCrossRegion => "default-cross-region",
+            Self::Config => "config",
+            Self::Env => "env",
+        }
+    }
+}
+
+impl RaftTiming {
+    /// Derive max timeout and heartbeat from a minimum election timeout.
+    ///
+    /// The minimum is clamped to the supported range so that the derived
+    /// values always satisfy openraft's `validate()` rules.
+    pub fn from_min(min_ms: u64, source: RaftTimingSource) -> Self {
+        let min = min_ms.clamp(MIN_RAFT_ELECTION_TIMEOUT_MS, MAX_RAFT_ELECTION_TIMEOUT_MS);
+        Self {
+            election_timeout_min_ms: min,
+            election_timeout_max_ms: min.saturating_mul(2),
+            heartbeat_interval_ms: (min / 4).max(10),
+            source,
+        }
+    }
+}
+
+impl Default for RaftTiming {
+    fn default() -> Self {
+        Self::from_min(
+            DEFAULT_RAFT_ELECTION_TIMEOUT_MS,
+            RaftTimingSource::DefaultCrossRegion,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlConfig {
     /// Controller base URL for members (MVP: HTTP).
@@ -118,6 +205,14 @@ pub struct ControlConfig {
     /// Initialize a pristine cluster with the configured peers.
     #[serde(default)]
     pub raft_bootstrap: bool,
+    /// Minimum Raft election timeout in milliseconds.
+    ///
+    /// The maximum timeout is twice this value and the leader heartbeat is a
+    /// quarter of it. When omitted the cross-region default
+    /// [`DEFAULT_RAFT_ELECTION_TIMEOUT_MS`] is used, because the openraft
+    /// default (150 ms) is too short for vote RPCs between regions.
+    #[serde(default)]
+    pub raft_election_timeout_ms: Option<u64>,
     /// Raft internal HTTPS certificate/key.
     #[serde(default)]
     pub raft_tls_cert: Option<String>,
@@ -200,6 +295,7 @@ impl Default for ControlConfig {
             raft_peers: Vec::new(),
             raft_secret: None,
             raft_bootstrap: false,
+            raft_election_timeout_ms: None,
             raft_tls_cert: None,
             raft_tls_key: None,
             raft_tls_ca: None,
@@ -222,6 +318,19 @@ impl Default for ControlConfig {
             iroh_port: None,
             endpoint_id: None,
             addrs: Vec::new(),
+        }
+    }
+}
+
+impl ControlConfig {
+    /// Effective Raft election timing.
+    ///
+    /// Explicit `raft_election_timeout_ms` wins; otherwise the cross-region
+    /// default applies. The value is validated by [`Config::validate`].
+    pub fn raft_timing(&self) -> RaftTiming {
+        match self.raft_election_timeout_ms {
+            Some(min) => RaftTiming::from_min(min, RaftTimingSource::Config),
+            None => RaftTiming::default(),
         }
     }
 }
@@ -554,6 +663,14 @@ impl Config {
                 "control.manifest_ttl_secs must be > 0".into(),
             ));
         }
+        if let Some(min) = self.control.raft_election_timeout_ms
+            && !(MIN_RAFT_ELECTION_TIMEOUT_MS..=MAX_RAFT_ELECTION_TIMEOUT_MS).contains(&min)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "control.raft_election_timeout_ms must be between \
+                 {MIN_RAFT_ELECTION_TIMEOUT_MS} and {MAX_RAFT_ELECTION_TIMEOUT_MS} ms (got {min})"
+            )));
+        }
         for key in &self.control.controller_keys {
             key.parse::<NodeId>()
                 .map_err(|e| ConfigError::Invalid(format!("control.controller_keys: {e}")))?;
@@ -848,6 +965,82 @@ cidr = "10.7.0.0/16"
         assert_eq!(
             config.network.id.unwrap().to_string(),
             "11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    const RAFT_BASE: &str = r#"
+[node]
+name = "c"
+role = "controller"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[control]
+raft_dir = "/tmp/stellaris-raft-timing-test"
+"#;
+
+    #[test]
+    fn raft_election_timeout_defaults_to_cross_region_value() {
+        let config = Config::from_toml(RAFT_BASE).unwrap();
+        let timing = config.control.raft_timing();
+        assert_eq!(timing.election_timeout_min_ms, 1000);
+        assert_eq!(timing.election_timeout_max_ms, 2000);
+        assert_eq!(timing.heartbeat_interval_ms, 250);
+        assert_eq!(timing.source, RaftTimingSource::DefaultCrossRegion);
+        assert_eq!(timing, RaftTiming::default());
+    }
+
+    #[test]
+    fn raft_election_timeout_is_configurable_in_toml() {
+        let toml = format!("{RAFT_BASE}raft_election_timeout_ms = 300\n");
+        let config = Config::from_toml(&toml).unwrap();
+        let timing = config.control.raft_timing();
+        assert_eq!(timing.election_timeout_min_ms, 300);
+        assert_eq!(timing.election_timeout_max_ms, 600);
+        assert_eq!(timing.heartbeat_interval_ms, 75);
+        assert_eq!(timing.source, RaftTimingSource::Config);
+    }
+
+    #[test]
+    fn raft_election_timeout_out_of_range_is_rejected() {
+        for value in [0u64, 10, 49, 60_001] {
+            let toml = format!("{RAFT_BASE}raft_election_timeout_ms = {value}\n");
+            let error = Config::from_toml(&toml).unwrap_err().to_string();
+            assert!(
+                error.contains("raft_election_timeout_ms"),
+                "value {value}: {error}"
+            );
+        }
+        for value in [MIN_RAFT_ELECTION_TIMEOUT_MS, MAX_RAFT_ELECTION_TIMEOUT_MS] {
+            let toml = format!("{RAFT_BASE}raft_election_timeout_ms = {value}\n");
+            assert!(Config::from_toml(&toml).is_ok(), "value {value}");
+        }
+    }
+
+    #[test]
+    fn raft_timing_derivation_keeps_openraft_invariants() {
+        for min in [
+            MIN_RAFT_ELECTION_TIMEOUT_MS,
+            150,
+            1000,
+            MAX_RAFT_ELECTION_TIMEOUT_MS,
+        ] {
+            let timing = RaftTiming::from_min(min, RaftTimingSource::Config);
+            assert!(timing.heartbeat_interval_ms < timing.election_timeout_min_ms);
+            assert!(timing.election_timeout_min_ms < timing.election_timeout_max_ms);
+            assert_eq!(
+                timing.election_timeout_max_ms,
+                timing.election_timeout_min_ms * 2
+            );
+        }
+        // Clamped below and above, so a stray value can never reach openraft.
+        assert_eq!(
+            RaftTiming::from_min(1, RaftTimingSource::Env).election_timeout_min_ms,
+            MIN_RAFT_ELECTION_TIMEOUT_MS
+        );
+        assert_eq!(
+            RaftTiming::from_min(u64::MAX, RaftTimingSource::Env).election_timeout_min_ms,
+            MAX_RAFT_ELECTION_TIMEOUT_MS
         );
     }
 }

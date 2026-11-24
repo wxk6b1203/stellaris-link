@@ -9,7 +9,8 @@ pub mod util;
 
 pub use config::{
     ApiConfig, AuthMode, Config, ControlConfig, ControllerMemberConfig, DataplaneConfig,
-    JoinTokenConfig, NetworkAuthConfig, NetworkConfig, NodeConfig, PeerConfig, RoutingConfig,
+    JoinTokenConfig, MAX_RAFT_ELECTION_TIMEOUT_MS, MIN_RAFT_ELECTION_TIMEOUT_MS, NetworkAuthConfig,
+    NetworkConfig, NodeConfig, PeerConfig, RaftTiming, RaftTimingSource, RoutingConfig,
     StaticRouteConfig, TransportConfig,
 };
 pub use error::{ConfigError, NodeIdParseError};

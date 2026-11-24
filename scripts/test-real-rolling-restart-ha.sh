@@ -6,6 +6,8 @@ IP1="${H1##*@}"; IP2="${H2##*@}"; IP3="${H3##*@}"
 BIN="${BIN:-/opt/stellaris/stellaris-controller}"
 DIR="${DIR:-/opt/stellaris/rolling-ha}"
 SECRET="controller-secret"; RAFT_SECRET="raft-secret"
+# Written into each controller TOML as control.raft_election_timeout_ms, which
+# defaults to the cross-region value (1000 ms) when omitted.
 ELECTION_MS="${ELECTION_MS:-1000}"
 NODE="0101010101010101010101010101010101010101010101010101010101010101"
 C_PORT=5801; R_PORT=5701
@@ -40,6 +42,7 @@ raft_id = $((i+1))
 raft_bind = "0.0.0.0:$R_PORT"
 raft_secret = "$RAFT_SECRET"
 raft_bootstrap = $boot
+raft_election_timeout_ms = $ELECTION_MS
 raft_tls_cert = "$DIR/tls/server.pem"
 raft_tls_key = "$DIR/tls/server-key.pem"
 raft_tls_ca = "$DIR/tls/ca.pem"
@@ -60,10 +63,10 @@ token = "join-roll"
 prefixes = ["192.168.251.0/24"]
 TOML
   scp -q -o BatchMode=yes "$TMP/ctrl$((i+1)).toml" "${hosts[$i]}:$DIR/ctrl$((i+1)).toml"
-  ssh -o BatchMode=yes "${hosts[$i]}" "mkdir -p $DIR/n$((i+1))/state $DIR/n$((i+1))/raft; cd $DIR; STELLARIS_RAFT_ELECTION_TIMEOUT_MS=$ELECTION_MS nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"
+  ssh -o BatchMode=yes "${hosts[$i]}" "mkdir -p $DIR/n$((i+1))/state $DIR/n$((i+1))/raft; cd $DIR; nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"
 done
 status(){ ssh -o BatchMode=yes "${hosts[$1]}" "curl -fsS --max-time 3 -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/status'"; }
-start_node(){ local i=$1; ssh -o BatchMode=yes "${hosts[$i]}" "cd $DIR; STELLARIS_RAFT_ELECTION_TIMEOUT_MS=$ELECTION_MS nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"; }
+start_node(){ local i=$1; ssh -o BatchMode=yes "${hosts[$i]}" "cd $DIR; nohup $BIN --config ctrl$((i+1)).toml > ctrl$((i+1)).log 2>&1 & echo \$! > ctrl$((i+1)).pid"; }
 find_leader(){ L=""; for _ in $(seq 1 120); do for i in 0 1 2; do if status "$i" >/dev/null 2>&1; then L=$(status "$i" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("leader") or "")'); [[ -n "$L" ]] && return 0; fi; done; sleep 0.5; done; return 1; }
 snapshot_ok(){ local i=$1; ssh -o BatchMode=yes "${hosts[$i]}" "curl -fsS -H 'x-stellaris-secret: $SECRET' 'http://127.0.0.1:$C_PORT/v1/snapshot?node=$NODE'" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("snapshot members ok")'; }
 wait_all(){ for _ in $(seq 1 120); do local ok=1; for j in 0 1 2; do status "$j" >/dev/null 2>&1 || ok=0; done; [[ "$ok" == 1 ]] && return 0; sleep 0.5; done; return 1; }
@@ -72,6 +75,14 @@ LSA1='{"origin":"010101010101010101010101010101010101010101010101010101010101010
 JOIN='{"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.247.0.10","token":"join-roll"}'
 find_leader || { echo "FAIL: no initial leader" >&2; exit 1; }
 echo "initial leader=$L"
+TIMING=$(status "$((L-1))" | python3 -c 'import json,sys; r=(json.load(sys.stdin).get("raft") or {}); print(r.get("election_timeout_min_ms"), r.get("source"))')
+[[ "$TIMING" == "$ELECTION_MS config" ]] || {
+  echo "FAIL: raft timing '$TIMING', want '$ELECTION_MS config'" >&2; exit 1; }
+for i in 0 1 2; do
+  ssh -o BatchMode=yes "${hosts[$i]}" "grep -q 'raft election timing' $DIR/ctrl$((i+1)).log" || {
+    echo "FAIL: ctrl$((i+1)) did not log raft timing" >&2; exit 1; }
+done
+echo "raft timing ok: ${TIMING%% *}ms source=${TIMING##* }"
 ssh -o BatchMode=yes "${hosts[$((L-1))]}" "curl -fsS -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$JOIN' 'http://127.0.0.1:$C_PORT/v1/join'" >/dev/null
 ssh -o BatchMode=yes "${hosts[$((L-1))]}" "curl -fsS -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$LSA1' 'http://127.0.0.1:$C_PORT/v1/lsa'" >/dev/null
 snapshot_ok "$((L-1))"

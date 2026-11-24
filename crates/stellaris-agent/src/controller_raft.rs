@@ -32,6 +32,10 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::controller_model::{ControllerCommand, ControllerModel};
+use stellaris_types::{
+    ControlConfig, MAX_RAFT_ELECTION_TIMEOUT_MS, MIN_RAFT_ELECTION_TIMEOUT_MS, RaftTiming,
+    RaftTimingSource,
+};
 
 openraft::declare_raft_types!(
     pub TypeConfig:
@@ -1303,8 +1307,11 @@ pub struct HttpRaftNode {
     pub store: StateMachineStore,
     pub server: tokio::task::JoinHandle<()>,
     pub address: std::net::SocketAddr,
+    /// Timing the Raft instance was started with, for status reporting.
+    pub timing: RaftTiming,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_http_node(
     model: ControllerModel,
     id: u64,
@@ -1313,6 +1320,7 @@ pub async fn start_http_node(
     dir: Option<PathBuf>,
     secret: Option<String>,
     bootstrap: bool,
+    timing: RaftTiming,
 ) -> anyhow::Result<HttpRaftNode> {
     start_http_node_at(
         model,
@@ -1322,7 +1330,8 @@ pub async fn start_http_node(
         dir,
         secret,
         bootstrap,
-        Arc::new(openraft::Config::default().validate()?),
+        openraft::Config::default(),
+        timing,
         None,
     )
     .await
@@ -1337,6 +1346,7 @@ pub async fn start_http_node_tls(
     dir: Option<PathBuf>,
     secret: Option<String>,
     bootstrap: bool,
+    timing: RaftTiming,
     tls: RaftTlsConfig,
 ) -> anyhow::Result<HttpRaftNode> {
     start_http_node_at(
@@ -1347,7 +1357,8 @@ pub async fn start_http_node_tls(
         dir,
         secret,
         bootstrap,
-        Arc::new(openraft::Config::default().validate()?),
+        openraft::Config::default(),
+        timing,
         Some(tls),
     )
     .await
@@ -1363,6 +1374,7 @@ pub async fn start_http_node_with_snapshot_policy(
     secret: Option<String>,
     bootstrap: bool,
     snapshot_logs: u64,
+    timing: RaftTiming,
 ) -> anyhow::Result<HttpRaftNode> {
     let config = openraft::Config {
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_logs),
@@ -1370,15 +1382,7 @@ pub async fn start_http_node_with_snapshot_policy(
         ..Default::default()
     };
     start_http_node_at(
-        model,
-        id,
-        bind,
-        peers,
-        dir,
-        secret,
-        bootstrap,
-        Arc::new(config.validate()?),
-        None,
+        model, id, bind, peers, dir, secret, bootstrap, config, timing, None,
     )
     .await
 }
@@ -1418,34 +1422,72 @@ async fn raft_server_config(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn raft_timing_config(config: Arc<openraft::Config>) -> Arc<openraft::Config> {
-    let Ok(raw) = std::env::var("STELLARIS_RAFT_ELECTION_TIMEOUT_MS") else {
-        return config;
-    };
-    let Ok(min) = raw.parse::<u64>() else {
-        tracing::warn!(value = %raw, "invalid STELLARIS_RAFT_ELECTION_TIMEOUT_MS");
-        return config;
-    };
-    let min = min.max(50);
-    let mut adjusted = (*config).clone();
-    adjusted.election_timeout_min = min;
-    adjusted.election_timeout_max = min.saturating_mul(2);
-    adjusted.heartbeat_interval = (min / 4).max(10);
-    match adjusted.validate() {
-        Ok(config) => {
-            tracing::info!(
-                election_timeout_min = min,
-                election_timeout_max = min.saturating_mul(2),
-                "adjusted raft election timing"
-            );
-            Arc::new(config)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "adjusting raft election timing failed");
-            config
-        }
+/// Environment variable that used to be the only way to widen the Raft
+/// election timeout. Kept as a deprecated override for existing test scripts.
+pub const RAFT_ELECTION_TIMEOUT_ENV: &str = "STELLARIS_RAFT_ELECTION_TIMEOUT_MS";
+
+/// Effective Raft timing for a controller: TOML config first, then the
+/// deprecated environment override, then the cross-region default.
+pub fn resolve_raft_timing(control: &ControlConfig) -> RaftTiming {
+    let configured = control.raft_timing();
+    match std::env::var(RAFT_ELECTION_TIMEOUT_ENV) {
+        Ok(raw) => apply_env_timing(configured, Some(raw.as_str())),
+        Err(_) => configured,
     }
+}
+
+fn apply_env_timing(configured: RaftTiming, raw: Option<&str>) -> RaftTiming {
+    let Some(raw) = raw else {
+        return configured;
+    };
+    if configured.source == RaftTimingSource::Config {
+        tracing::warn!(
+            env = RAFT_ELECTION_TIMEOUT_ENV,
+            "deprecated env override ignored; control.raft_election_timeout_ms is set"
+        );
+        return configured;
+    }
+    let Ok(min) = raw.trim().parse::<u64>() else {
+        tracing::warn!(value = %raw, env = RAFT_ELECTION_TIMEOUT_ENV, "invalid election timeout override");
+        return configured;
+    };
+    if !(MIN_RAFT_ELECTION_TIMEOUT_MS..=MAX_RAFT_ELECTION_TIMEOUT_MS).contains(&min) {
+        tracing::warn!(
+            value = min,
+            min = MIN_RAFT_ELECTION_TIMEOUT_MS,
+            max = MAX_RAFT_ELECTION_TIMEOUT_MS,
+            "out-of-range election timeout override ignored"
+        );
+        return configured;
+    }
+    tracing::warn!(
+        env = RAFT_ELECTION_TIMEOUT_ENV,
+        election_timeout_min_ms = min,
+        "deprecated env override applied; set control.raft_election_timeout_ms instead"
+    );
+    RaftTiming::from_min(min, RaftTimingSource::Env)
+}
+
+/// Apply the resolved timing to a base openraft config and validate the result.
+fn apply_raft_timing(
+    config: openraft::Config,
+    timing: RaftTiming,
+) -> anyhow::Result<Arc<openraft::Config>> {
+    let mut adjusted = config;
+    adjusted.election_timeout_min = timing.election_timeout_min_ms;
+    adjusted.election_timeout_max = timing.election_timeout_max_ms;
+    adjusted.heartbeat_interval = timing.heartbeat_interval_ms;
+    let config = adjusted
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid raft election timing: {e}"))?;
+    tracing::info!(
+        election_timeout_min_ms = timing.election_timeout_min_ms,
+        election_timeout_max_ms = timing.election_timeout_max_ms,
+        heartbeat_interval_ms = timing.heartbeat_interval_ms,
+        source = timing.source.as_str(),
+        "raft election timing"
+    );
+    Ok(Arc::new(config))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1457,10 +1499,11 @@ async fn start_http_node_at(
     dir: Option<PathBuf>,
     secret: Option<String>,
     bootstrap: bool,
-    config: Arc<openraft::Config>,
+    config: openraft::Config,
+    timing: RaftTiming,
     tls: Option<RaftTlsConfig>,
 ) -> anyhow::Result<HttpRaftNode> {
-    let config = raft_timing_config(config);
+    let config = apply_raft_timing(config, timing)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
     let address = peers
@@ -1512,6 +1555,7 @@ async fn start_http_node_at(
         store,
         server,
         address,
+        timing,
     })
 }
 
@@ -1626,6 +1670,41 @@ fn http_factory(
 mod tests {
     use super::*;
     use stellaris_types::{NetworkId, NodeId};
+
+    /// Keep unit tests fast: explicit 150 ms floor instead of the 1000 ms
+    /// cross-region default.
+    fn test_timing() -> RaftTiming {
+        RaftTiming::from_min(150, RaftTimingSource::Config)
+    }
+
+    #[test]
+    fn env_variable_is_a_deprecated_fallback_only() {
+        let default = RaftTiming::default();
+        let from_env = apply_env_timing(default, Some("1200"));
+        assert_eq!(from_env.source, RaftTimingSource::Env);
+        assert_eq!(from_env.election_timeout_min_ms, 1200);
+        assert_eq!(from_env.election_timeout_max_ms, 2400);
+        assert_eq!(from_env.heartbeat_interval_ms, 300);
+
+        // TOML wins over the environment.
+        let configured = RaftTiming::from_min(300, RaftTimingSource::Config);
+        assert_eq!(apply_env_timing(configured, Some("1200")), configured);
+
+        // Invalid and out-of-range values are ignored, not clamped silently.
+        assert_eq!(apply_env_timing(default, Some("nope")), default);
+        assert_eq!(apply_env_timing(default, Some("1")), default);
+        assert_eq!(apply_env_timing(default, Some("")), default);
+        assert_eq!(apply_env_timing(default, None), default);
+    }
+
+    #[test]
+    fn applied_timing_lands_in_openraft_config() {
+        let timing = RaftTiming::from_min(1000, RaftTimingSource::Config);
+        let config = apply_raft_timing(openraft::Config::default(), timing).unwrap();
+        assert_eq!(config.election_timeout_min, 1000);
+        assert_eq!(config.election_timeout_max, 2000);
+        assert_eq!(config.heartbeat_interval, 250);
+    }
 
     #[tokio::test]
     async fn three_node_raft_commits_to_all_replicas() {
@@ -1761,6 +1840,7 @@ mod tests {
             Some(dir.clone()),
             Some("secret".into()),
             false,
+            test_timing(),
         )
         .await
         .unwrap();
@@ -1829,6 +1909,7 @@ mod tests {
             Some(dir.clone()),
             Some("secret".into()),
             false,
+            test_timing(),
         )
         .await
         .unwrap();
@@ -1883,6 +1964,7 @@ mod tests {
             None,
             Some("secret".into()),
             false,
+            test_timing(),
         )
         .await
         .unwrap();
@@ -1980,6 +2062,7 @@ mod tests {
             None,
             Some("secret".into()),
             false,
+            test_timing(),
         )
         .await
         .unwrap();
@@ -2066,6 +2149,7 @@ mod tests {
             None,
             Some("secret".into()),
             false,
+            test_timing(),
         )
         .await
         .unwrap();
@@ -2195,6 +2279,7 @@ mod tests {
                 None,
                 Some("secret".into()),
                 i == 0,
+                test_timing(),
             )
             .await
             .unwrap();
@@ -2274,6 +2359,7 @@ mod tests {
                     Some("secret".into()),
                     i == 0,
                     2,
+                    test_timing(),
                 )
                 .await
                 .unwrap(),
@@ -2331,6 +2417,7 @@ mod tests {
             Some("secret".into()),
             false,
             2,
+            test_timing(),
         )
         .await
         .unwrap();
