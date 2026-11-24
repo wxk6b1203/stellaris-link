@@ -18,4 +18,4 @@ jobs:
       - run: cargo test
       - run: cargo build --bins
       - run: ./scripts/test-tls.sh
-      - run: BIN=target/debug/stellaris-agent ./scripts/test-docker-mdns.sh
+      - run: BIN="$PWD/target/debug/stellaris-agent" ./scripts/test-docker-mdns.sh
