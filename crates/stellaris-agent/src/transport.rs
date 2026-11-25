@@ -1112,4 +1112,136 @@ cidr = "10.8.0.0/16"
         drop(server);
         let _ = std::fs::remove_dir_all(base);
     }
+
+    /// Manual spike: can one iroh 1.5 connection keep two relay paths and
+    /// migrate when one relay dies? Run with:
+    /// `cargo test -p stellaris-agent --lib multipath_spike -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "manual iroh multipath spike"]
+    async fn multipath_spike_two_relays() {
+        use futures::StreamExt;
+        use iroh::endpoint::Connection;
+        use std::time::Instant;
+
+        async fn probe(conn: &Connection) -> bool {
+            match conn.open_bi().await {
+                Ok((mut send, _recv)) => send.write_all(b"spike").await.is_ok(),
+                Err(_) => false,
+            }
+        }
+
+        fn dump(conn: &Connection, label: &str) {
+            let paths = conn.paths();
+            println!("SPIKE {label}: paths={}", paths.len());
+            for path in paths.iter() {
+                println!(
+                    "SPIKE {label}: selected={} addr={:?}",
+                    path.is_selected(),
+                    path.remote_addr()
+                );
+            }
+        }
+
+        let (relay1, url1) = start_relay().await;
+        let (relay2, url2) = start_relay().await;
+        let relays: Vec<RelayUrl> = vec![url1.parse().unwrap(), url2.parse().unwrap()];
+        let mk = |secret: [u8; 32], bind: Option<&str>| {
+            let mut builder = Endpoint::builder(presets::N0)
+                .secret_key(SecretKey::from_bytes(&secret))
+                .relay_mode(RelayMode::custom(relays.clone()))
+                .clear_address_lookup()
+                .alpns(vec![b"multipath-spike".to_vec()]);
+            if let Some(addr) = bind {
+                builder = builder
+                    .bind_addr(addr.parse::<std::net::SocketAddr>().unwrap())
+                    .unwrap();
+            }
+            builder
+        };
+        let bind_a = std::env::var("SPIKE_BIND_A").ok();
+        let bind_b = std::env::var("SPIKE_BIND_B").ok();
+        let a = mk([21u8; 32], bind_a.as_deref()).bind().await.unwrap();
+        let b = mk([22u8; 32], bind_b.as_deref()).bind().await.unwrap();
+        let b_id = b.id();
+        let b2 = b.clone();
+        let accept = tokio::spawn(async move {
+            let incoming = b2.accept().await.unwrap();
+            incoming.accept().unwrap().await.unwrap()
+        });
+        let addrs = vec![
+            TransportAddr::Relay(relays[0].clone()),
+            TransportAddr::Relay(relays[1].clone()),
+        ];
+        println!("SPIKE connect: addrs={addrs:?}");
+        let conn = a
+            .connect(EndpointAddr::from_parts(b_id, addrs), b"multipath-spike")
+            .await
+            .unwrap();
+        let _server_conn = accept.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        dump(&conn, "after-connect");
+        println!("SPIKE probe before kill: {}", probe(&conn).await);
+
+        let selected_relay = conn.paths().iter().find_map(|path| {
+            if path.is_selected()
+                && let TransportAddr::Relay(url) = path.remote_addr()
+            {
+                Some(url.clone())
+            } else {
+                None
+            }
+        });
+        let kill_first = selected_relay.as_ref() == Some(&relays[0]);
+        println!("SPIKE selected relay={selected_relay:?} kill_first={kill_first}");
+        let mut r1 = Some(relay1);
+        let mut r2 = Some(relay2);
+        if kill_first {
+            r1.take().unwrap().shutdown().await.unwrap();
+        } else {
+            r2.take().unwrap().shutdown().await.unwrap();
+        }
+        let start = Instant::now();
+        let mut first_ok = None;
+        let mut events = conn.path_events();
+        loop {
+            if first_ok.is_none() && probe(&conn).await {
+                first_ok = Some(start.elapsed());
+            }
+            match tokio::time::timeout(Duration::from_millis(500), events.next()).await {
+                Ok(Some(event)) => {
+                    let kind = match &event {
+                        iroh::endpoint::PathEvent::Opened { remote_addr, .. } => {
+                            format!("opened {remote_addr:?}")
+                        }
+                        iroh::endpoint::PathEvent::Closed { remote_addr, .. } => {
+                            format!("closed {remote_addr:?}")
+                        }
+                        iroh::endpoint::PathEvent::Selected { remote_addr, .. } => {
+                            format!("selected {remote_addr:?}")
+                        }
+                        iroh::endpoint::PathEvent::Lagged { missed, .. } => {
+                            format!("lagged {missed}")
+                        }
+                        _ => "other".to_string(),
+                    };
+                    println!("SPIKE event at {:?}: {kind}", start.elapsed());
+                }
+                Ok(None) => {
+                    println!("SPIKE event stream ended at {:?}", start.elapsed());
+                    break;
+                }
+                Err(_) => {}
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                break;
+            }
+        }
+        dump(&conn, "after-kill");
+        println!("SPIKE first successful stream after relay1 kill: {first_ok:?}");
+        conn.close(0u8.into(), b"spike done");
+        a.close().await;
+        b.close().await;
+        drop(r1);
+        drop(r2);
+    }
 }

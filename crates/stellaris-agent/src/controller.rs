@@ -33,6 +33,7 @@ use crate::credential::{MembershipCredential, SignedCredential};
 use uuid::Uuid;
 
 use crate::controller_raft::{StateMachineStore, TypeConfig};
+use openraft::async_runtime::WatchReceiver;
 use openraft::{BasicNode, Raft, ReadPolicy};
 
 use crate::controller_model::{ControllerCommand, ControllerModel, MemberRecord};
@@ -1514,6 +1515,9 @@ fn make_route(
 
 pub fn router(state: ControllerState) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(controller_metrics))
         .route("/v1/status", get(status))
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/routes", post(add_route))
@@ -1913,6 +1917,92 @@ async fn status(State(state): State<ControllerState>, headers: HeaderMap) -> Res
         })),
     }))
     .into_response()
+}
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+async fn readyz(State(state): State<ControllerState>) -> Response {
+    let ready = state
+        .raft
+        .as_ref()
+        .map(|raft| raft.metrics().borrow_watched().running_state.is_ok())
+        .unwrap_or(true);
+    if ready {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response()
+    }
+}
+
+async fn controller_metrics(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
+    if !state.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let model = state.model_current().await;
+    let raft = state
+        .raft
+        .as_ref()
+        .map(|raft| (*raft.metrics().borrow_watched()).clone());
+    let (raft_enabled, is_leader, term, last_log, last_applied) = match &raft {
+        Some(metrics) => (
+            1,
+            u8::from(metrics.current_leader == state.raft_id),
+            metrics.current_term,
+            metrics.last_log_index.unwrap_or(0),
+            metrics.last_applied.map(|id| id.index()).unwrap_or(0),
+        ),
+        None => (0, 0, 0, 0, 0),
+    };
+    let body = format!(
+        "# HELP stellaris_controller_up Controller process is serving.\n\
+# TYPE stellaris_controller_up gauge\n\
+stellaris_controller_up 1\n\
+# TYPE stellaris_controller_generation gauge\n\
+stellaris_controller_generation {}\n\
+# TYPE stellaris_controller_epoch gauge\n\
+stellaris_controller_epoch {}\n\
+# TYPE stellaris_controller_members gauge\n\
+stellaris_controller_members {}\n\
+# TYPE stellaris_controller_lsas gauge\n\
+stellaris_controller_lsas {}\n\
+# TYPE stellaris_controller_routes gauge\n\
+stellaris_controller_routes {}\n\
+# TYPE stellaris_controller_pools gauge\n\
+stellaris_controller_pools {}\n\
+# TYPE stellaris_controller_leases gauge\n\
+stellaris_controller_leases {}\n\
+# TYPE stellaris_controller_pending_admissions gauge\n\
+stellaris_controller_pending_admissions {}\n\
+# TYPE stellaris_controller_revoked gauge\n\
+stellaris_controller_revoked {}\n\
+# TYPE stellaris_controller_raft_enabled gauge\n\
+stellaris_controller_raft_enabled {}\n\
+# TYPE stellaris_controller_raft_is_leader gauge\n\
+stellaris_controller_raft_is_leader {}\n\
+# TYPE stellaris_controller_raft_term gauge\n\
+stellaris_controller_raft_term {}\n\
+# TYPE stellaris_controller_raft_last_log_index gauge\n\
+stellaris_controller_raft_last_log_index {}\n\
+# TYPE stellaris_controller_raft_last_applied gauge\n\
+stellaris_controller_raft_last_applied {}\n",
+        model.generation,
+        model.epoch,
+        model.members.len(),
+        model.lsas.len(),
+        model.routes.len(),
+        model.pools.len(),
+        model.leases.len(),
+        model.pending_admissions.len(),
+        model.revoked.len(),
+        raft_enabled,
+        is_leader,
+        term,
+        last_log,
+        last_applied,
+    );
+    ([("content-type", "text/plain; version=0.0.4")], body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -4575,5 +4665,52 @@ lease_secs = 600"#,
                 .0,
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn health_ready_and_metrics_endpoints() {
+        let app = router(state());
+        for uri in ["/healthz", "/readyz"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for needle in [
+            "stellaris_controller_up 1",
+            "stellaris_controller_generation",
+            "stellaris_controller_members",
+            "stellaris_controller_raft_enabled",
+        ] {
+            assert!(text.contains(needle), "missing {needle}:\n{text}");
+        }
     }
 }

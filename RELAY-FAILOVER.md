@@ -109,6 +109,28 @@ connect 超时/重试 + 重新握手。
 - 若答案是否/不稳定：不做 D，Phase 2 改做 C（双连接热备），并在文档记录原因。
 - 若 iroh 版本升级后 API 变化，重新评估。
 
+### 5.1 2026-11-26 spike 结果（本机 10.0.10.42，两个本地 iroh-relay）
+
+测试：`cargo test -p stellaris-agent --lib multipath_spike_two_relays -- --ignored --nocapture`
+（测试代码保留在 `transport.rs`，手动运行；同一台主机，先阻断 IPv4/IPv6 direct，仅留 relay）。
+
+| 场景 | 观察 |
+|---|---|
+| 两个 relay 地址参与 `EndpointAddr` | 建立 **1 条 relay 路径**，没有第二条 relay 路径 |
+| 允许 direct | `paths=2`：一条 relay + 一条 direct，direct 被选中 |
+| 阻断 direct（IPv4+IPv6） | `paths=1`，只有一条 relay 路径 |
+| kill 当前 relay | 测试里 `Server::shutdown()` 后路径仍在（测试装置未能真正断流）；不能作为产品 failover 证据 |
+| API | `Connection::paths()` / `PathEvent` 只读；没有 `add_path`/`set_path`；多 relay 只是建连候选 |
+
+**结论**：
+
+- iroh 1.5 的 multipath 面向 **direct/NAT 地址**，不是“多条 relay 同时承载”。
+- 应用层无法把第二个 relay 加成同一连接的路径；relay 故障仍需要重新建连。
+- **D（真 relay multipath）暂不可行**，除非上游提供 API/实现；Phase 2 采用 **C（主/备双连接）**。
+- 现有 relay failover 测试失败的另一原因是 `iroh_relay::Server::shutdown()` 不能可靠切断
+  已建立的 relay 会话；Phase 0 改用 iptables/进程 kill 模拟真实故障。
+- TODO 更新：spike 完成；决策 C；Phase 2 按 C 设计。
+
 ---
 
 ## 6. 测试矩阵
@@ -141,13 +163,13 @@ connect 超时/重试 + 重新握手。
 
 ## 8. TODO
 
-- [ ] Phase 0：稳定复现 relay failover 测试，记录 60s 时间线
+- [ ] Phase 0：稳定复现 relay failover 测试（用 iptables/进程 kill，不用 Server::shutdown），记录 60s 时间线
 - [ ] Phase 0：relay/路径指标（active、switch_total、switch_seconds、rtt、lost）
 - [ ] Phase 1：relay 健康探测（1s/3 次失败）与恢复
 - [ ] Phase 1：并行竞速 + 候选轮换 + 优雅 drain
 - [ ] Phase 1：本地 2 relay 故障测试，验收 p95 < 5s
-- [ ] Spike：iroh multipath 双 relay 路径/自动迁移/MTU（时间盒 2 天）
-- [ ] 决策：D（multipath）或 C（双连接热备），记录依据
+- [x] Spike：iroh multipath 双 relay 路径/自动迁移/MTU（2026-11-26 完成，结论见 §5.1）
+- [x] 决策：C（双连接热备）；D 需要上游 multipath API（记录于 §5.1）
 - [ ] Phase 2：实现选中的方案，验收 p95 < 1s/丢包 ≤ 个位数
 - [ ] Phase 3：3+ relay 舰队、controller 下发、监控/容量
 - [ ] 真实 NAT 主机 + relay 故障回归，更新 TEST-RESULTS

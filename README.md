@@ -729,6 +729,24 @@ POST       /v1/ipam/allocate           {node, pool?, zone?}
 批量回收、revoke 释放并隔离、重复/池外静态地址被 409 拒绝。设计细节与限制见
 [IPAM.md](IPAM.md)。
 
+### 15. 控制面运维接口
+
+controller 的 `control.bind` 上新增：
+
+```text
+GET /healthz    # 存活探针，无需认证
+GET /readyz     # Raft 运行状态；异常返回 503
+GET /metrics    # Prometheus text，需要 x-stellaris-secret（member secret）
+```
+
+`/metrics` 暴露 generation/epoch、members、LSAs、routes、pools、leases、
+pending admissions、revoked，以及 Raft 的 enabled/is_leader/term/last_log_index/
+last_applied。示例：
+
+```bash
+curl -H "x-stellaris-secret: $SECRET" http://controller:5801/metrics
+```
+
 ## 已知限制
 
 - controller 已完成 openraft quorum/leader election/mTLS/snapshot/failover；member 入口仍是单 URL（可指向 LB/任一 controller）。旧 fanout 已移除。
