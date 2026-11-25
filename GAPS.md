@@ -241,6 +241,7 @@ iroh 入口走 Raft、Raft RPC 鉴权/超时/checksum、routes/LSA TTL/epoch 入
 仍开放：relay 秒级切换/多 relay 同时承载（现为旧连接关闭后重连，约 60s）、持续慢链路 60s TTL、
 真 multipath、真实互联网 PTB（云网络路径 MTU 均为 1500）、macOS NAT。
 （大状态持久化已改为分段追加日志 + 状态快照/WAL：5.1k LSA 从 5m50s 降到 16.4s，重启 0.14s。）
+relay 快速切换/多 relay 已规划（[RELAY-FAILOVER.md](RELAY-FAILOVER.md)），尚未实施；multipath 依赖 iroh spike。
 已完成：应用层分片重组、ACL ICMP reject、IPv6 最小 MTU、discovery 默认认证、relay_urls 校验、
 metrics/audit、systemd/CI 矩阵、签名审批入网。
 2026-11-25：入网进一步收敛为单一 controller 签名凭据（`MembershipCredential` + `/v1/enroll`），
