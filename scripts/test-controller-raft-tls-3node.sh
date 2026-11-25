@@ -62,8 +62,9 @@ addr = "127.0.0.1:48002"
 id = 3
 addr = "127.0.0.1:48003"
 
-[[control.join_tokens]]
-token = "join-tls"
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.7.0.20"
 prefixes = ["192.168.202.0/24"]
 TOML
   RUST_LOG=info "$BIN" --config "$TMP/n$i.toml" >"$TMP/n$i.log" 2>&1 &
@@ -81,12 +82,6 @@ for _ in $(seq 1 100); do
 done
 [[ -n "${L:-}" ]] || { echo "FAIL: no leader" >&2; for i in 1 2 3; do echo "--- n$i"; tail -30 "$TMP/n$i.log"; done; exit 1; }
 echo "tls leader=$L"
-JOIN=$(python3 - <<'PY'
-import json
-print(json.dumps({"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.7.0.20","token":"join-tls"}))
-PY
-)
-curl -fsS -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' -d "$JOIN" "http://127.0.0.1:4810$L/v1/join" >/dev/null
 LSA=$(python3 - <<'PY'
 import json
 print(json.dumps({"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":1,"zone":None,"links":[],"prefixes":[{"prefix":"192.168.202.0/24","metric":0}],"overlay_ip":"10.7.0.20","addrs":[]}))
@@ -95,4 +90,4 @@ PY
 curl -fsS -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' -d "$LSA" "http://127.0.0.1:4810$L/v1/lsa" >/dev/null
 sleep 1
 curl -fsS -H "x-stellaris-secret: $SECRET" "http://127.0.0.1:4810$L/v1/snapshot?node=$NODE" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("tls snapshot ok")'
-echo "OK: 3-controller raft TLS join/LSA/snapshot works."
+echo "OK: 3-controller raft TLS LSA/snapshot with a pre-registered member works."

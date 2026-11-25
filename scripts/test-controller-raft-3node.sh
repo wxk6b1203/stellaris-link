@@ -49,8 +49,9 @@ addr = "127.0.0.1:47802"
 id = 3
 addr = "127.0.0.1:47803"
 
-[[control.join_tokens]]
-token = "join-3node"
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.7.0.20"
 prefixes = ["192.168.200.0/24"]
 TOML
   RUST_LOG=info "$BIN" --config "$TMP/n$i.toml" >"$TMP/n$i.log" 2>&1 &
@@ -121,14 +122,7 @@ DEFAULT_TIMING=$(curl -fsS --max-time 3 -H "x-stellaris-secret: $SECRET" http://
   echo "FAIL: cross-region default timing not applied (status: $DEFAULT_TIMING)" >&2
   cat "$DEF/default.log" >&2; exit 1; }
 echo "default timing ok: min=1000ms max=2000ms heartbeat=250ms source=default-cross-region"
-# join and LSA on the leader
-JOIN=$(python3 - <<'PY'
-import json
-print(json.dumps({"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.7.0.20","token":"join-3node"}))
-PY
-)
-curl -fsS -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' \
-  -d "$JOIN" "http://127.0.0.1:4790$L/v1/join" >/dev/null
+# LSA on the leader (the member above is pre-registered)
 LSA=$(python3 - <<'PY'
 import json
 print(json.dumps({"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":1,"zone":None,"links":[],"prefixes":[{"prefix":"192.168.200.0/24","metric":0}],"overlay_ip":"10.7.0.20","addrs":[]}))
@@ -181,4 +175,4 @@ for _ in $(seq 1 100); do
 done
 [[ "$SEQ" == "2" ]] || { echo "FAIL: restarted leader did not catch up (seq=$SEQ)" >&2; exit 1; }
 echo "crash recovery ok"
-echo "OK: 3-controller raft join/LSA/snapshot/failover/crash-recovery works."
+echo "OK: 3-controller raft LSA/snapshot/failover/crash-recovery with a pre-registered member works."

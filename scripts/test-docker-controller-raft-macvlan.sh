@@ -66,8 +66,9 @@ addr = "$IP2:47802"
 id = 3
 addr = "$IP3:47803"
 
-[[control.join_tokens]]
-token = "join-macvlan"
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.7.0.20"
 prefixes = ["192.168.201.0/24"]
 TOML
 done
@@ -92,12 +93,6 @@ for _ in $(seq 1 100); do
   sleep 0.2
 done
 [[ -n "${L:-}" ]] || { echo "FAIL: no leader" >&2; for i in 1 2 3; do echo "--- c$i"; docker logs "ctrl$i" 2>&1 | tail -30; done; exit 1; }
-JOIN=$(python3 - <<'PY'
-import json
-print(json.dumps({"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.7.0.20","token":"join-macvlan"}))
-PY
-)
-req -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' -d "$JOIN" "http://${IPS[$((L-1))]}:4790$L/v1/join" >/dev/null
 LSA=$(python3 - <<'PY'
 import json
 print(json.dumps({"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":1,"zone":None,"links":[],"prefixes":[{"prefix":"192.168.201.0/24","metric":0}],"overlay_ip":"10.7.0.20","addrs":[]}))
@@ -143,4 +138,4 @@ for _ in $(seq 1 100); do
 done
 [[ "$SEQ" == "2" ]] || { echo "FAIL: old leader did not catch up seq=2 (seq=$SEQ)" >&2; exit 1; }
 echo "partition recovery ok"
-echo "OK: 3 macvlan controller raft join/LSA/snapshot/failover/partition-recovery works."
+echo "OK: 3 macvlan controller raft LSA/snapshot/failover/partition-recovery with a pre-registered member works."

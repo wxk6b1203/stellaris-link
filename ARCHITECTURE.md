@@ -653,7 +653,11 @@ Starting → Follower → Leader → Draining → Stopped
 详见 `PROTOCOL.md`。摘要：
 
 - ALPN `stellaris/control/1`；protobuf length-delimited。
-- `Hello` 认证：network/node/epoch/nonce/signature。
+- `Hello` 认证：network/node/epoch/nonce/signature（设计目标）。
+- **2026-11-25 实现**：数据面握手改为交换 controller 签名的 `MembershipCredential`
+  （network/node/overlay/prefixes/capabilities/revision/not_after），不再是共享 PSK；
+  controller 签发入口为 `POST /v1/enroll` 或 iroh `Request::Enroll`。详见
+  [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md)。
 - `SyncRequest/Snapshot/Delta`、`RouteIntent/RouteAck`、`Heartbeat/Revoke`。
 - 控制流与数据流分开 ALPN。
 - 0-RTT 禁用。

@@ -34,7 +34,7 @@
 | 能力 | 状态 | 主要缺口 |
 |---|---|---|
 | L3 overlay / TUN | 可用 | IPv4/IPv6；应用层重组/完整 PMTUD 未做；macOS NAT 未做 |
-| iroh 传输 | 可用 | direct/relay、relay failover、PSK 成员认证；multipath 强制测试待做 |
+| iroh 传输 | 可用 | direct/relay、relay failover、controller 凭据成员认证；multipath 强制测试待做 |
 | link-state/SPF | 可用 | UDP/mDNS discovery、static seed、controller；跨区拓扑优化待做 |
 | controller | 可用 | openraft 3 节点 + HTTP/mTLS + snapshot + failover |
 | ACL | 可用 | counters/审计/每规则命中已做；UI 待扩展 |
@@ -51,7 +51,7 @@
 
 | 优先级 | 项目 | 用户价值 | 不做的风险 | 工作量 | 依赖 | 建议 |
 |---|---|---|---|---|---|---|
-| **P0** | 身份/成员认证 + Hello | 高 | 任意 iroh peer 可注入 LSA/控制帧；共享 secret 泄露即全泄 | M | 无 | **完成：PSK/Ed25519/TLS/RBAC/轮换** |
+| **P0** | 身份/成员认证 + Hello | 高 | 任意 iroh peer 可注入 LSA/控制帧；共享 secret 泄露即全泄 | M | 无 | **完成：controller 签名凭据（2026-11-25 取代 PSK）** |
 | **P0** | 控制面授权/前缀 ownership | 高 | 恶意 member 广告任意前缀，劫持流量 | M | Hello | **完成：grant + LSA/dataplane 强制** |
 | **P0** | 真实 3 节点 TUN/LSA/controller 测试 | 高 | 单机 demo 通过≠真实网络通过；MTU/NAT/防火墙问题 | M | Linux x86 build | **TUN/LSA + controller 3 节点已通过** |
 | **P1** | bootstrap/discovery | 高 | 部署必须手填 controller URL/peer addrs | M | 无 | **完成：UDP broadcast + PSK** |
@@ -73,7 +73,7 @@
 当前实现的实际边界：
 
 - iroh 数据/控制连接接受任意 endpoint；数据面靠 anti-spoof 丢包，但**控制面 LSA 帧没有成员签名**。
-- member 与 controller 用 shared HMAC secret，不是 per-member key。
+- 历史：member 与 controller 曾用 shared HMAC secret；2026-11-25 起改为 controller 签名的 per-member 凭据。
 - member 没有 `Hello` 证明“我是这个 network 的合法节点”。
 - 路由写入没有前缀 ownership/角色校验；任何能调 API/控制面的主体可广告前缀。
 - HTTP API token 是可选的，默认没有 TLS。
@@ -89,7 +89,7 @@ Raft 保证“副本一致”，不保证“写入合法”。所以先做：
 1. member/controller Ed25519 身份 + `Hello` challenge/nonce。
 2. 控制帧签名/绑定 network+epoch。
 3. 前缀 ownership / `can_route` capability。
-4. controller snapshot 从 shared HMAC 迁移到 controller key 签名。
+4. controller snapshot 从 shared HMAC 迁移到 controller key 签名（成员侧已完成 membership credential）。
 5. API TLS/token/本地 socket 权限。
 
 ---

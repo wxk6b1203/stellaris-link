@@ -84,7 +84,8 @@
 - [x] mDNS/DNS-SD discovery（`_stellaris._udp.local.`），Linux netns 实测通过；真实局域网 browse/注册已验证；Docker bridge 双容器完整发现+PSK 通过。
 - [x] `transport.bind_ip`：TUN 场景绑定 underlay，避免 iroh underlay QUIC 走进 TUN。
 - [x] 事件驱动 OS route reconciler（watch + 30s fallback）。
-- [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。
+- [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。（PSK/join token 已于 2026-11-25 删除，见下一行）
+- [x] 2026-11-25：入网收敛为单一 controller 签名 `MembershipCredential`；`/v1/enroll`、`/v1/members/{node}/grants`、撤销断连、自动续签。
 - [x] join token 过期/撤销；旧 manifest threshold/多 controller 聚合已移除。
 - [ ] ACL/QoS 审计日志、复杂整形。
 - [ ] 完整 PMTUD 状态机、应用层 fragment reassembly、强制 multipath、磁盘满/撕裂写注入、Windows/macOS NAT。

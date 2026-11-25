@@ -24,9 +24,6 @@ overlay_ip="fd00:115::1"
 [network]
 name="exitnat6"
 cidr="fd00:115::/64"
-[network.auth]
-mode="psk"
-secret="exit6-secret"
 [transport]
 relay_urls=[]
 disable_relay=true
@@ -48,9 +45,6 @@ overlay_ip="fd00:115::2"
 [network]
 name="exitnat6"
 cidr="fd00:115::/64"
-[network.auth]
-mode="psk"
-secret="exit6-secret"
 [transport]
 relay_urls=[]
 disable_relay=true

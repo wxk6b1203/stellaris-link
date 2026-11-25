@@ -8,11 +8,10 @@ pub mod route;
 pub mod util;
 
 pub use config::{
-    AdmissionConfig, AdmissionMode, ApiConfig, AuthMode, Config, ControlConfig,
-    ControllerMemberConfig, DataplaneConfig, JoinTokenConfig, MAX_RAFT_ELECTION_TIMEOUT_MS,
-    MIN_RAFT_ELECTION_TIMEOUT_MS, NetworkAuthConfig, NetworkConfig, NodeConfig, PeerConfig,
-    RaftTiming, RaftTimingSource, RelayModeConfig, RoutingConfig, StaticRouteConfig,
-    TransportConfig,
+    ApiConfig, AuthMode, Config, ControlConfig, ControllerMemberConfig, DataplaneConfig,
+    MAX_RAFT_ELECTION_TIMEOUT_MS, MIN_RAFT_ELECTION_TIMEOUT_MS, NetworkAuthConfig, NetworkConfig,
+    NodeConfig, PeerConfig, RaftTiming, RaftTimingSource, RelayModeConfig, RoutingConfig,
+    StaticRouteConfig, TransportConfig,
 };
 pub use error::{ConfigError, NodeIdParseError};
 pub use id::{NetworkId, NodeId, RouteId};

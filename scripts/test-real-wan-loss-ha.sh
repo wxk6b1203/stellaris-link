@@ -84,8 +84,9 @@ addr = "$IP2:$R_PORT"
 [[control.raft_peers]]
 id = 3
 addr = "$IP3:$R_PORT"
-[[control.join_tokens]]
-token = "join-wan"
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.248.0.10"
 prefixes = ["192.168.252.0/24"]
 TOML
   scp -q -o BatchMode=yes -o ConnectTimeout=6 "$TMP/ctrl$((i+1)).toml" "${hosts[$i]}:$DIR/ctrl$((i+1)).toml"
@@ -107,12 +108,10 @@ log "initial leader=$L after $(python3 -c "import time;print(round(time.time()-$
 TIMING=$(status_of "$((L-1))" | python3 -c 'import json,sys; r=json.load(sys.stdin).get("raft") or {}; print(r.get("election_timeout_min_ms"), r.get("heartbeat_interval_ms"), r.get("source"))')
 log "raft timing: $TIMING"
 [ "$TIMING" = "$ELECTION_MS $((ELECTION_MS / 4)) config" ] || { log "FAIL: unexpected raft timing $TIMING"; exit 1; }
-JOIN='{"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.248.0.10","token":"join-wan"}'
 LSA1='{"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":1,"zone":null,"links":[],"prefixes":[{"prefix":"192.168.252.0/24","metric":0}],"overlay_ip":"10.248.0.10","addrs":[]}'
 post(){ sshx "${hosts[$2]}" "curl -fsS --max-time 20 -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$1' 'http://127.0.0.1:$C_PORT$3'" >/dev/null; }
-post "$JOIN" "$((L-1))" /v1/join || fail "join failed on leader $L"
 post "$LSA1" "$((L-1))" /v1/lsa || fail "lsa write failed on leader $L"
-log "joined member and wrote lsa=1 on leader $L"
+log "wrote lsa=1 on leader $L (member is pre-registered)"
 snapshot_has_member "$((L-1))" || fail "snapshot missing member on leader $L"
 log "snapshot members ok on leader"
 

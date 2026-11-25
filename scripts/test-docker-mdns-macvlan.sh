@@ -29,9 +29,6 @@ overlay_ip="10.214.0.1"
 [network]
 name="macvlan-mdns"
 cidr="10.214.0.0/16"
-[network.auth]
-mode="psk"
-secret="macvlan-secret"
 [transport]
 relay_urls=[]
 disable_relay=true
@@ -40,6 +37,7 @@ bind_ip="$IP_A"
 advertise=["$IP_A:46851"]
 mdns=true
 mdns_interface="eth0"
+allow_unauthenticated_discovery=true
 [api]
 bind="127.0.0.1:46861"
 TOML
@@ -51,9 +49,6 @@ overlay_ip="10.214.0.2"
 [network]
 name="macvlan-mdns"
 cidr="10.214.0.0/16"
-[network.auth]
-mode="psk"
-secret="macvlan-secret"
 [transport]
 relay_urls=[]
 disable_relay=true
@@ -62,6 +57,7 @@ bind_ip="$IP_B"
 advertise=["$IP_B:46852"]
 mdns=true
 mdns_interface="eth0"
+allow_unauthenticated_discovery=true
 [api]
 bind="127.0.0.1:46862"
 TOML
@@ -87,4 +83,4 @@ fi
 if ! grep -q 'outbound iroh connected\|inbound iroh connection' <<<"$B_LOG"; then
   echo "FAIL: B did not connect" >&2; echo "$B_LOG" >&2; exit 1
 fi
-echo "OK: macvlan mDNS discovery + PSK works on real LAN."
+echo "OK: macvlan mDNS discovery works on a real LAN in dev-only unauthenticated mode."

@@ -226,7 +226,7 @@ PMTUD：
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - 非 Raft legacy controller 仍保留。
 - agent 客户端重启后的 snapshot 续传未验证（controller 侧 + 整集群滚动后的续传已在 TEST-RESULTS §3.10 验证）。
-- 动态 Raft membership 未实现（不是"未验证"）；WAN 丢包/大 snapshot 已测单次，未做 soak。
+- 动态 Raft membership 已实现（`/v1/raft/learner|membership`）；WAN 丢包/大 snapshot 已测单次，未做 soak。
 - 2026-11-24 审计发现：iroh 控制入口绕过 Raft、`POST /v1/routes` 不进 Raft、Raft 模式 LSA TTL 不执行、epoch 不复制、Raft RPC 可无鉴权等，详见 [AUDIT.md](AUDIT.md)。
 
 ### 4.3.1 2026-11-24 审计修复（详见 AUDIT.md §7）
@@ -240,6 +240,9 @@ iroh 入口走 Raft、Raft RPC 鉴权/超时/checksum、routes/LSA TTL/epoch 入
 大状态写入/追赶的全量 JSON 持久化（批量导入 Θ(n²)；snapshot 后尾部为 Θ(m×状态大小)）、真 multipath、真实互联网 PTB（云网络路径 MTU 均为 1500）、macOS NAT。
 已完成：应用层分片重组、ACL ICMP reject、IPv6 最小 MTU、discovery 默认认证、relay_urls 校验、
 metrics/audit、systemd/CI 矩阵、签名审批入网。
+2026-11-25：入网进一步收敛为单一 controller 签名凭据（`MembershipCredential` + `/v1/enroll`），
+删除 PSK/join token/`admission.mode`；撤销后 ≤10s 断连并丢弃 grant，grant 可单独更新。
+仍未验证：多 controller 各自 key 签发的跨地域实测、真实路由器 PTB、CI 实跑。
 （动态 membership 3→4 与 iroh 8 MiB 快照已在 2026-11-24 晚验证通过。）
 
 ### 4.4 平台/运维

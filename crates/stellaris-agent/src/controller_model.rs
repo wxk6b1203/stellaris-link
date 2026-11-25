@@ -63,14 +63,6 @@ pub enum ControllerCommand {
         node: NodeId,
         member: MemberRecord,
     },
-    Join {
-        node: NodeId,
-        member: MemberRecord,
-        token: String,
-    },
-    SetJoinConfigHash {
-        hash: String,
-    },
     RevokeMember {
         node: NodeId,
     },
@@ -95,9 +87,14 @@ pub struct ControllerModel {
     pub lsas: BTreeMap<NodeId, Lsa>,
     pub members: BTreeMap<NodeId, MemberRecord>,
     pub acks: BTreeMap<NodeId, AckRecord>,
-    pub consumed_join_tokens: BTreeSet<String>,
+    /// Monotonic per-node credential revision. Bumped on every authorization
+    /// change so a replayed old credential sorts below the current revision.
     #[serde(default)]
-    pub join_config_hash: Option<String>,
+    pub member_revisions: BTreeMap<NodeId, u64>,
+    /// Nodes explicitly revoked/denied; they cannot re-enroll until an
+    /// administrator admits them again.
+    #[serde(default)]
+    pub revoked: BTreeSet<NodeId>,
     /// Controller-pushed routes: prefix -> next hop -> metric.
     #[serde(default)]
     pub routes: BTreeMap<String, BTreeMap<NodeId, u32>>,
@@ -115,8 +112,8 @@ impl ControllerModel {
             lsas: BTreeMap::new(),
             members: BTreeMap::new(),
             acks: BTreeMap::new(),
-            consumed_join_tokens: BTreeSet::new(),
-            join_config_hash: None,
+            member_revisions: BTreeMap::new(),
+            revoked: BTreeSet::new(),
             routes: BTreeMap::new(),
             pending_admissions: BTreeMap::new(),
         }
@@ -170,42 +167,22 @@ impl ControllerModel {
                 }
             }
             ControllerCommand::UpsertMember { node, member } => {
-                let changed = self.members.get(&node) != Some(&member);
-                if changed {
-                    self.members.insert(node, member);
-                }
-                changed
-            }
-            ControllerCommand::Join {
-                node,
-                member,
-                token,
-            } => {
-                if self.consumed_join_tokens.contains(&token) {
-                    false
-                } else {
-                    self.consumed_join_tokens.insert(token);
-                    self.members.insert(node, member);
-                    true
-                }
-            }
-            ControllerCommand::SetJoinConfigHash { hash } => {
-                if self.join_config_hash.is_none() {
-                    self.join_config_hash = Some(hash);
-                    true
-                } else {
-                    false
-                }
+                self.bump_revision(node);
+                self.members.insert(node, member);
+                self.revoked.remove(&node);
+                true
             }
             ControllerCommand::RevokeMember { node } => {
                 let removed = self.members.remove(&node).is_some();
                 let lsa_removed = self.lsas.remove(&node).is_some();
+                self.revoked.insert(node);
+                self.bump_revision(node);
                 if removed || lsa_removed {
                     // A revocation invalidates manifests signed under the old
                     // epoch; bump it so stale manifest copies are fenced.
                     self.epoch = self.epoch.saturating_add(1);
                 }
-                removed || lsa_removed
+                true
             }
             ControllerCommand::Ack {
                 node,
@@ -220,7 +197,10 @@ impl ControllerModel {
                 changed
             }
             ControllerCommand::RequestAdmission { node, overlay_ip } => {
-                if self.members.contains_key(&node) || self.pending_admissions.contains_key(&node) {
+                if self.members.contains_key(&node)
+                    || self.pending_admissions.contains_key(&node)
+                    || self.revoked.contains(&node)
+                {
                     false
                 } else {
                     self.pending_admissions
@@ -229,16 +209,17 @@ impl ControllerModel {
                 }
             }
             ControllerCommand::ApproveAdmission { node, member } => {
-                let changed = self.members.get(&node) != Some(&member);
+                self.bump_revision(node);
                 self.members.insert(node, member);
+                self.revoked.remove(&node);
                 self.pending_admissions.remove(&node);
-                // Approvals always change authorization, even when the member
-                // record is unchanged (idempotent re-approval still bumps generation).
-                let _ = changed;
                 true
             }
             ControllerCommand::DenyAdmission { node } => {
-                self.pending_admissions.remove(&node).is_some()
+                let changed = self.pending_admissions.remove(&node).is_some();
+                self.revoked.insert(node);
+                self.bump_revision(node);
+                changed
             }
             ControllerCommand::UpsertRoute {
                 prefix,
@@ -269,6 +250,11 @@ impl ControllerModel {
         }
     }
 
+    fn bump_revision(&mut self, node: NodeId) {
+        let entry = self.member_revisions.entry(node).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
     /// Deterministic snapshot bytes used by openraft snapshot / signing.
     pub fn snapshot_bytes(&self) -> Vec<u8> {
         #[derive(Serialize)]
@@ -279,8 +265,8 @@ impl ControllerModel {
             lsas: Vec<&'a Lsa>,
             members: Vec<(&'a NodeId, &'a MemberRecord)>,
             acks: Vec<(&'a NodeId, &'a AckRecord)>,
-            consumed_join_tokens: Vec<&'a String>,
-            join_config_hash: Option<&'a String>,
+            member_revisions: Vec<(&'a NodeId, &'a u64)>,
+            revoked: Vec<&'a NodeId>,
             routes: Vec<(&'a String, Vec<(&'a NodeId, &'a u32)>)>,
             pending_admissions: Vec<(&'a NodeId, &'a PendingAdmission)>,
         }
@@ -291,8 +277,8 @@ impl ControllerModel {
             lsas: self.lsas.values().collect(),
             members: self.members.iter().collect(),
             acks: self.acks.iter().collect(),
-            consumed_join_tokens: self.consumed_join_tokens.iter().collect(),
-            join_config_hash: self.join_config_hash.as_ref(),
+            member_revisions: self.member_revisions.iter().collect(),
+            revoked: self.revoked.iter().collect(),
             routes: self
                 .routes
                 .iter()

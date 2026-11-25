@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Two Linux containers on one Docker bridge: mDNS must discover the peer and
-# PSK auth must complete. Intended for a Linux Docker host.
+# the transport connection must come up (dev-only unauthenticated mode).
+# Intended for a Linux Docker host.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/release/stellaris-agent}"
 IMAGE="${IMAGE:-nginx:latest}"
@@ -24,9 +25,6 @@ overlay_ip="10.209.0.1"
 [network]
 name="docker-mdns"
 cidr="10.209.0.0/16"
-[network.auth]
-mode="psk"
-secret="docker-mdns-secret"
 [transport]
 relay_urls=[]
 disable_relay=true
@@ -34,6 +32,7 @@ listen_port=46831
 bind_ip="172.31.0.2"
 advertise=["172.31.0.2:46831"]
 mdns=true
+allow_unauthenticated_discovery=true
 ${IFACE_LINE}
 [api]
 bind="127.0.0.1:46841"
@@ -46,9 +45,6 @@ overlay_ip="10.209.0.2"
 [network]
 name="docker-mdns"
 cidr="10.209.0.0/16"
-[network.auth]
-mode="psk"
-secret="docker-mdns-secret"
 [transport]
 relay_urls=[]
 disable_relay=true
@@ -56,6 +52,7 @@ listen_port=46832
 bind_ip="172.31.0.3"
 advertise=["172.31.0.3:46832"]
 mdns=true
+allow_unauthenticated_discovery=true
 ${IFACE_LINE}
 [api]
 bind="127.0.0.1:46842"
@@ -82,4 +79,4 @@ fi
 if ! grep -q 'outbound iroh connected\|inbound iroh connection' <<<"$B_LOG"; then
   echo "FAIL: B did not connect" >&2; echo "$B_LOG" >&2; exit 1
 fi
-echo "OK: container mDNS discovery + PSK works."
+echo "OK: container mDNS discovery works in dev-only unauthenticated mode."

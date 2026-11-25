@@ -63,8 +63,9 @@ addr = "$P2:7901"
 [[control.raft_peers]]
 id = 3
 addr = "$P3:7901"
-[[control.join_tokens]]
-token = "join-physical"
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.250.0.10"
 prefixes = ["192.168.250.0/24"]
 TOML
   scp -q -o BatchMode=yes "$TMP/ctrl$((i+1)).toml" "${hosts[$i]}:$DIR/ctrl$((i+1)).toml"
@@ -82,12 +83,6 @@ for _ in $(seq 1 120); do
 done
 [[ -n "${L:-}" ]] || { echo "FAIL: no leader" >&2; for h in "${hosts[@]}"; do ssh "$h" "tail -40 $DIR/ctrl*.log" 2>/dev/null || true; done; exit 1; }
 echo "physical leader=$L"
-JOIN=$(python3 - <<'PY'
-import json
-print(json.dumps({"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.250.0.10","token":"join-physical"}))
-PY
-)
-ssh -o BatchMode=yes "$H1" "curl -fsS -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$JOIN' 'http://${pips[$((L-1))]}:7801/v1/join'" >/dev/null
 LSA=$(python3 - <<'PY'
 import json
 print(json.dumps({"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":1,"zone":None,"links":[],"prefixes":[{"prefix":"192.168.250.0/24","metric":0}],"overlay_ip":"10.250.0.10","addrs":[]}))
@@ -117,4 +112,4 @@ PY
 ssh -o BatchMode=yes "$H1" "curl -fsS -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$LSA2' 'http://${pips[$((NL-1))]}:7801/v1/lsa'" >/dev/null
 sleep 1
 ssh -o BatchMode=yes "$H1" "curl -fsS -H 'x-stellaris-secret: $SECRET' 'http://${pips[$((NL-1))]}:7801/v1/snapshot?node=$NODE'" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(m["node_id"]=="0101010101010101010101010101010101010101010101010101010101010101" for m in d["members"]), d; print("physical failover snapshot ok")'
-echo "OK: physical 3-host controller HA + mTLS + failover works."
+echo "OK: physical 3-host controller HA + mTLS + failover with a pre-registered member works."

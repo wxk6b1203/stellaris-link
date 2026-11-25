@@ -1,21 +1,24 @@
-//! Network membership authentication.
+//! Network membership: controller-signed credentials and dataplane grants.
 //!
-//! PSK mode performs a mutual HMAC challenge-response on a fresh bi-stream
-//! before the connection is admitted to the dataplane or LSA exchange.
+//! Every connection must present a [`SignedCredential`] issued by a trusted
+//! controller. The credential is verified during the iroh handshake against
+//! `control.controller_keys`, which makes the controller the single authority
+//! for who may carry overlay traffic and which source addresses they own.
+//!
+//! There is no shared network secret: a credential is a signed capability,
+//! safe to show to any peer.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, bail};
-use hmac::{Hmac, Mac};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use stellaris_types::{NetworkId, NodeId};
 
-const CLIENT_DOMAIN: &[u8] = b"stellaris-join-client-v1";
-const SERVER_DOMAIN: &[u8] = b"stellaris-join-server-v1";
+use crate::credential::{CredentialError, SignedCredential, VerifiedCredential};
+
 const MAX_FRAME: usize = 4096;
 
 #[derive(Clone, Debug, Default)]
@@ -27,28 +30,17 @@ pub struct Grant {
 
 pub type GrantMap = Arc<RwLock<HashMap<NodeId, Grant>>>;
 
-pub fn manifest_grants(members: &[crate::controller::MemberView]) -> HashMap<NodeId, Grant> {
-    members
-        .iter()
-        .filter_map(|member| {
-            let node: NodeId = member.node_id.parse().ok()?;
-            Some((
-                node,
-                Grant {
-                    overlay_ip: member.overlay_ip,
-                    prefixes: member
-                        .allowed_prefixes
-                        .iter()
-                        .filter_map(|p| p.parse().ok())
-                        .collect(),
-                    capabilities: member.capabilities.clone(),
-                },
-            ))
-        })
-        .collect()
+impl Grant {
+    pub fn from_verified(credential: &VerifiedCredential) -> Self {
+        Self {
+            overlay_ip: credential.overlay_ip,
+            prefixes: credential.prefixes.clone(),
+            capabilities: credential.capabilities.clone(),
+        }
+    }
 }
 
-/// Enforce controller grants (when present) on the dataplane source address.
+/// Enforce credentials (when present) on the dataplane source address.
 pub fn inbound_source_allowed(state: &crate::AgentState, peer: NodeId, src: IpAddr) -> bool {
     let grants = state.grants.read().unwrap_or_else(|e| e.into_inner());
     if grants.is_empty() {
@@ -99,7 +91,7 @@ pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa)
         }
         return true;
     }
-    // No controller manifest: static peers grant their configured prefixes;
+    // No membership state yet: static peers grant their configured prefixes;
     // unknown/dynamic peers may only advertise their own overlay /32.
     let Some(peer) = state.peers.get(&lsa.origin) else {
         return lsa.prefixes.iter().all(|p| {
@@ -117,137 +109,89 @@ pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct AuthHello {
-    network: String,
-    node: String,
-    nonce: String,
-    proof: String,
+struct CredentialFrame {
+    credential: SignedCredential,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AuthAck {
-    node: String,
-    nonce: String,
-    proof: String,
+fn verify_frame(
+    frame: CredentialFrame,
+    remote: NodeId,
+    network: &NetworkId,
+    controller_keys: &[NodeId],
+    min_revision: u64,
+) -> anyhow::Result<VerifiedCredential> {
+    frame
+        .credential
+        .verify(
+            network,
+            remote,
+            controller_keys,
+            min_revision,
+            crate::credential::now_secs(),
+        )
+        .map_err(|error| match error {
+            CredentialError::WrongNetwork => anyhow::anyhow!("credential network mismatch"),
+            other => anyhow::anyhow!("credential rejected: {other}"),
+        })
 }
 
-fn hmac_hex(secret: &str, parts: &[&[u8]]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
-    for part in parts {
-        mac.update(part);
-    }
-    hex::encode(mac.finalize().into_bytes())
-}
-
-fn nonce() -> String {
-    let mut bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
-    hex::encode(bytes)
-}
-
-/// Client side: prove PSK possession and verify the server's response.
+/// Outbound side: present our credential, verify the peer's.
 pub async fn authenticate_client(
     conn: &iroh::endpoint::Connection,
-    network: NetworkId,
-    local: NodeId,
-    expected_server: NodeId,
-    secret: &str,
-) -> anyhow::Result<()> {
+    network: &NetworkId,
+    controller_keys: &[NodeId],
+    own: Option<&SignedCredential>,
+    min_revision: impl Fn(NodeId) -> u64,
+) -> anyhow::Result<VerifiedCredential> {
+    let own = own.ok_or_else(|| anyhow::anyhow!("no membership credential"))?;
+    let remote = NodeId::new(*conn.remote_id().as_bytes());
     let (mut send, mut recv) = conn.open_bi().await.context("open auth stream")?;
-    let client_nonce = nonce();
-    let network_s = network.to_string();
-    let local_s = local.to_string();
-    let proof = hmac_hex(
-        secret,
-        &[
-            CLIENT_DOMAIN,
-            network_s.as_bytes(),
-            local_s.as_bytes(),
-            client_nonce.as_bytes(),
-        ],
-    );
-    let hello = AuthHello {
-        network: network_s.clone(),
-        node: local_s.clone(),
-        nonce: client_nonce.clone(),
-        proof,
-    };
-    write_json(&mut send, &hello).await?;
+    write_json(
+        &mut send,
+        &CredentialFrame {
+            credential: own.clone(),
+        },
+    )
+    .await?;
     let _ = send.finish();
-
-    let ack: AuthAck = read_json(&mut recv).await?;
-    if ack.node != expected_server.to_string() {
-        bail!("auth server identity mismatch");
-    }
-    let expected = hmac_hex(
-        secret,
-        &[
-            SERVER_DOMAIN,
-            network_s.as_bytes(),
-            local_s.as_bytes(),
-            expected_server.to_string().as_bytes(),
-            client_nonce.as_bytes(),
-            ack.nonce.as_bytes(),
-        ],
-    );
-    if ack.proof != expected {
-        bail!("auth server proof mismatch");
-    }
-    Ok(())
+    let frame: CredentialFrame = read_json(&mut recv).await?;
+    verify_frame(
+        frame,
+        remote,
+        network,
+        controller_keys,
+        min_revision(remote),
+    )
 }
 
-/// Server side: verify the client's PSK proof, optional allowlist, and send ack.
+/// Inbound side: verify the peer's credential, then present ours.
 pub async fn authenticate_server(
     conn: &iroh::endpoint::Connection,
-    network: NetworkId,
-    local: NodeId,
-    secret: &str,
-    allowed: &[NodeId],
-) -> anyhow::Result<NodeId> {
-    let (mut send, mut recv) = conn.accept_bi().await.context("accept auth stream")?;
-    let hello: AuthHello = read_json(&mut recv).await?;
+    network: &NetworkId,
+    controller_keys: &[NodeId],
+    own: Option<&SignedCredential>,
+    min_revision: impl Fn(NodeId) -> u64,
+) -> anyhow::Result<VerifiedCredential> {
+    let own = own.ok_or_else(|| anyhow::anyhow!("no membership credential"))?;
     let remote = NodeId::new(*conn.remote_id().as_bytes());
-    if hello.network != network.to_string() {
-        bail!("auth network mismatch");
-    }
-    if hello.node != remote.to_string() {
-        bail!("auth node identity mismatch");
-    }
-    if !allowed.is_empty() && !allowed.contains(&remote) {
-        bail!("peer not in auth.allowed_nodes");
-    }
-    let expected = hmac_hex(
-        secret,
-        &[
-            CLIENT_DOMAIN,
-            hello.network.as_bytes(),
-            hello.node.as_bytes(),
-            hello.nonce.as_bytes(),
-        ],
-    );
-    if hello.proof != expected {
-        bail!("auth client proof mismatch");
-    }
-    let server_nonce = nonce();
-    let proof = hmac_hex(
-        secret,
-        &[
-            SERVER_DOMAIN,
-            hello.network.as_bytes(),
-            remote.to_string().as_bytes(),
-            local.to_string().as_bytes(),
-            hello.nonce.as_bytes(),
-            server_nonce.as_bytes(),
-        ],
-    );
-    let ack = AuthAck {
-        node: local.to_string(),
-        nonce: server_nonce,
-        proof,
-    };
-    write_json(&mut send, &ack).await?;
+    let (mut send, mut recv) = conn.accept_bi().await.context("accept auth stream")?;
+    let frame: CredentialFrame = read_json(&mut recv).await?;
+    let verified = verify_frame(
+        frame,
+        remote,
+        network,
+        controller_keys,
+        min_revision(remote),
+    )?;
+    write_json(
+        &mut send,
+        &CredentialFrame {
+            credential: own.clone(),
+        },
+    )
+    .await?;
     let _ = send.finish();
-    Ok(remote)
+    Ok(verified)
 }
 
 async fn write_json<T: Serialize>(
@@ -433,31 +377,5 @@ overlay_ip = "10.7.0.2"
             b,
             "10.7.0.1".parse().unwrap()
         ));
-    }
-
-    #[test]
-    fn proofs_are_domain_separated() {
-        let network = NetworkId::new();
-        let node = NodeId::new([1u8; 32]);
-        let a = hmac_hex(
-            "secret",
-            &[
-                CLIENT_DOMAIN,
-                network.to_string().as_bytes(),
-                node.to_string().as_bytes(),
-                b"nonce",
-            ],
-        );
-        let b = hmac_hex(
-            "secret",
-            &[
-                SERVER_DOMAIN,
-                network.to_string().as_bytes(),
-                node.to_string().as_bytes(),
-                b"nonce",
-            ],
-        );
-        assert_ne!(a, b);
-        assert_eq!(a.len(), 64);
     }
 }

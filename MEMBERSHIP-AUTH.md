@@ -1,415 +1,203 @@
-# 入网与成员授权 — 设计
+# 入网与成员授权 — 实现说明
 
-> 实现状态（2026-11-24）：签名 `POST /v1/join`（`require_join_signature`）、
-> `control.admin_secret` 读写分权、`admission.mode=approve` 签名申请+管理员审批、
-> 动态 Raft membership 接口、快照/manifest 默认
-> fail-closed 已落地；Hello 挑战、per-member key、threshold、manifest 过期只读等
-> 仍是设计目标，详见 [AUDIT.md](AUDIT.md) §7。
+> 实现状态（2026-11-25）：**入网只有一种凭据** —— controller 签名的
+> `MembershipCredential`。PSK、join token、`admission.mode` 的
+> `legacy`/`allowlist` 已删除。签发入口是 `POST /v1/enroll`（HTTP，签名请求）
+> 与 iroh 控制通道的 `Request::Enroll`（连接已由 node key 认证，无需额外签名）。
+> 撤销、续签、grant 更新与 revision 防回滚均已落地。
 
-> 状态：设计稿；已实现 **PSK 双向 HMAC 入网认证 + allowlist**、controller Ed25519 snapshot 签名、controller 侧 member/prefix grant 校验、一次性 join token（HTTP `/v1/join`）、**独立 Ed25519 signed membership manifest（`GET /v1/manifest`）**、member 侧 LSA prefix 强制。
-> 关联：[PRIORITIES.md](PRIORITIES.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、[PROTOCOL.md](PROTOCOL.md)
-> 目标：把“谁能加入网络、谁能让别人加入、谁能广告哪些前缀”设计清楚，再实现。
-
----
-
-## 0. 先定义三个不同的问题
-
-很多方案把这三件事混在一起，最后必然出问题：
-
-1. **身份（Identity）**
-   这个节点是谁？= Ed25519 公钥 / iroh EndpointId / NodeId。
-
-2. **成员资格（Membership）**
-   这个节点是否属于这个 Network？决定能不能交换数据/LSA。
-
-3. **路由授权（Route Authorization）**
-   这个成员能不能广告某个前缀、当 gateway、当 exit？决定流量能不能被劫持。
-
-**成员资格 ≠ 路由授权。**
-一个合法成员不应该自动获得“广告任意 0.0.0.0/0”的权利。
+> 关联：[PROTOCOL.md](PROTOCOL.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、
+> [README.md](README.md) §13。
 
 ---
 
-## 1. 信任根与角色
+## 0. 三个问题，三层解决
+
+| 问题 | 答案 | 落点 |
+|---|---|---|
+| 这个节点是谁？ | Ed25519 公钥 = NodeId = iroh endpoint id | `identity.key` |
+| 它是否属于这个网络？ | controller 签名的 `MembershipCredential` | iroh 握手 |
+| 它能广告/转发什么？ | 凭据里的 `prefixes` + `capabilities` | LSA 校验、数据面 anti-spoof |
+
+成员资格 ≠ 路由授权：一个合法成员默认只能使用自己的 overlay `/32`，要广告额外前缀或
+转发他人源地址，必须在凭据里显式授予（`prefixes`、`transit`/`gateway`/`exit`）。
+
+---
+
+## 1. 信任根
 
 | 角色 | 职责 | 密钥 |
 |---|---|---|
-| Network Owner / Admin | 创建网络、定义入网策略、签发 join token | admin key（离线/HSM 更佳） |
-| Controller | 审批加入、签发 membership manifest、下发路由 | controller Ed25519 key |
-| Member / Agent | 运行数据面、提交 LSA、接收 manifest | node Ed25519 key（iroh endpoint） |
-| Gateway / Exit | 广告 underlay 前缀、转发 | node key + `can_route` capability |
+| Controller | 决定谁能入网、签发凭据、撤销成员 | controller Ed25519 key（Raft leader 用自身 key 签） |
+| Member | 提交 LSA、转发自己获授权的前缀 | node Ed25519 key（iroh endpoint） |
+| Admin | 审批/撤销/改 grant | `control.admin_secret`（与 member secret 分权） |
 
-安全不变量：
-
-- 控制器必须能验证“申请者拥有其 NodeId 对应的私钥”。
-- 控制器签发的 membership 必须绑定 `network_id + node_id + overlay_ip + capabilities + epoch`。
-- 非成员不能加入数据面，也不能提交 LSA。
-- 成员只能广告被授权的前缀。
-- 多网络之间不能重放凭证（domain separation）。
-- 旧 controller/旧 epoch 不能继续写入。
+节点只信任 `control.controller_keys` 里列出的 controller 公钥。HA 部署时把每个
+controller 的 NodeId 都列进去；凭据的 `issuer` 必须是其中之一。
 
 ---
 
-## 2. 入网场景总览
+## 2. 凭据格式
 
-| 场景 | 信任根 | 谁批准 | 凭证 | 适用 |
-|---|---|---|---|---|
-| 无 controller，小型/实验 | 共享 PSK | 无中心；持有 PSK 即可 | network PSK | 家庭/实验/离线 |
-| 无 controller，受控 | 静态 allowlist + PSK | 管理员改配置 | PSK + allowed NodeIds | 小集群 |
-| 单 controller | controller key | controller 自动/手工审批 | join token → signed manifest | 生产默认 |
-| 多 controller | controller key set / quorum | leader/多数 controller | signed manifest | HA |
-| 多网络 | 每网络独立 root | 每网络独立 controller/admin | 每网络独立凭证 | 多租户/多环境 |
-
----
-
-## 3. 场景 A：没有 controller
-
-### 3.1 最简单：共享 PSK
-
-管理员生成：
-
-```text
-network_id + network_secret（高熵）
-```
-
-通过安全渠道分发给每个节点：
-
-```toml
-[network.auth]
-mode = "psk"
-secret = "..."
-```
-
-节点连接时执行 **双向 HMAC challenge/response**（已实现）：
-
-```text
-client -> server: network_id, node_id, nonce_c, HMAC(secret, domain|network|node|nonce_c)
-server -> client: nonce_s, HMAC(secret, domain|network|node_c|node_s|nonce_c|nonce_s)
-```
-
-- 双方都证明持有 PSK；
-- nonce 防重放；
-- `network_id` 防跨网络重放；
-- iroh TLS 负责链路机密性/完整性；
-- 认证通过后才允许数据/LSA。
-
-### 3.2 加强：PSK + allowlist
-
-```toml
-[network.auth]
-mode = "psk"
-secret = "..."
-allowed_nodes = ["<node-a>", "<node-b>"]
-```
-
-- 知道 PSK 但不在 allowlist 的节点仍被拒绝。
-- 适合 10～100 节点的小集群。
-- 新增节点需要管理员更新每个节点的 allowlist（或至少 gateway/seed）。
-
-### 3.3 谁处理“加入”？
-
-没有 controller 时，**没有在线审批者**。加入 = 管理员在带外完成：
-
-1. 生成/分发 PSK；
-2. 把新节点 NodeId 加入 allowlist（可选）；
-3. 给新节点 seed/peer 地址；
-4. 新节点启动，PSK 握手通过即加入。
-
-### 3.4 撤销
-
-- 轮换 PSK（全量）/移除 allowlist（需要节点重启或热加载）。
-- 无 controller 时无法瞬时撤销单个节点；只能缩短凭证寿命或引入 controller。
-- 这是无 controller 模式的固有限制，不应假装支持即时吊销。
-
-### 3.5 优点/缺点
-
-优点：零依赖、离线可用、部署简单。
-缺点：PSK 泄露 = 全网可加入；无在线审批；无细粒度前缀授权；撤销困难。
-
----
-
-## 4. 场景 B：单个 controller
-
-### 4.1 加入流程
-
-```text
-Admin creates network + join policy
-        │
-        ▼
-Member generates NodeId key
-        │
-        ▼
-Member -> Controller: JoinRequest {
-  network_id, node_id, overlay_ip?, capabilities?,
-  join_token, nonce, timestamp,
-  signature(node_key, transcript)
-}
-        │
-        ▼
-Controller verifies token + signature + policy
-        │
-        ├─ auto-approve → MemberGrant + signed manifest
-        └─ manual-approve → pending; admin approves
-        │
-        ▼
-Member stores manifest; uses it for peer auth
-```
-
-### 4.2 Join token
-
-两种：
-
-- **一次性 token**：`id + secret`，controller 存 hash，使用后删除；
-- **签名 token**：admin/controller 签 `{network, expires, max_uses, caps}`，可离线分发。
-
-推荐一次性 token + 短有效期；token 只用于“申请加入”，不是长期数据面凭证。
-
-### 4.3 Membership manifest
-
-```rust
-struct MembershipManifest {
-    network: NetworkId,
-    epoch: u64,
-    generation: u64,
-    issued_at: u64,
-    expires_at: u64,
-    controller: NodeId,
-    members: Vec<MemberGrant>,
-    signature: Ed25519,
-}
-
-struct MemberGrant {
-    node_id: NodeId,
-    overlay_ip: IpAddr,
-    addrs: Vec<SocketAddr>,
-    capabilities: Capabilities, // member | gateway | exit | relay?
-    allowed_prefixes: Vec<IpNet>,
-    zones: Vec<String>,
+```json
+{
+  "credential": {
+    "network": "<network id>",
+    "node": "<node id hex>",
+    "overlay_ip": "10.7.0.2",
+    "prefixes": ["192.168.50.0/24"],
+    "capabilities": ["member"],
+    "revision": 3,
+    "issued_at": 1763996400,
+    "not_after": 1764000000
+  },
+  "issuer": "<controller node id hex>",
+  "signature": "<hex ed25519>"
 }
 ```
 
-- Controller key 签发；
-- member 配置 `controller_public_keys`；
-- peer 连接时交换 manifest/grant，验证签名；
-- LSA 的 prefixes 必须是 `allowed_prefixes` 子集，否则拒绝/降级。
+签名字节：`stellaris-credential-v1|` + issuer 的 32 字节 + 凭据的规范化 JSON。
 
-### 4.4 Controller 不可用时加入
+验证方（每个 peer）检查五件事：
 
-- 首次加入必须能联系 controller；否则只能使用预置的短期 manifest（bootstrap token）。
-- 已加入成员保留最后 manifest 到过期；过期后进入只读/不允许新 peer。
-- 不要让“controller 不可用”自动退化为 PSK 或 allow-any。
+1. `credential.network == 本地 network`（防跨网络重放）；
+2. `credential.node == conn.remote_id()`（凭据只能由持有对应私钥的节点使用）；
+3. `issuer ∈ control.controller_keys`；
+4. Ed25519 签名有效；
+5. `not_after > now` 且 `revision >= 本地已见该节点的最高 revision`。
 
-### 4.5 Controller 撤销
-
-- controller 生成新 epoch/generation 的 manifest，移除成员；
-- member 拉取/接收新 manifest；
-- peer 校验 epoch/generation；旧 manifest 被拒绝；
-- 被撤销节点保留本地 FIB 但无法新增 peer/路由；数据面可按策略立即丢弃其流量。
+凭据是**能力**而不是秘密：可以公开出示，对端验签即可，因此不需要在任何两个节点之间
+分发密钥。这是它取代 PSK 的根本原因。
 
 ---
 
-## 5. 场景 C：多个 controller
+## 3. 签发、续签、落盘
 
-### 5.1 目标
+```
+member                         controller
+  |-- POST /v1/enroll (signed) -->|
+  |<-- 200 {credential} ----------|   已预注册 / 已审批
+  |<-- 202 {pending:true} --------|   未知节点，进入 Raft 待审队列
+  |<-- 403 revoked/denied --------|
+```
 
-- 无单点；
-- 多 controller 对“谁加入/谁被撤销/哪些前缀合法”达成一致；
-- member 能验证“这个 manifest 是合法 controller 签的”；
-- 旧 controller 不能继续签发。
+- **预注册**：`[[control.members]]` 里的节点 enroll 时直接签发。
+- **审批**：未知节点进入 `ControllerCommand::RequestAdmission`（Raft 复制）；
+  管理员 `POST /v1/admissions/{node}/approve` 后，下次 enroll 拿到凭据。
+- **续签**：member 在 `credential_ttl_secs` 的 2/3 时自动重新 enroll；
+  凭据落盘到 `state_dir/credential.json`，重启后先复用，过期再续。
+- **改授权**：`POST /v1/members/{node}/grants` 更新前缀/能力并递增 revision，
+  不需要重新入网；member 下次续签拿到新凭据。
 
-### 5.2 方案阶段
+HTTP enroll 请求由节点私钥签名（`stellaris-enroll-v1|network|node|overlay|zone`），
+因此抓包重放最多让 controller 重签一张同 node 的凭据，无法冒用身份。iroh enroll
+没有签名步骤：QUIC 连接已经用 node key 认证，`conn.remote_id()` 就是身份。
 
-**C0（当前 fanout）**：
+---
 
-- 多个 controller 各自签发 HMAC snapshot；
-- member 选择最高 `(epoch,generation)`；
-- 没有 quorum，可能 split-brain；只用于过渡。
+## 4. 握手
 
-**C1（controller key set + leader）**：
+连接建立后，双方在一条 bi-stream 上各发一帧 `SignedCredential`：
 
-- 每个 controller 有 Ed25519 key；
-- member 配置 `controller_keys = [k1,k2,k3]`；
-- 只接受 **leader** 的 manifest；
-- controller 间用 leader lease/epoch fence；
-- 仍不是 Raft，但能防止旧 leader 继续写。
+- 发起方：open_bi → 写自己的凭据 → 读对端凭据 → 验证；
+- 接受方：accept_bi → 读对端凭据 → 验证 → 写自己的凭据。
 
-**C2（openraft）**：
+验证通过后，双方把对方凭据转成 `Grant` 装进 `state.grants`，用于：
 
-- controller 是 Raft voters；
-- membership/route/LSA/ACK 通过 Raft log 提交；
-- manifest 由 leader 签发，带 Raft term/epoch；
-- member 只信任当前 leader + 签名；
-- 详见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
+- 数据面 anti-spoof：源地址必须属于该 peer 的 overlay `/32` 或授权前缀；
+  转发别人的源地址需要 `transit`/`gateway`/`exit` capability；
+- LSA 校验：`lsa.origin` 必须有 grant，`overlay_ip` 必须与 grant 一致，
+  LSA 里的前缀必须在 grant 内。
 
-### 5.3 多 controller 下的加入
+握手失败（无凭据、过期、revision 回滚、issuer 不受信）直接关闭连接并每 2s 重试；
+`network.auth.mode = "controller"` 时不接受任何非凭据连接（fail-closed）。
 
-- JoinRequest 发给 leader；follower 返回 leader hint。
-- Leader 把 `AddMember` 写 Raft log；提交后签发 manifest。
-- 多数 controller 确认后，成员才拿到有效 grant。
-- 如果 leader 不可用，加入失败/重试；不在 minority 上“本地批准”。
+---
 
-### 5.4 多 controller 下的撤销
+## 5. 撤销
 
-- `RevokeMember` 写 Raft log，epoch+1；
-- 新 manifest 广播/拉取；
-- 旧 manifest 在 grace period 后失效；
-- 被撤销节点不能提交 LSA/路由。
+撤销的路径只有一条：controller 的成员表变化。
 
-### 5.5 信任配置
+1. `POST /v1/revoke`、`deny`，或从 `control.members` 删除；
+2. model 移除成员、递增该节点的 `member_revisions`、写入 `revoked` tombstone；
+3. member 在下一个快照（≤10s）发现该节点不在 members 里：
+   主动 `close` 连接（QUIC close code 3）并删除本地 grant；
+4. 该节点后续 enroll 返回 403（tombstone），除非管理员重新 approve；
+5. 即使对方重放撤销前的旧凭据，`revision` 也更低，会被拒绝；
+6. `not_after` 兜底：controller 不可达时，最迟一个 TTL 后凭据自然失效。
+
+---
+
+## 6. 配置
+
+controller：
 
 ```toml
 [control]
-controller_keys = ["<ed25519-1>", "<ed25519-2>", "<ed25519-3>"]
-# 或 threshold = 2
+secret = "member-secret"        # enroll 的共享门禁（可省略则仅靠签名+审批）
+admin_secret = "admin-secret"   # admissions/revoke/grants
+raft_dir = "/var/lib/stellaris/raft"
+raft_secret = "raft-secret"
+credential_ttl_secs = 3600
+
+[[control.members]]             # 预注册（可选）
+node_id = "<node>"
+overlay_ip = "10.7.0.2"
+prefixes = ["192.168.50.0/24"]
+capabilities = ["member"]
 ```
 
-- member 不信任“任意 controller”，只信任配置的 key set；
-- 支持 key rotation（old+new 双信任窗口）；
-- 禁止 TOFU 静默接受新 controller key。
+member：
 
----
+```toml
+[network.auth]
+mode = "controller"             # 唯一的生产模式
 
-## 6. 场景 D：一个节点加入多个网络
-
-### 6.1 原则
-
-- **每网络独立身份上下文/凭证**，不能把网络 A 的 PSK/manifest 用于网络 B；
-- 所有签名/HMAC transcript 必须包含 `network_id`；
-- 每个网络独立 TUN、FIB、ACL、QoS、route engine；
-- 跨网络转发明确禁止（除非未来做显式 gateway policy）。
-
-### 6.2 当前实现
-
-当前 agent 进程是 **单 NetworkConfig / 单 TUN / 单 FIB**。一个节点加入多个网络有两种落地方式：
-
-1. **每网络一个 agent 进程**（当前可用）：
-   - 不同 state_dir、TUN name、API port、overlay CIDR；
-   - 同一 NodeId 可以复用，但每个网络独立 manifest/PSK；
-   - 简单、隔离好，资源开销较大。
-
-2. **单进程多网络**（P1）：
-   - `Vec<NetworkRuntime>`；
-   - 每网络独立 FIB/Policy/PeerRegistry/TUN；
-   - 共享 iroh endpoint 时，连接上必须绑定 network；
-   - 推荐每个网络独立 iroh endpoint/ALPN 或 network tag，避免串网。
-
-### 6.3 凭证隔离
-
-- PSK 派生 key：`HKDF(network_secret, salt=network_id)`，不同网络不同 key；
-- manifest 签名覆盖 `network_id`；
-- nonce 缓存按 `(network_id,node_id)` 分区；
-- 禁止跨网络重放 LSA/ACK/Hello。
-
-### 6.4 多网络地址
-
-- overlay IP 可以重叠（不同 network namespace/TUN）；
-- underlay 地址可共享，但 peer 必须绑定 network；
-- controller 每网络独立，或 shared controller 带 network scope + RBAC。
-
----
-
-## 7. 前缀授权（Route Authorization）
-
-### 7.1 规则
-
-```text
-member 默认只能广告：
-  - 自己的 overlay /32
-  - manifest 中 allowed_prefixes
-gateway/exit 才能广告其他前缀
+[control]
+endpoint_id = "<controller endpoint>"   # 或 url = "https://controller:5801"
+secret = "member-secret"
+controller_keys = ["<controller node id>"]
+credential_ttl_secs = 3600
 ```
 
-### 7.2 检查点
-
-1. controller 收到 LSA：检查 origin 的 grant；
-2. member 收到 LSA：检查 origin 的 grant/manifest；
-3. dataplane anti-spoof：源地址属于该 peer 的 grant；
-4. controller 生成 snapshot：只包含授权前缀；
-5. UI/explain：显示“未授权/拒绝原因”。
-
-### 7.3 无 controller 模式
-
-- 用静态 `PeerConfig.advertised` 作为 grant；
-- 自动发现的动态 peer 只能广告自己的 /32，除非配置明确授权；
-- 不要默认允许任何动态 peer 广告任意前缀。
+`mode = "none"` 仅用于隔离实验：没有任何成员认证，discovery 需要
+`transport.allow_unauthenticated_discovery = true` 才能开启。
 
 ---
 
-## 8. 失败与边界
+## 7. 与旧机制的关系
 
-| 情况 | 行为 |
-|---|---|
-| controller 不可达（首次加入） | 加入失败；使用预置 bootstrap manifest 才可离线 |
-| controller 不可达（已加入） | 保留最后 manifest 到 TTL；写操作暂停；不降级为 allow-any |
-| manifest 过期 | 不接新 peer/新路由；已有流量按策略 |
-| token 泄露 | 一次性 token 吊销；短 TTL；审计 |
-| PSK 泄露 | 轮换 PSK；无 controller 时无法瞬时单点撤销 |
-| 多 controller 分区 | 只有 quorum/leader 能签发；minority 拒绝写 |
-| 旧 leader 恢复 | epoch/term fence；旧 manifest 被拒 |
-| 跨网络重放 | transcript 绑定 network_id；拒绝 |
-| 时钟偏差 | token/manifest 用 ±5min 窗口；nonce 缓存 |
-| 节点 key 丢失 | 重新生成 NodeId；重新加入；旧 grant 吊销 |
+| 旧机制 | 状态 | 原因 |
+|---|---|---|
+| `network.auth.mode = "psk"` + `secret` | 删除 | 整网共享秘密：无 per-node 撤销、轮换需全网、任意持有者可冒充 |
+| `network.auth.allowed_nodes` | 删除 | 与 `control.members` 重复，且只是静态名单 |
+| `control.join_token(s)` | 删除 | bearer token 可自助入网；scope 烧在 token 里，泄露即授权 |
+| `control.require_join_signature` | 删除 | enroll 一律要求签名（iroh 侧由连接天然保证） |
+| `admission.mode = legacy/allowlist/approve` | 删除 | 收敛成一条路径：预注册直接签发，否则审批 |
+| `POST /v1/join` | 替换 | `POST /v1/enroll`，返回签名凭据而不是成员资格 |
 
 ---
 
-## 9. 协议与代码落点
+## 8. 残余风险
 
-### 9.1 已实现
-
-- `NetworkAuthConfig`：`none | psk` + `secret` + `allowed_nodes`；
-- iroh 连接建立后、数据/LSA 前做 PSK handshake；
-- 错误 secret 拒绝连接；
-- controller Ed25519 snapshot 签名 + member `controller_keys` 校验；
-- controller `control.members` allowlist / 每 member prefix grant；
-- member 侧 controller threshold（同一 payload 至少 N 个不同 controller 签名）；
-- member 侧对 LSA prefix 的 grant 强制（`lsa_authorized`）；
-- 一次性 join token：`POST /v1/join`，member `control.join_token` 自动申请；token 支持 `expires_at`，过期/复用拒绝；
-- `POST /v1/revoke`：撤销 member，移除其 grant/LSA/ACK，generation+1；strict membership 下空 grant 不会退化为 allow-all；
-- membership grant 和已消费 join token 持久化到 `state_dir/controller-members.json`；LSA 表持久化到 `state_dir/controller-lsas.json`（30s TTL 内恢复）；controller 重启后保持；
-- 独立 signed membership manifest：`GET /v1/manifest`，member 校验 Ed25519/expiry 后更新 grants；
-- 未授权 LSA origin、overlay_ip、prefix、link target 被拒绝；
-- 数据面 source 按 grant 检查；forwarding member 可携带其他已授权成员源地址；`transit` 保留给 gateway/exit 策略；
-- 测试：`demo-psk-join.sh`、`demo-iroh-controller.sh`、`join_token_admits_once_and_grants_prefix`。
-
-### 9.2 待实现
-
-- 数据面前缀已由 controller grant + `transit` capability 约束；
-- multi-network runtime；
-- openraft command integration。
+- **controller 是单点信任**：controller 私钥泄露 = 可以给任意节点签发凭据。
+  建议 controller key 离线保存/HSM，`controller_keys` 支持多把以便轮换。
+- **没有逐帧签名**：连接由凭据认证，LSA 有 Ed25519 签名，但数据/控制帧本身不逐帧签名；
+  连接内仍信任对端。
+- **时钟**：`not_after` 依赖节点时钟大致同步；偏差过大会导致误拒，需要 NTP。
+- **凭据可见性**：凭据不是秘密，泄露不构成风险；真正要保护的是 node 私钥和 controller 私钥。
+- **HA 签发**：每个 controller 用自身 key；member 需要信任全部 controller key，
+  且 `revision` 必须在 Raft 内单调（当前由 model 保证）。
 
 ---
 
-## 10. 推荐实现顺序（P0）
+## 9. 验证
 
-1. **PSK + allowlist**（已完成）
-2. **Controller key + signed snapshot**（替代 shared HMAC）
-3. **Join token + MembershipManifest/MemberGrant**
-4. **Prefix authorization 检查**
-5. **多 controller key set / leader fence**
-6. **多网络 credential isolation**（先每网络进程，后单进程多 runtime）
-7. **真实 3 节点测试 + 撤销/过期测试**
-
----
-
-## 11. 测试矩阵
-
-| 测试 | 期望 |
-|---|---|
-| 正确 PSK | 连接成功，数据/LSA 可用 |
-| 错误 PSK | 连接拒绝，peer 不 connected |
-| allowlist 外节点 | 拒绝 |
-| 无 controller 离线加入 | PSK+seed 可加入 |
-| 单 controller 正确 token | 签发 manifest |
-| 过期/复用 token | 拒绝 |
-| 无 grant 的前缀 LSA | 拒绝/过滤 |
-| gateway 授权前缀 | 接受 |
-| 撤销后旧 epoch | 拒绝 |
-| 多 controller 少数派 | 不能签发 |
-| 多网络跨用 PSK/manifest | 拒绝 |
-| manifest 过期 | 不接新 peer |
-
----
-
-## 12. 一句话
-
-**没有 controller 时，加入是管理员带外分发 PSK/allowlist；有 controller 时，加入是 controller 验证 token 后签发 membership grant；多 controller 必须只让 leader/quorum 签发；多网络必须每个网络独立凭证和状态。**
+- 单元：`credential::tests`（签名/篡改/过期/跨网络/revision 回滚/续签时机）、
+  `controller_model::tests`（revision、tombstone、确定性快照）。
+- 集成：`controller::tests::pre_registered_member_receives_credential`、
+  `enrollment_is_queued_then_approved`、`enrollment_is_signed_admin_scoped_and_revocable`、
+  `enrollment_rejects_a_signature_from_another_key`、
+  `control_client::tests::http_enrollment_installs_a_credential`、
+  `transport::tests::controller_credentials_gate_connections_and_install_grants`。
+- 多进程/多机脚本：`scripts/` 下的 controller 测试已改为预注册或 enroll+approve 流程。

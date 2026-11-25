@@ -58,8 +58,9 @@ addr = "$IP2:$R_PORT"
 [[control.raft_peers]]
 id = 3
 addr = "$IP3:$R_PORT"
-[[control.join_tokens]]
-token = "join-roll"
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.247.0.10"
 prefixes = ["192.168.251.0/24"]
 TOML
   scp -q -o BatchMode=yes "$TMP/ctrl$((i+1)).toml" "${hosts[$i]}:$DIR/ctrl$((i+1)).toml"
@@ -72,7 +73,6 @@ snapshot_ok(){ local i=$1; ssh -o BatchMode=yes "${hosts[$i]}" "curl -fsS -H 'x-
 wait_all(){ for _ in $(seq 1 120); do local ok=1; for j in 0 1 2; do status "$j" >/dev/null 2>&1 || ok=0; done; [[ "$ok" == 1 ]] && return 0; sleep 0.5; done; return 1; }
 snapshot_retry(){ local i=$1; for _ in $(seq 1 60); do snapshot_ok "$i" && return 0; sleep 0.5; done; return 1; }
 LSA1='{"origin":"0101010101010101010101010101010101010101010101010101010101010101","seq":1,"zone":null,"links":[],"prefixes":[{"prefix":"192.168.251.0/24","metric":0}],"overlay_ip":"10.247.0.10","addrs":[]}'
-JOIN='{"node_id":"0101010101010101010101010101010101010101010101010101010101010101","overlay_ip":"10.247.0.10","token":"join-roll"}'
 find_leader || { echo "FAIL: no initial leader" >&2; exit 1; }
 echo "initial leader=$L"
 TIMING=$(status "$((L-1))" | python3 -c 'import json,sys; r=(json.load(sys.stdin).get("raft") or {}); print(r.get("election_timeout_min_ms"), r.get("source"))')
@@ -83,7 +83,6 @@ for i in 0 1 2; do
     echo "FAIL: ctrl$((i+1)) did not log raft timing" >&2; exit 1; }
 done
 echo "raft timing ok: ${TIMING%% *}ms source=${TIMING##* }"
-ssh -o BatchMode=yes "${hosts[$((L-1))]}" "curl -fsS -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$JOIN' 'http://127.0.0.1:$C_PORT/v1/join'" >/dev/null
 ssh -o BatchMode=yes "${hosts[$((L-1))]}" "curl -fsS -H 'x-stellaris-secret: $SECRET' -H 'content-type: application/json' -d '$LSA1' 'http://127.0.0.1:$C_PORT/v1/lsa'" >/dev/null
 snapshot_ok "$((L-1))"
 # Rolling restart followers first.
@@ -120,4 +119,4 @@ ssh -o BatchMode=yes "${hosts[$((NL-1))]}" "curl -fsS -H 'x-stellaris-secret: $S
 start_node "$((OLD-1))"
 wait_all
 snapshot_retry "$((NL-1))"
-echo "OK: cross-region 3-controller rolling restart works."
+echo "OK: cross-region 3-controller rolling restart with a pre-registered member works."

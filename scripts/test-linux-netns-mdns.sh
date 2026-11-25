@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Two isolated Linux namespaces; mDNS/DNS-SD should discover the peer, then PSK auth.
+# Two isolated Linux namespaces; mDNS/DNS-SD should discover the peer and connect.
+# Dev-only unauthenticated mode: controller membership is not exercised here.
 BIN="${BIN:-$(pwd)/target/release/stellaris-agent}"
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -x "$BIN" ]] || { echo "missing Linux binary: $BIN" >&2; exit 1; }
@@ -25,9 +26,6 @@ overlay_ip = "$ip"
 [network]
 name = "mdns"
 cidr = "10.206.0.0/16"
-[network.auth]
-mode = "psk"
-secret = "mdns-secret"
 [transport]
 relay_urls = []
 disable_relay = true
@@ -35,6 +33,7 @@ listen_port = $port
 bind_ip = "$under"
 advertise = ["$under:$port"]
 mdns = true
+allow_unauthenticated_discovery = true
 [api]
 bind = "127.0.0.1:$api"
 TOML
@@ -50,4 +49,4 @@ if ! grep -q 'outbound iroh connected\|inbound iroh connection' "$DIR/a.log"; th
   echo "FAIL: mDNS peer not connected" >&2
   tail -30 "$DIR/a.log" >&2; exit 1
 fi
-echo "OK: mDNS discovery + PSK works."
+echo "OK: mDNS discovery works in dev-only unauthenticated mode."

@@ -135,3 +135,7 @@ routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、snapshot/manifest f
 3. 大状态写入/追赶性能：每次 append/apply 重写整份 raft JSON。批量导入随模型增长是 Θ(n²)（5.1k LSA 约 5 分 50 秒）；snapshot 后尾部追赶是 Θ(m×状态大小)。未做增量持久化。
 4. 真 multipath、真实互联网 PTB（需要小 MTU 链路/可控路由器）、macOS NAT/Windows、磁盘满/慢 IO 注入。
 （分片重组、ACL ICMP、IPv6 最小 MTU、审批入网、metrics/打包/CI 已在 2026-11-24 晚完成。）
+
+2026-11-25：入网已收敛为单一 controller 签名凭据（PSK/join token/`admission.mode` 删除），
+本地验证 172 项测试；仍未验证多 controller 各自 key 跨地域签发、CI 实跑。
+（应用层分片重组等旧条目仍有效。）

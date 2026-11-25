@@ -71,25 +71,6 @@ fn default_role() -> String {
     "member".to_string()
 }
 
-/// How a controller admits new members.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AdmissionMode {
-    /// Existing behaviour: one-time join token, or static allowlist.
-    #[default]
-    Legacy,
-    /// Signed join request is queued; an admin approves/denies it.
-    Approve,
-    /// Only members already configured in `control.members` may join.
-    Allowlist,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdmissionConfig {
-    #[serde(default)]
-    pub mode: AdmissionMode,
-}
-
 /// Explicit relay policy; `auto` keeps backwards-compatible behaviour:
 /// custom relays when `relay_urls` is non-empty, otherwise the N0 preset.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,18 +194,6 @@ pub struct ControlConfig {
     /// when unset; setting it separates member and admin authority.
     #[serde(default)]
     pub admin_secret: Option<String>,
-    /// Require `/v1/join` requests to be signed by the joining node's key.
-    /// Disabled by default because HTTP/curl bootstrap scripts cannot sign;
-    /// enable it for agent-driven joins.
-    #[serde(default)]
-    pub require_join_signature: bool,
-    /// Controller-side admission policy.
-    #[serde(default)]
-    pub admission: AdmissionConfig,
-    /// Member side: request admission even without a join token (used with
-    /// `admission.mode = "approve"`).
-    #[serde(default)]
-    pub request_admission: bool,
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
@@ -299,12 +268,10 @@ pub struct ControlConfig {
     /// Optional controller-side member allowlist / prefix grants.
     #[serde(default)]
     pub members: Vec<ControllerMemberConfig>,
-    /// One-time join tokens accepted by a controller.
-    #[serde(default)]
-    pub join_tokens: Vec<JoinTokenConfig>,
-    /// Member: one-time token used to request admission.
-    #[serde(default)]
-    pub join_token: Option<String>,
+    /// Lifetime of a signed membership credential in seconds. Members renew
+    /// at two thirds of this value; expired credentials are rejected.
+    #[serde(default = "default_credential_ttl")]
+    pub credential_ttl_secs: u64,
     /// Auto-add controller-listed members as peers (default true).
     #[serde(default = "default_true")]
     pub discover_members: bool,
@@ -342,9 +309,6 @@ impl Default for ControlConfig {
             bind: None,
             secret: None,
             admin_secret: None,
-            require_join_signature: false,
-            admission: AdmissionConfig::default(),
-            request_admission: false,
             epoch: None,
             leader_id: None,
             previous_secrets: Vec::new(),
@@ -368,8 +332,7 @@ impl Default for ControlConfig {
             allow_unsigned_snapshot: false,
             controller_threshold: 1,
             members: Vec::new(),
-            join_tokens: Vec::new(),
-            join_token: None,
+            credential_ttl_secs: default_credential_ttl(),
             discover_members: true,
             apply_routes: true,
             tls_cert: None,
@@ -394,18 +357,6 @@ impl ControlConfig {
             None => RaftTiming::default(),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JoinTokenConfig {
-    pub token: String,
-    /// Unix timestamp after which the token is invalid.
-    #[serde(default)]
-    pub expires_at: Option<u64>,
-    #[serde(default)]
-    pub prefixes: Vec<IpNet>,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -436,9 +387,8 @@ pub enum AuthMode {
     /// No membership authentication (development only).
     #[default]
     None,
-    /// Shared network secret with mutual HMAC challenge-response.
-    Psk,
-    /// Controller-signed membership manifest (design; not implemented yet).
+    /// Controller-signed membership credential presented during the iroh
+    /// handshake; peers verify it against `control.controller_keys`.
     Controller,
 }
 
@@ -446,11 +396,6 @@ pub enum AuthMode {
 pub struct NetworkAuthConfig {
     #[serde(default)]
     pub mode: AuthMode,
-    #[serde(default)]
-    pub secret: Option<String>,
-    /// Optional allowed peer NodeIds; empty means any holder of the PSK.
-    #[serde(default)]
-    pub allowed_nodes: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -582,6 +527,10 @@ fn default_lsa_ttl() -> u64 {
 }
 
 fn default_manifest_ttl() -> u64 {
+    3600
+}
+
+fn default_credential_ttl() -> u64 {
     3600
 }
 
@@ -738,17 +687,9 @@ impl Config {
                 self.network.cidr
             )));
         }
-        if self.network.auth.mode == AuthMode::Psk
-            && self
-                .network
-                .auth
-                .secret
-                .as_deref()
-                .map(str::trim)
-                .is_none_or(str::is_empty)
-        {
+        if self.control.credential_ttl_secs == 0 {
             return Err(ConfigError::Invalid(
-                "network.auth.secret is required when auth.mode = psk".into(),
+                "control.credential_ttl_secs must be > 0".into(),
             ));
         }
         if self.control.lsa_ttl_secs == 0 {
@@ -804,17 +745,6 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "control.raft_tls_require_client_cert requires raft_tls_client_cert/key".into(),
-            ));
-        }
-        if self.control.admission.mode == AdmissionMode::Approve && self.control.raft_dir.is_none()
-        {
-            return Err(ConfigError::Invalid(
-                "control.admission.mode = approve requires control.raft_dir".into(),
-            ));
-        }
-        if self.control.admission.mode == AdmissionMode::Approve && self.control.secret.is_none() {
-            return Err(ConfigError::Invalid(
-                "control.admission.mode = approve requires control.secret".into(),
             ));
         }
         if self.control.raft_dir.is_some() {
@@ -912,19 +842,6 @@ impl Config {
                 "control.controller_threshold (legacy fanout) was removed".into(),
             ));
         }
-        let mut join_tokens = HashSet::new();
-        for join in &self.control.join_tokens {
-            if join.token.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "control.join_tokens token must not be empty".into(),
-                ));
-            }
-            if !join_tokens.insert(join.token.clone()) {
-                return Err(ConfigError::Invalid(
-                    "duplicate control.join_tokens token".into(),
-                ));
-            }
-        }
         let mut member_ids = HashSet::new();
         for member in &self.control.members {
             let node: NodeId = member
@@ -939,9 +856,20 @@ impl Config {
             }
         }
         if self.network.auth.mode == AuthMode::Controller {
-            return Err(ConfigError::Invalid(
-                "network.auth.mode = controller is not implemented yet".into(),
-            ));
+            if self.control.controller_keys.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "network.auth.mode = controller requires control.controller_keys".into(),
+                ));
+            }
+            if self.node.role != "controller"
+                && self.control.endpoint_id.is_none()
+                && self.control.url.is_none()
+            {
+                return Err(ConfigError::Invalid(
+                    "network.auth.mode = controller requires control.endpoint_id or control.url"
+                        .into(),
+                ));
+            }
         }
         if self.dataplane.mtu < 576 {
             return Err(ConfigError::Invalid("dataplane.mtu must be >= 576".into()));
@@ -1024,8 +952,8 @@ impl Config {
             && !self.transport.allow_unauthenticated_discovery
         {
             return Err(ConfigError::Invalid(
-                "discovery (discovery_port/mdns) requires network.auth.mode = psk; \
-                 set transport.allow_unauthenticated_discovery only for isolated labs"
+                "discovery (discovery_port/mdns) requires controller membership \
+                 authentication; set transport.allow_unauthenticated_discovery only for isolated labs"
                     .into(),
             ));
         }
@@ -1339,19 +1267,21 @@ mdns = true
 "#;
         let error = Config::from_toml(base).unwrap_err().to_string();
         assert!(error.contains("discovery"), "{error}");
-        let with_psk = r#"
+        let with_controller = r#"
 [node]
 name = "a"
 [network]
 name = "demo"
 cidr = "10.7.0.0/16"
 [network.auth]
-mode = "psk"
-secret = "s"
+mode = "controller"
+[control]
+endpoint_id = "0101010101010101010101010101010101010101010101010101010101010101"
+controller_keys = ["0202020202020202020202020202020202020202020202020202020202020202"]
 [transport]
 mdns = true
 "#;
-        assert!(Config::from_toml(with_psk).is_ok());
+        assert!(Config::from_toml(with_controller).is_ok());
         let lab = base.replace(
             "[transport]",
             "[transport]\nallow_unauthenticated_discovery = true",

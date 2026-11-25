@@ -230,7 +230,7 @@ P0 证据速查：
 | metrics/audit 细化 | `/metrics` 新增 acl_rejected/spoof/fragment/reassembly；ACL 审计带 rule/src/dst/proto/peer | API 单测 |
 | 打包/CI 矩阵 | systemd 两个 unit（capability 最小化）+ packaging 文档；CI ubuntu/macos + netns/TLS/docker + 脚本语法 | 文件已加；GitHub CI 未实际跑过 |
 | 真实互联网 PMTUD | 实测成都→深圳路径 MTU 1500（payload 1472 通、1473 报错）；tracepath pmtu 1500 | `TEST-RESULTS.md` §3.12；云网络无更小 MTU 链路，路由器 PTB 生成未观测 |
-| 入网 ACL | `admission.mode = approve/allowlist`：签名申请入 Raft 待审队列，admin 审批时显式授予前缀/能力 | 模型单测 + controller 集成测试（未签名 403、待审 202、member secret 不能审批、批准后 200） |
+| 入网 ACL（已被 2026-11-25 方案取代，见 §7.5） | `admission.mode = approve/allowlist`：签名申请入 Raft 待审队列，admin 审批时显式授予前缀/能力 | 模型单测 + controller 集成测试（未签名 403、待审 202、member secret 不能审批、批准后 200） |
 
 ### 7.3 仍开放的 P1/P2 边界
 
@@ -256,3 +256,28 @@ P0 证据速查：
 - 开启 `discovery_port`/`mdns` 且 `auth.mode = "none"` 现在会配置报错；隔离实验需显式 `transport.allow_unauthenticated_discovery = true`。
 - `disable_relay` 与 `relay_urls` 同时配置会报错（此前静默忽略 relay_urls）。
 - 分片重组在 ACL 前执行；超限/重叠（IPv6）分片会被丢弃并计入 `frag_dropped`。
+
+### 7.5 2026-11-25 入网模型二次收敛：单一成员凭据
+
+审计结论中“PSK + join token + admission.mode 三套入口”属于**重叠而非纵深**，本轮把它们收敛为
+一套 controller 签名的 `MembershipCredential`：
+
+- **删除**：`network.auth.secret`、`network.auth.allowed_nodes`、`control.join_token(s)`、
+  `control.require_join_signature`、`control.admission`、`control.request_admission`、
+  `POST /v1/join`、`AuthMode::Psk`、`AdmissionMode`/`JoinTokenConfig`。
+- **新增**：`MembershipCredential { network, node, overlay_ip, prefixes, capabilities,
+  revision, not_after }` + controller 签名；`POST /v1/enroll`（HTTP 签名请求）与
+  iroh `Request::Enroll`；`POST /v1/members/{node}/grants`；`control.credential_ttl_secs`。
+- **握手**：数据面 bi-stream 交换凭据，验证 `network`、`node == remote_id`、
+  `issuer ∈ controller_keys`、签名、`not_after`、`revision`；失败即关闭连接。
+- **撤销**：`RevokeMember`/`DenyAdmission` 递增 revision 并写 tombstone；member 在
+  下一个快照（≤10s）主动断连并丢弃 grant/LSA；旧凭据因 revision 回滚被拒绝。
+- **授权解耦**：grant 可单独更新（`/v1/members/{node}/grants`），不再需要 revoke + 重新审批。
+- **认证边界变化**：`controller` 模式不再接受任何 PSK 连接（fail-closed）；`none`
+  仅保留给隔离实验，且 discovery 需 `allow_unauthenticated_discovery`。
+
+验证（全部本地，无云主机）：`cargo test --workspace` 覆盖凭据签名/篡改/过期/跨网络/
+revision 回滚、controller 预注册与审批签发、HTTP enroll 落盘、撤销丢 grant、
+以及真实 iroh 双端点凭据握手（无凭据节点被拒绝）。脚本层同步改为预注册或
+enroll+approve 流程。
+

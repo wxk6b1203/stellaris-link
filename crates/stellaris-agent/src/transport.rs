@@ -38,8 +38,9 @@ pub enum ControlEvent {
 pub struct IrohTransport {
     endpoint: Endpoint,
     config: Arc<Config>,
+    state: crate::AgentState,
+    controller_keys: Vec<NodeId>,
     network: NetworkId,
-    local: NodeId,
     peers: PeerRegistry,
     inbound_tx: mpsc::Sender<InboundPacket>,
     control_tx: Option<mpsc::Sender<ControlEvent>>,
@@ -51,6 +52,7 @@ pub struct IrohTransport {
 
 impl IrohTransport {
     pub async fn start(
+        state: crate::AgentState,
         config: Arc<Config>,
         network: NetworkId,
         secret: [u8; 32],
@@ -98,14 +100,20 @@ impl IrohTransport {
             endpoint.online().await;
         }
         let me = endpoint.id();
-        let local = NodeId::new(*me.as_bytes());
         info!(endpoint = %me, addr = ?endpoint.addr(), "iroh endpoint ready");
 
+        let controller_keys: Vec<NodeId> = config
+            .control
+            .controller_keys
+            .iter()
+            .filter_map(|key| key.parse().ok())
+            .collect();
         let transport = Arc::new(Self {
             endpoint: endpoint.clone(),
             config: config.clone(),
+            state,
+            controller_keys,
             network,
-            local,
             peers: peers.clone(),
             inbound_tx: inbound_tx.clone(),
             control_tx: control_tx.clone(),
@@ -146,23 +154,31 @@ impl IrohTransport {
                     };
                     let remote = conn.remote_id();
                     let node = NodeId::new(*remote.as_bytes());
-                    if accept_config.network.auth.mode == AuthMode::Psk {
-                        let secret = accept_config.network.auth.secret.as_deref().unwrap_or("");
+                    if accept_config.network.auth.mode == AuthMode::Controller {
+                        let credential = transport.state.credential();
                         let auth = tokio::time::timeout(
                             Duration::from_secs(5),
                             crate::membership::authenticate_server(
                                 &conn,
-                                transport.network,
-                                transport.local,
-                                secret,
-                                &accept_config.network.auth.allowed_nodes,
+                                &transport.network,
+                                &transport.controller_keys,
+                                credential.as_ref(),
+                                |peer| transport.state.revision(peer),
                             ),
                         )
                         .await;
-                        if !matches!(auth, Ok(Ok(_))) {
-                            warn!(peer = %node.short(), "membership authentication failed");
-                            conn.close(2u8.into(), b"auth failed");
-                            continue;
+                        match auth {
+                            Ok(Ok(verified)) => transport.state.install_grant(&verified),
+                            Ok(Err(error)) => {
+                                warn!(peer = %node.short(), error = %error, "membership authentication failed");
+                                conn.close(2u8.into(), b"auth failed");
+                                continue;
+                            }
+                            Err(_) => {
+                                warn!(peer = %node.short(), "membership authentication timed out");
+                                conn.close(2u8.into(), b"auth timeout");
+                                continue;
+                            }
                         }
                     }
                     info!(peer = %node.short(), "inbound iroh connection");
@@ -241,6 +257,20 @@ impl IrohTransport {
 
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// Force-close a peer connection (used when the controller revokes it).
+    pub fn close_peer(&self, node: NodeId) {
+        let conn = self
+            .conns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node);
+        if let Some(conn) = conn {
+            conn.close(3u8.into(), b"revoked");
+            warn!(peer = %node.short(), "closed revoked peer connection");
+        }
+        self.state.drop_grant(node);
     }
 
     /// Minimum application datagram size across active connections, if any.
@@ -421,30 +451,33 @@ async fn connect_loop(
     loop {
         match transport.endpoint.connect(addr.clone(), DATA_ALPN).await {
             Ok(conn) => {
-                if transport.config.network.auth.mode == AuthMode::Psk {
-                    let secret = transport
-                        .config
-                        .network
-                        .auth
-                        .secret
-                        .as_deref()
-                        .unwrap_or("");
+                if transport.config.network.auth.mode == AuthMode::Controller {
+                    let credential = transport.state.credential();
                     let auth = tokio::time::timeout(
                         Duration::from_secs(5),
                         crate::membership::authenticate_client(
                             &conn,
-                            transport.network,
-                            transport.local,
-                            node,
-                            secret,
+                            &transport.network,
+                            &transport.controller_keys,
+                            credential.as_ref(),
+                            |peer| transport.state.revision(peer),
                         ),
                     )
                     .await;
-                    if !matches!(auth, Ok(Ok(()))) {
-                        warn!(peer = %peer.name, "membership authentication failed");
-                        conn.close(2u8.into(), b"auth failed");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
+                    match auth {
+                        Ok(Ok(verified)) => transport.state.install_grant(&verified),
+                        Ok(Err(error)) => {
+                            warn!(peer = %peer.name, error = %error, "membership authentication failed");
+                            conn.close(2u8.into(), b"auth failed");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(peer = %peer.name, "membership authentication timed out");
+                            conn.close(2u8.into(), b"auth timeout");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
                     }
                 }
                 info!(peer = %peer.name, "outbound iroh connected");
@@ -477,6 +510,7 @@ async fn connect_loop(
                 let stable_id = conn.stable_id();
                 conn.closed().await;
                 transport.remove_conn_if(node, stable_id);
+                transport.state.drop_grant(node);
                 transport
                     .peers
                     .mark(&node, false, None, None, None, None, 0);
@@ -585,7 +619,9 @@ bind = "127.0.0.1:0"
         let network = NetworkId::new();
         let (tx_a, _rx_a) = mpsc::channel(64);
         let (tx_b, _rx_b) = mpsc::channel(64);
+        let state_a = crate::AgentState::build(config_a.clone()).unwrap();
         let a = IrohTransport::start(
+            state_a,
             Arc::new(config_a),
             network,
             [11u8; 32],
@@ -609,7 +645,9 @@ cidr = "10.8.0.0/16"
         )
         .await
         .unwrap();
+        let state_b = crate::AgentState::build(config_b.clone()).unwrap();
         let b = IrohTransport::start(
+            state_b,
             Arc::new(config_b),
             network,
             [12u8; 32],
@@ -777,7 +815,9 @@ cidr = "10.8.0.0/16"
         let network = NetworkId::new();
         let (tx_a, _rx_a) = mpsc::channel(64);
         let (tx_b, _rx_b) = mpsc::channel(64);
+        let state_a = crate::AgentState::build(config_a.clone()).unwrap();
         let a = IrohTransport::start(
+            state_a,
             Arc::new(config_a.clone()),
             network,
             [1u8; 32],
@@ -787,7 +827,9 @@ cidr = "10.8.0.0/16"
         )
         .await
         .unwrap();
+        let state_b = crate::AgentState::build(config_b.clone()).unwrap();
         let b = IrohTransport::start(
+            state_b,
             Arc::new(config_b.clone()),
             network,
             [2u8; 32],
@@ -824,5 +866,139 @@ cidr = "10.8.0.0/16"
         drop(b);
         drop(server);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    fn node_for(secret: [u8; 32]) -> NodeId {
+        NodeId::new(*SecretKey::from_bytes(&secret).public().as_bytes())
+    }
+
+    fn credential(
+        controller_secret: &[u8; 32],
+        network: &NetworkId,
+        node: NodeId,
+        overlay: &str,
+    ) -> crate::credential::SignedCredential {
+        crate::credential::SignedCredential::sign(
+            controller_secret,
+            crate::credential::MembershipCredential {
+                network: network.to_string(),
+                node,
+                overlay_ip: Some(overlay.parse().unwrap()),
+                prefixes: Vec::new(),
+                capabilities: vec!["member".into()],
+                revision: 1,
+                issued_at: crate::credential::now_secs(),
+                not_after: crate::credential::now_secs() + 600,
+            },
+        )
+    }
+
+    fn controller_config(config: &mut Config, controller: NodeId) {
+        config.network.auth.mode = AuthMode::Controller;
+        config.control.controller_keys = vec![controller.to_string()];
+        config.control.url = Some("http://127.0.0.1:1".into());
+        config.control.credential_ttl_secs = 600;
+    }
+
+    #[tokio::test]
+    async fn controller_credentials_gate_connections_and_install_grants() {
+        let (server, relay_url) = start_relay().await;
+        let base = std::env::temp_dir().join(format!("stellaris-cred-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let controller_secret = [9u8; 32];
+        let controller = node_for(controller_secret);
+        let mut config_a = config("a", &base.join("a"), &relay_url, "10.7.0.1");
+        let mut config_b = config("b", &base.join("b"), &relay_url, "10.7.0.2");
+        let mut config_c = config("c", &base.join("c"), &relay_url, "10.7.0.3");
+        for config in [&mut config_a, &mut config_b, &mut config_c] {
+            controller_config(config, controller);
+        }
+        let state_a = crate::AgentState::build(config_a.clone()).unwrap();
+        let state_b = crate::AgentState::build(config_b.clone()).unwrap();
+        let state_c = crate::AgentState::build(config_c.clone()).unwrap();
+        let network = state_a.network;
+        state_a.set_credential(credential(
+            &controller_secret,
+            &network,
+            node_for([1u8; 32]),
+            "10.7.0.1",
+        ));
+        state_b.set_credential(credential(
+            &controller_secret,
+            &network,
+            node_for([2u8; 32]),
+            "10.7.0.2",
+        ));
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let (tx_b, _rx_b) = mpsc::channel(64);
+        let (tx_c, _rx_c) = mpsc::channel(64);
+        let a = IrohTransport::start(
+            state_a.clone(),
+            state_a.config.clone(),
+            network,
+            [1u8; 32],
+            PeerRegistry::from_config(&config_a).unwrap(),
+            tx_a,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = IrohTransport::start(
+            state_b.clone(),
+            state_b.config.clone(),
+            network,
+            [2u8; 32],
+            PeerRegistry::from_config(&config_b).unwrap(),
+            tx_b,
+            None,
+        )
+        .await
+        .unwrap();
+        let c = IrohTransport::start(
+            state_c.clone(),
+            state_c.config.clone(),
+            network,
+            [3u8; 32],
+            PeerRegistry::from_config(&config_c).unwrap(),
+            tx_c,
+            None,
+        )
+        .await
+        .unwrap();
+        let peer = |name: &str, id: NodeId, overlay: &str| PeerConfig {
+            name: name.into(),
+            endpoint_id: id.to_string(),
+            overlay_ip: overlay.parse().unwrap(),
+            addrs: vec![],
+            relay_url: Some(relay_url.clone()),
+            advertised: vec![],
+            zone: None,
+        };
+        let a_id = node_for([1u8; 32]);
+        let b_id = node_for([2u8; 32]);
+        a.add_peer(peer("b", b_id, "10.7.0.2"), true);
+        b.add_peer(peer("a", a_id, "10.7.0.1"), true);
+        c.add_peer(peer("b", b_id, "10.7.0.2"), true);
+        for _ in 0..100 {
+            if a.peers.get(&b_id).is_some_and(|p| p.connected)
+                && b.peers.get(&a_id).is_some_and(|p| p.connected)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(a.peers.get(&b_id).is_some_and(|p| p.connected));
+        assert!(b.peers.get(&a_id).is_some_and(|p| p.connected));
+        // The handshake installs grants derived from the presented credentials.
+        assert!(state_a.grants.read().unwrap().contains_key(&b_id));
+        assert!(state_b.grants.read().unwrap().contains_key(&a_id));
+        // A node with no credential cannot join the data plane.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(!c.peers.get(&b_id).is_some_and(|p| p.connected));
+        drop(a);
+        drop(b);
+        drop(c);
+        drop(server);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

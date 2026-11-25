@@ -65,10 +65,10 @@ link_state:  LinkStateDb            // 由 LSA 汇总
 acks:        HashMap<NodeId,u64>    // 持久化 JSON
 generation:  AtomicU64
 epoch:       u64
-secret:      shared HMAC secret
+secret:      shared HMAC secret（仅 snapshot HMAC；成员身份用签名凭据）
 ```
 
-Member 通过 HTTP/iroh 拉 snapshot，校验 HMAC，应用并 ACK。
+Member 通过 HTTP/iroh 拉 snapshot，校验 HMAC/Ed25519，应用并 ACK；成员身份由 `MembershipCredential` 在握手时证明。
 
 问题：
 
@@ -76,7 +76,7 @@ Member 通过 HTTP/iroh 拉 snapshot，校验 HMAC，应用并 ACK。
 2. **LSA 含时间/连接状态**：RTT metric、TTL expiry 依赖本地 `Instant`/wall clock。
 3. **RouteId 随机生成**：同一条命令在不同节点重放会产生不同 ID。
 4. **fanout 无 quorum**：多 controller 各写各的，没有 split-brain 保护。
-5. **安全边界不足**：shared secret + HMAC 能防篡改，但不能证明“某个 member 有权提交某条前缀”。
+5. **安全边界不足**：shared secret + HMAC 能防篡改，但不能证明“某个 member 有权提交某条前缀”；现已由 controller 签名的成员凭据（含 prefixes/capabilities）补上。
 6. **ACK 与 snapshot 不是 Raft 状态**：当前 ACK 存在本地 JSON，无法保证多副本一致。
 
 ---
@@ -332,13 +332,17 @@ control.raft_election_timeout_ms   (正式配置)
   现存 LSA 一个 TTL 宽限期。
 - **epoch**：Raft 模式初始 epoch 为 0（配置显式值优先），leader 当选后写入
   `SetEpoch{max(now, epoch+1)}`；`RevokeMember` 也会 +1，旧 manifest 因此失效。
-- **加入**：`require_join_signature = true` 时，`/v1/join` 必须带 nonce 与
-  origin 私钥签名；member agent 始终签名，curl 引导脚本需显式关闭或自行签名。
-- **权限**：`control.admin_secret` 存在时，`revoke` 与 `routes` 只接受 admin
-  secret，member secret 仅能读快照/写 LSA/加入。
-- **入网审批**：`admission.mode = approve` 时，签名 join 以 `RequestAdmission`
-  进入 Raft 待审队列；`GET /v1/admissions` 列出，管理员通过
-  `POST /v1/admissions/{node}/approve|deny` 授予/拒绝（前缀与能力由管理员显式给出）。
+- **加入（2026-11-25 起）**：`POST /v1/enroll`（签名请求）或 iroh
+  `Request::Enroll`（连接已由 node key 认证）是唯一入口；已预注册的节点直接拿到
+  controller 签名的 `MembershipCredential`，未知节点以 `RequestAdmission` 进入
+  Raft 待审队列。`/v1/join`、join token 与 `require_join_signature` 已删除。
+- **权限**：`control.admin_secret` 存在时，`revoke`、`routes`、`admissions` 与
+  `members/{node}/grants` 只接受 admin secret，member secret 仅能读快照/写 LSA/enroll。
+- **入网审批**：`GET /v1/admissions` 列出待审；管理员通过
+  `POST /v1/admissions/{node}/approve|deny` 授予/拒绝（前缀与能力由管理员显式给出），
+  deny 与 revoke 都会写 tombstone，节点不能再次自助入网。
+- **凭据与撤销**：审批结果决定 `member_revisions`，member 续签时拿到新 revision；
+  撤销后 member 在下一个快照（≤10s）断开该 peer 并丢弃 grant，旧 revision 凭据被拒绝。
 - **动态成员**：`POST /v1/raft/learner {id, addr}` 与
   `POST /v1/raft/membership {voters:[{id,addr}]}`（admin）分别封装
   `add_learner`（非阻塞）与 `change_membership`。
@@ -378,7 +382,7 @@ If-Match: generation
 }
 ```
 
-- 签名从共享 HMAC 迁移到 controller Ed25519（或双签名过渡）；
+- 签名从共享 HMAC 迁移到 controller Ed25519：成员凭据已完成，snapshot 仍保留 HMAC 兼容；
 - member 校验 controller 公钥/manifest；
 - epoch 不匹配 → 409/重新拉取；
 - ACK 只接受当前 epoch 的 leader snapshot。

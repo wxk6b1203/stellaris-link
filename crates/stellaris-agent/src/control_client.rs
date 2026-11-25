@@ -47,24 +47,27 @@ async fn run_http(
             return;
         }
     };
-    let mut joined = state.config.control.join_token.is_none();
+    let mut last_enroll = Instant::now() - Duration::from_secs(60);
     let mut last_manifest = Instant::now() - Duration::from_secs(60);
     let mut last_generation = 0u64;
     let mut last_epoch = 0u64;
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
-        if !joined
-            && (state.config.control.join_token.is_some() || state.config.control.request_admission)
-        {
-            joined = matches!(
-                try_join(&client, &base, &state, secret.as_deref()).await,
-                JoinOutcome::Joined
-            );
+        if credential_needs_renewal(&state) && last_enroll.elapsed() >= Duration::from_secs(5) {
+            last_enroll = Instant::now();
+            enroll_http(&client, &base, &state, secret.as_deref()).await;
         }
         if !state.config.control.controller_keys.is_empty()
             && last_manifest.elapsed() >= Duration::from_secs(10)
-            && try_manifest(&client, &base, &state, secret.as_deref()).await
+            && try_manifest(
+                &client,
+                &base,
+                &state,
+                transport.as_ref(),
+                secret.as_deref(),
+            )
+            .await
         {
             last_manifest = Instant::now();
         }
@@ -209,6 +212,35 @@ async fn run_iroh(
             }
         };
         loop {
+            if credential_needs_renewal(&state) {
+                let req = Request::Enroll {
+                    overlay_ip: state.config.node.overlay_ip,
+                    zone: state.config.node.zone.clone(),
+                    addrs: state.config.transport.advertise.clone(),
+                    secret: secret.clone(),
+                };
+                match request(&conn, &req).await {
+                    Ok(Response::Credential { credential }) => {
+                        if install_credential(&state, &credential) {
+                            tracing::info!("membership credential issued");
+                        }
+                    }
+                    Ok(Response::Pending { .. }) => {
+                        tracing::debug!("enrollment pending administrator approval");
+                    }
+                    Ok(Response::Denied { reason, .. }) => {
+                        tracing::warn!(%reason, "enrollment denied");
+                    }
+                    Ok(Response::Error { code, message }) => {
+                        tracing::warn!(code, message, "controller enrollment error");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(error = %e, "controller enroll request failed");
+                        break;
+                    }
+                }
+            }
             if last_lsa.elapsed() >= Duration::from_secs(10) {
                 seq = seq.max(now_seq());
                 let lsa = local_lsa(&state, seq);
@@ -258,7 +290,7 @@ async fn run_iroh(
                 Ok(Response::Error { code, message }) => {
                     tracing::warn!(code, message, "controller error");
                 }
-                Ok(Response::Ok { .. }) => {}
+                Ok(_) => {}
                 Err(e) => {
                     tracing::debug!(error = %e, "controller iroh request failed");
                     break;
@@ -295,6 +327,7 @@ async fn try_manifest(
     client: &reqwest::Client,
     base: &str,
     state: &AgentState,
+    transport: Option<&std::sync::Arc<IrohTransport>>,
     secret: Option<&str>,
 ) -> bool {
     let now = SystemTime::now()
@@ -315,7 +348,7 @@ async fn try_manifest(
                     if verify_manifest(state, &manifest, now).is_none() {
                         return false;
                     }
-                    state.set_grants(&manifest.members);
+                    apply_members(state, &manifest.members, transport);
                     tracing::debug!(
                         generation = manifest.generation,
                         members = manifest.members.len(),
@@ -373,64 +406,135 @@ fn verify_manifest(
     Some(controller)
 }
 
-enum JoinOutcome {
-    Joined,
-    Pending,
-    Rejected,
+/// True when we have no credential, or it is past two thirds of its lifetime.
+fn credential_needs_renewal(state: &AgentState) -> bool {
+    if state.config.network.auth.mode != stellaris_types::AuthMode::Controller {
+        return false;
+    }
+    let Some(credential) = state.credential() else {
+        return true;
+    };
+    credential.needs_renewal(crate::credential::now_secs())
 }
 
-async fn try_join(
+fn install_credential(state: &AgentState, signed: &crate::credential::SignedCredential) -> bool {
+    let keys: Vec<NodeId> = state
+        .config
+        .control
+        .controller_keys
+        .iter()
+        .filter_map(|key| key.parse().ok())
+        .collect();
+    if keys.is_empty() {
+        tracing::warn!("controller credential ignored: control.controller_keys is empty");
+        return false;
+    }
+    match signed.verify(
+        &state.network,
+        state.node_id,
+        &keys,
+        0,
+        crate::credential::now_secs(),
+    ) {
+        Ok(_) => {
+            state.set_credential(signed.clone());
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "controller credential rejected");
+            false
+        }
+    }
+}
+
+/// Apply the controller membership list: refresh revisions and revoke peers
+/// that are no longer members (close their connection, drop their grant).
+fn apply_members(
+    state: &AgentState,
+    members: &[crate::controller::MemberView],
+    transport: Option<&std::sync::Arc<IrohTransport>>,
+) {
+    let mut known = std::collections::HashSet::new();
+    for member in members {
+        if let Ok(node) = member.node_id.parse::<NodeId>() {
+            known.insert(node);
+            state.observe_revision(node, member.revision);
+        }
+    }
+    let stale: Vec<NodeId> = state
+        .grants
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .filter(|node| !known.contains(node))
+        .collect();
+    for node in stale {
+        tracing::warn!(peer = %node.short(), "member is no longer authorized; revoking");
+        match transport {
+            Some(transport) => transport.close_peer(node),
+            None => state.drop_grant(node),
+        }
+    }
+}
+
+/// HTTP enrollment (debug/bootstrap path). The request is signed by the node
+/// key; the iroh control channel does not need a signature.
+async fn enroll_http(
     client: &reqwest::Client,
     base: &str,
     state: &AgentState,
     secret: Option<&str>,
-) -> JoinOutcome {
-    if state.config.control.join_token.is_none() && !state.config.control.request_admission {
-        return JoinOutcome::Joined;
-    }
-    let token = state.config.control.join_token.as_deref().unwrap_or("");
-    let Some(overlay) = state.config.node.overlay_ip else {
-        tracing::warn!("join requires node.overlay_ip");
-        return JoinOutcome::Joined;
-    };
-    let nonce = uuid::Uuid::now_v7().to_string();
-    let payload = crate::controller::join_payload_bytes(
+) {
+    let overlay = state.config.node.overlay_ip;
+    let overlay_text = overlay.map(|ip| ip.to_string());
+    let payload = crate::controller::enroll_payload_bytes(
         &state.network.to_string(),
         &state.node_id.to_string(),
-        &overlay.to_string(),
-        token,
-        &nonce,
+        overlay_text.as_deref(),
+        state.config.node.zone.as_deref(),
     );
     let signature = crate::controller::sign_ed25519(&state.identity_secret, &payload);
     let mut request = client
-        .post(format!("{base}/v1/join"))
+        .post(format!("{base}/v1/enroll"))
         .json(&serde_json::json!({
             "node_id": state.node_id.to_string(),
-            "overlay_ip": overlay.to_string(),
-            "token": token,
-            "nonce": nonce,
+            "overlay_ip": overlay_text,
+            "zone": state.config.node.zone,
+            "addrs": state.config.transport.advertise,
             "signature": signature,
         }));
     if let Some(secret) = secret {
         request = request.header("x-stellaris-secret", secret);
     }
     match request.send().await {
-        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
-            tracing::info!(%base, "join request queued for administrator approval");
-            JoinOutcome::Pending
-        }
         Ok(response) if response.status().is_success() => {
-            tracing::info!(%base, "controller admitted member");
-            JoinOutcome::Joined
+            match response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|value| value.get("credential").cloned())
+                .and_then(|value| {
+                    serde_json::from_value::<crate::credential::SignedCredential>(value).ok()
+                }) {
+                Some(credential) => {
+                    if install_credential(state, &credential) {
+                        tracing::info!(%base, "membership credential issued");
+                    }
+                }
+                None => tracing::warn!(%base, "controller response carried no credential"),
+            }
+        }
+        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
+            tracing::info!(%base, "enrollment queued for administrator approval");
+        }
+        Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
+            tracing::warn!(%base, status = %response.status(), "enrollment denied");
         }
         Ok(response) => {
-            tracing::warn!(%base, status = %response.status(), "join rejected");
-            JoinOutcome::Rejected
+            tracing::warn!(%base, status = %response.status(), "enrollment rejected")
         }
-        Err(e) => {
-            tracing::debug!(%base, error = %e, "join request failed");
-            JoinOutcome::Rejected
-        }
+        Err(e) => tracing::debug!(%base, error = %e, "controller enrollment unreachable"),
     }
 }
 
@@ -510,7 +614,14 @@ fn apply_verified_snapshot(
     last_epoch: &mut u64,
     transport: Option<&std::sync::Arc<IrohTransport>>,
 ) -> Option<(u64, u64)> {
-    if snapshot.generation == last_generation {
+    if snapshot.generation <= last_generation {
+        if snapshot.generation < last_generation {
+            tracing::warn!(
+                got = snapshot.generation,
+                seen = last_generation,
+                "controller snapshot generation rolled back; ignored"
+            );
+        }
         return None;
     }
     if snapshot.epoch < *last_epoch {
@@ -522,7 +633,7 @@ fn apply_verified_snapshot(
         return None;
     }
     *last_epoch = (*last_epoch).max(snapshot.epoch);
-    state.set_grants(&snapshot.members);
+    apply_members(state, &snapshot.members, transport);
     if state.config.control.discover_members {
         discover_members(state, &snapshot.members, transport);
     }
@@ -745,5 +856,117 @@ url = "http://127.0.0.1:7800"
             apply_verified_snapshot(&state, snap, generation - 1, &mut last_epoch, None).is_none()
         );
         assert_eq!(last_epoch, 5);
+    }
+
+    fn node_for(secret: [u8; 32]) -> NodeId {
+        use ed25519_dalek::SigningKey;
+        NodeId::new(SigningKey::from_bytes(&secret).verifying_key().to_bytes())
+    }
+
+    #[tokio::test]
+    async fn http_enrollment_installs_a_credential() {
+        let controller_secret = [9u8; 32];
+        let controller = node_for(controller_secret);
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-enroll-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent_toml = format!(
+            r#"
+[node]
+name = "m"
+state_dir = "{}"
+overlay_ip = "10.7.0.2"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+url = "http://127.0.0.1:1"
+secret = "s3cret"
+controller_keys = ["{controller}"]
+credential_ttl_secs = 600
+"#,
+            dir.join("agent").display()
+        );
+        let agent = AgentState::build(Config::from_toml(&agent_toml).unwrap()).unwrap();
+        let cdir = dir.join("controller");
+        std::fs::create_dir_all(&cdir).unwrap();
+        let controller_toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+
+[[control.members]]
+node_id = "{}"
+overlay_ip = "10.7.0.2"
+prefixes = ["192.168.50.0/24"]
+"#,
+            cdir.display(),
+            agent.node_id
+        );
+        let mut controller_state = crate::controller::ControllerState::from_config(
+            &Config::from_toml(&controller_toml).unwrap(),
+        )
+        .unwrap();
+        controller_state.set_signing_key(controller_secret);
+        let app = crate::controller::router(controller_state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = http_client(&agent.config).unwrap();
+        enroll_http(&client, &format!("http://{addr}"), &agent, Some("s3cret")).await;
+        let credential = agent.credential().expect("credential installed");
+        assert_eq!(credential.credential.node, agent.node_id);
+        assert_eq!(credential.issuer, controller);
+        assert_eq!(
+            credential.credential.prefixes,
+            vec!["192.168.50.0/24".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn revoked_members_lose_their_grants_and_revisions_advance() {
+        let state = agent("");
+        let node = NodeId::new([5u8; 32]);
+        state.grants.write().unwrap().insert(
+            node,
+            crate::membership::Grant {
+                overlay_ip: Some("10.7.0.5".parse().unwrap()),
+                prefixes: Vec::new(),
+                capabilities: vec!["member".into()],
+            },
+        );
+        let view = crate::controller::MemberView {
+            node_id: node.to_string(),
+            zone: None,
+            overlay_ip: Some("10.7.0.5".parse().unwrap()),
+            addrs: Vec::new(),
+            prefixes: Vec::new(),
+            allowed_prefixes: Vec::new(),
+            capabilities: vec!["member".into()],
+            links: Vec::new(),
+            last_seq: 0,
+            revision: 5,
+        };
+        apply_members(&state, &[view], None);
+        assert_eq!(state.revision(node), 5);
+        assert!(state.grants.read().unwrap().contains_key(&node));
+        apply_members(&state, &[], None);
+        assert!(!state.grants.read().unwrap().contains_key(&node));
     }
 }

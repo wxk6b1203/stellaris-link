@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Requires root + Linux binary. Two isolated namespaces discover each other
-# over UDP broadcast, then authenticate with PSK.
+# over UDP broadcast and connect (dev-only unauthenticated mode).
 BIN="${BIN:-$(pwd)/target/release/stellaris-agent}"
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -x "$BIN" ]] || { echo "missing Linux binary: $BIN" >&2; exit 1; }
@@ -26,9 +26,6 @@ overlay_ip = "$ip"
 [network]
 name = "discovery"
 cidr = "10.204.0.0/16"
-[network.auth]
-mode = "psk"
-secret = "discovery-secret"
 [transport]
 relay_urls = []
 disable_relay = true
@@ -36,6 +33,7 @@ listen_port = $port
 advertise = ["$under:$port"]
 discovery_port = 47000
 discovery_broadcast = "10.203.0.255:47000"
+allow_unauthenticated_discovery = true
 [api]
 bind = "127.0.0.1:$api"
 TOML
@@ -54,4 +52,4 @@ if ! grep -q 'outbound iroh connected' "$DIR/a.log" && ! grep -q 'inbound iroh c
   tail -20 "$DIR/a.log" >&2
   exit 1
 fi
-echo "OK: UDP broadcast discovery + PSK works."
+echo "OK: UDP broadcast discovery works in dev-only unauthenticated mode."

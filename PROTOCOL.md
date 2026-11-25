@@ -4,7 +4,7 @@
 > 配套：`ARCHITECTURE.md`
 > 范围：控制面 wire protocol、RouteQuery/RouteAdjust HTTP API、CLI 映射、版本/安全约定。
 >
-> **实现状态（2026-11-24）**：HTTP controller 已含 openraft HA、mTLS、snapshot/manifest、join/revoke/ack、`/v1/admissions` 审批、`/v1/raft/*` 成员操作；iroh control 已实现 JSON 帧（签名 LSA/ACK、线性化快照）并走 Raft；ACL 支持 `deny_action=reject` 回 ICMP，数据面做分片重组。本文中的 protobuf/8MiB/Hello/nonce/Delta、`/v1/paths`、SSE、history/rollback 等仍是设计目标，未实现项以 [AUDIT.md](AUDIT.md) §5/§7 为准。
+> **实现状态（2026-11-25）**：入网改为 controller 签名的成员凭据（`/v1/enroll`、iroh `Request::Enroll`），PSK/join token/`admission.mode` 已删除；HTTP controller 含 openraft HA、mTLS、snapshot/manifest、revoke/ack、`/v1/admissions`、`/v1/members/{node}/grants`、`/v1/raft/*`；iroh control 已实现 JSON 帧（签名 LSA/ACK、线性化快照）并走 Raft；ACL 支持 `deny_action=reject` 回 ICMP，数据面做分片重组。本文中的 protobuf/8MiB/Hello/nonce/Delta、`/v1/paths`、SSE、history/rollback 等仍是设计目标，未实现项以 [AUDIT.md](AUDIT.md) §5/§7 为准。
 
 ---
 
@@ -125,6 +125,11 @@ signature = Ed25519(node_key, SHA256(transcript))
 - controller 校验：成员存在、epoch 匹配/可接受、timestamp ±5min、nonce 未复用、签名有效。
 - `HelloAck.signature` 用 controller key 签同一 transcript + nonce_echo，agent 校验。
 - 失败：返回 `Error{code=UNAUTHENTICATED|EPOCH_MISMATCH|NOT_MEMBER}`，关闭连接。
+
+> **当前实现（2026-11-25）**：上面的 Hello 仍是设计目标。实际握手是在 iroh 连接上的一条
+> bi-stream 里各发一帧 JSON `SignedCredential`（见 §10.1），由对端验证
+> `network`、`node == conn.remote_id()`、`issuer ∈ controller_keys`、Ed25519 签名、
+> `not_after`、`revision`。没有共享秘密，没有 nonce。
 
 ### 1.4 加入/同步
 
@@ -549,7 +554,24 @@ POST /v1/lsa             # LSA {origin,seq,zone,links[],prefixes[]}
 POST /v1/ack             # {node, generation, epoch}
 ```
 
-鉴权：`x-stellaris-secret: <control.secret>`。`snapshot.signature` 是 HMAC-SHA256（控制面 secret）对 `{network_id,epoch,generation,members,routes}` 的签名；member 校验后才应用并回 ACK；member manifest 的 `overlay_ip/addrs` 用于自动发现/连接其他 member。ACK 带 epoch，epoch 不匹配返回 409；ACK 写入 `state_dir/controller-acks.json`。`/v1/lsa` 是 controller-mediated link-state 的拓扑上报入口；SPF 结果按 `?node=` 的本地视角计算。
+鉴权：`x-stellaris-secret: <control.secret>`（管理端点用 `control.admin_secret`）。`snapshot.signature` 是 HMAC-SHA256（控制面 secret）对 `{network_id,epoch,generation,members,routes}` 的签名，`ed25519_signature` 是 controller key 的签名；member 校验后才应用并回 ACK；member manifest 的 `overlay_ip/addrs` 用于自动发现/连接其他 member。ACK 带 epoch，epoch 不匹配返回 409；ACK 写入 `state_dir/controller-acks.json`。`/v1/lsa` 是 controller-mediated link-state 的拓扑上报入口；SPF 结果按 `?node=` 的本地视角计算。
+
+入网（2026-11-25 起唯一入口）：
+
+```text
+POST /v1/enroll
+{ "node_id": "<hex>", "overlay_ip": "10.7.0.2", "zone": "az-a",
+  "addrs": ["192.0.2.2:41002"],
+  "signature": "<hex Ed25519 over stellaris-enroll-v1|network|node|overlay|zone>" }
+
+200 { "credential": { "credential": {...}, "issuer": "<hex>", "signature": "<hex>" } }
+202 { "pending": true, "node": "<hex>" }        # 已进入 Raft 待审队列
+403                                            # revoked/denied/签名错误
+```
+
+`/v1/admissions`（admin）列出待审；`/v1/admissions/{node}/approve|deny` 决策；
+`/v1/members/{node}/grants` 更新前缀/能力并递增 revision；
+`/v1/revoke` 撤销成员并写入 tombstone。`/v1/join` 已删除。
 
 Member 配置：
 
@@ -594,16 +616,38 @@ Request：
 
 ```text
 snapshot { node?, secret? }
-lsa      { lsa, secret? }
+lsa      { lsa, signature, secret? }
 ack      { node, generation, epoch?, secret? }
+enroll   { overlay_ip?, zone?, addrs?, secret? }   # 节点身份 = conn.remote_id()
 ```
 
 Response：
 
 ```text
-snapshot { snapshot }
-ok       { changed, generation, epoch }
-error    { code, message }
+snapshot   { snapshot }
+ok         { changed, generation, epoch }
+error      { code, message }
+credential { credential }      # SignedCredential
+pending    { node }
+denied     { node, reason }
 ```
 
 snapshot 与 HTTP 版本相同（epoch/members/routes/HMAC 签名）。member 校验签名后应用并回 ACK；ACK epoch 不匹配返回 409。
+
+### 10.1 成员凭据握手（数据面 ALPN `stellaris/data/1`）
+
+连接建立后，双方在一条 bi-stream 上交换一帧 `SignedCredential`：
+
+```json
+{ "credential": {
+    "network": "<uuid>", "node": "<hex node id>",
+    "overlay_ip": "10.7.0.2", "prefixes": ["192.168.50.0/24"],
+    "capabilities": ["member"], "revision": 3, "not_after": 1764000000
+  },
+  "issuer": "<controller node id>", "signature": "<hex ed25519>" }
+```
+
+签名内容：`b"stellaris-credential-v1" || issuer(32) || canonical_json(credential)`。
+
+验证失败（无凭据、过期、跨网络、issuer 不受信、revision 回滚）关闭连接。
+成功则把凭据转成 grant，用于 anti-spoof 和 LSA 前缀校验（见 §2.3）。

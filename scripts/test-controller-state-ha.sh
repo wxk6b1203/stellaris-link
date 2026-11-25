@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Single-host verification of the post-audit controller state:
 #   - routes replicated through Raft with deterministic ids
-#   - signed join via a real agent process
-#   - unsigned join rejected when require_join_signature is on
+#   - signed enrollment from a real agent, approved through the admin API
+#   - approved member replicated to every controller
 #   - leader-side replicated LSA TTL expiry
 #   - epoch monotonic across a leader change
 # Requires the release binaries, no root, no netns.
@@ -17,6 +17,7 @@ PIDS=()
 cleanup(){ for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; rm -rf "$DIR"; }
 trap cleanup EXIT
 SECRET="ctrl-secret"; ADMIN="admin-secret"; RAFT="raft-secret"
+CTRL_KEYS=""
 NODE="0202020202020202020202020202020202020202020202020202020202020202"
 status(){ curl -fsS --max-time 5 2>/dev/null -H "x-stellaris-secret: $SECRET" "http://127.0.0.1:$((48300+$1))/v1/status"; }
 model(){ curl -fsS --max-time 5 -H "x-stellaris-secret: $SECRET" "http://127.0.0.1:$((48300+$1))/v1/model"; }
@@ -67,7 +68,6 @@ raft_secret = "$RAFT"
 raft_bootstrap = $boot
 raft_election_timeout_ms = 300
 lsa_ttl_secs = 2
-require_join_signature = true
 [[control.raft_peers]]
 id = 1
 addr = "127.0.0.1:48201"
@@ -77,13 +77,11 @@ addr = "127.0.0.1:48202"
 [[control.raft_peers]]
 id = 3
 addr = "127.0.0.1:48203"
-[[control.join_tokens]]
-token = "signed-join"
-prefixes = ["192.168.44.0/24"]
-[[control.join_tokens]]
-token = "unsigned-join"
-prefixes = ["192.168.44.0/24"]
 TOML
+  # Create the controller identity before startup so the agent config below can
+  # trust every replica's credential/snapshot signing key.
+  ID=$("$CTRL" --config "$DIR/n$i.toml" --print-id)
+  CTRL_KEYS+="${CTRL_KEYS:+, }\"$ID\""
   RUST_LOG=info "$CTRL" --config "$DIR/n$i.toml" >"$DIR/n$i.log" 2>&1 &
   PIDS+=($!)
 done
@@ -109,11 +107,7 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "x-stellaris-secret: $SECRET" -
 [[ "$CODE" == "401" ]] || { echo "FAIL: member secret accepted for route write ($CODE)" >&2; exit 1; }
 echo "member secret rejected for admin write"
 
-echo '--- 3. unsigned join rejected, agent-signed join accepted'
-CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "x-stellaris-secret: $SECRET" -H 'content-type: application/json' \
-  -d "{\"node_id\":\"$NODE\",\"overlay_ip\":\"10.250.0.10\",\"token\":\"unsigned-join\"}" \
-  "http://127.0.0.1:$((48300+L))/v1/join")
-[[ "$CODE" == "403" ]] || { echo "FAIL: unsigned join accepted ($CODE)" >&2; exit 1; }
+echo '--- 3. signed enrollment is queued and approved by an admin'
 mkdir -p "$DIR/member-state"
 cat > "$DIR/member.toml" <<TOML
 [node]
@@ -123,10 +117,13 @@ overlay_ip = "10.250.0.20"
 [network]
 name = "state-ha"
 cidr = "10.250.0.0/16"
+[network.auth]
+mode = "controller"
 [control]
 url = "http://127.0.0.1:$((48300+L))"
 secret = "$SECRET"
-join_token = "signed-join"
+controller_keys = [$CTRL_KEYS]
+credential_ttl_secs = 600
 [api]
 bind = "127.0.0.1:48320"
 TOML
@@ -137,10 +134,30 @@ MEMBER_ID=$(for _ in $(seq 1 100); do
   curl -s --max-time 2 "http://127.0.0.1:48320/v1/status" >/dev/null 2>&1 && break
   sleep 0.1
 done; curl -fsS --max-time 3 "http://127.0.0.1:48320/v1/status" | python3 -c 'import json,sys;print(json.load(sys.stdin)["node_id"])')
-for i in 1 2 3; do
-  model "$i" | grep -q "$MEMBER_ID" || { echo "FAIL: signed join missing on replica $i" >&2; exit 1; }
+# The signed /v1/enroll queues the unknown node; an admin must approve it.
+PENDING=""
+for _ in $(seq 1 100); do
+  PENDING=$(curl -fsS --max-time 3 -H "x-stellaris-secret: $ADMIN" \
+    "http://127.0.0.1:$((48300+L))/v1/admissions" 2>/dev/null \
+    | python3 -c 'import json,sys;print(" ".join(p["node"] for p in json.load(sys.stdin)["pending"]))' 2>/dev/null \
+    || echo "")
+  [[ " $PENDING " == *" $MEMBER_ID "* ]] && break
+  sleep 0.1
 done
-echo "signed join replicated ($MEMBER_ID)"
+[[ " $PENDING " == *" $MEMBER_ID "* ]] || {
+  echo "FAIL: enrolled node not pending approval (pending: ${PENDING:-none})" >&2
+  tail -30 "$DIR/member.log" >&2; exit 1; }
+curl -fsS --max-time 10 -H "x-stellaris-secret: $ADMIN" -H 'content-type: application/json' \
+  -d '{"prefixes":[]}' "http://127.0.0.1:$((48300+L))/v1/admissions/$MEMBER_ID/approve" >/dev/null
+echo "approved enrollment ($MEMBER_ID)"
+for i in 1 2 3; do
+  for _ in $(seq 1 100); do
+    model "$i" | grep -q "$MEMBER_ID" && break
+    sleep 0.1
+  done
+  model "$i" | grep -q "$MEMBER_ID" || { echo "FAIL: approved member missing on replica $i" >&2; exit 1; }
+done
+echo "approved member replicated ($MEMBER_ID)"
 
 echo '--- 4. replicated LSA TTL'
 for _ in $(seq 1 60); do
@@ -171,4 +188,4 @@ for _ in $(seq 1 60); do
 done
 [[ "$EPOCH_AFTER" -ge "$EPOCH_BEFORE" ]] || { echo "FAIL: epoch rolled back ($EPOCH_BEFORE -> $EPOCH_AFTER)" >&2; exit 1; }
 echo "epoch monotonic ($EPOCH_BEFORE -> $EPOCH_AFTER), new leader=$NL"
-echo "OK: controller state replication, signed join, LSA TTL and epoch verified"
+echo "OK: controller state replication, signed enrollment approval, LSA TTL and epoch verified"

@@ -6,6 +6,7 @@ pub mod control_wire;
 pub mod controller;
 pub mod controller_model;
 pub mod controller_raft;
+pub mod credential;
 pub mod dataplane;
 pub mod discovery;
 pub mod gateway;
@@ -21,6 +22,7 @@ pub mod stats;
 pub mod transport;
 pub mod wire;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -42,6 +44,10 @@ pub struct AgentState {
     pub routes: Arc<RouteEngine>,
     pub peers: PeerRegistry,
     pub grants: membership::GrantMap,
+    /// Our own controller-signed membership credential, when configured.
+    pub credential: Arc<RwLock<Option<credential::SignedCredential>>>,
+    /// Highest credential revision observed per node (replay fencing).
+    pub revisions: Arc<RwLock<HashMap<NodeId, u64>>>,
     pub policy: Arc<RwLock<policy::Policy>>,
     pub stats: Arc<stats::Stats>,
     pub reassembly: Arc<std::sync::Mutex<reassembly::Reassembler>>,
@@ -165,6 +171,7 @@ impl AgentState {
             policy::Policy::from_config(config.acl.clone(), config.qos.clone())
         };
         let policy = Arc::new(RwLock::new(policy));
+        let credential = load_credential(&state_dir);
 
         Ok(Self {
             config: Arc::new(config),
@@ -173,7 +180,9 @@ impl AgentState {
             identity_secret: identity.secret,
             routes,
             peers,
-            grants: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            grants: Arc::new(RwLock::new(HashMap::new())),
+            credential: Arc::new(RwLock::new(credential)),
+            revisions: Arc::new(RwLock::new(HashMap::new())),
             policy,
             stats: Arc::new(stats::Stats::default()),
             reassembly: Arc::new(std::sync::Mutex::new(reassembly::Reassembler::default())),
@@ -185,9 +194,79 @@ impl AgentState {
         PathBuf::from(&self.config.node.state_dir).join("routes.json")
     }
 
-    pub fn set_grants(&self, members: &[controller::MemberView]) {
-        let grants = membership::manifest_grants(members);
-        *self.grants.write().unwrap_or_else(|e| e.into_inner()) = grants;
+    pub fn credential_path(&self) -> PathBuf {
+        PathBuf::from(&self.config.node.state_dir).join("credential.json")
+    }
+
+    pub fn credential(&self) -> Option<credential::SignedCredential> {
+        self.credential
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install a freshly issued credential and persist it for restarts.
+    pub fn set_credential(&self, credential: credential::SignedCredential) {
+        if let Some(existing) = self
+            .revisions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&credential.credential.node)
+        {
+            tracing::debug!(revision = *existing, "replacing local credential");
+        }
+        self.observe_revision(credential.credential.node, credential.credential.revision);
+        let path = self.credential_path();
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, path = %parent.display(), "create credential dir");
+        }
+        match serde_json::to_vec(&credential) {
+            Ok(bytes) => match std::fs::write(&path, bytes) {
+                Ok(()) => tracing::info!(path = %path.display(), "membership credential stored"),
+                Err(e) => tracing::warn!(error = %e, "failed to persist membership credential"),
+            },
+            Err(e) => tracing::warn!(error = %e, "failed to serialize membership credential"),
+        }
+        *self.credential.write().unwrap_or_else(|e| e.into_inner()) = Some(credential);
+    }
+
+    /// Highest credential revision seen for `node`.
+    pub fn revision(&self, node: NodeId) -> u64 {
+        self.revisions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn observe_revision(&self, node: NodeId, revision: u64) {
+        let mut revisions = self.revisions.write().unwrap_or_else(|e| e.into_inner());
+        let entry = revisions.entry(node).or_insert(0);
+        if revision > *entry {
+            *entry = revision;
+        }
+    }
+
+    /// Record a peer's verified credential as its dataplane grant.
+    pub fn install_grant(&self, credential: &credential::VerifiedCredential) {
+        self.observe_revision(credential.node, credential.revision);
+        self.grants
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                credential.node,
+                membership::Grant::from_verified(credential),
+            );
+    }
+
+    pub fn drop_grant(&self, node: NodeId) {
+        self.grants
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node);
     }
 
     pub fn policy_path(&self) -> PathBuf {
@@ -197,6 +276,18 @@ impl AgentState {
     pub fn save_routes(&self) {
         if let Err(e) = self.routes.save(self.routes_path()) {
             tracing::warn!(error = %e, "failed to persist routes");
+        }
+    }
+}
+
+fn load_credential(state_dir: &std::path::Path) -> Option<credential::SignedCredential> {
+    let path = state_dir.join("credential.json");
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(credential) => Some(credential),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "ignoring invalid credential");
+            None
         }
     }
 }
@@ -219,6 +310,7 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     let mut transport_handle = None;
     if want_transport {
         let transport = transport::IrohTransport::start(
+            state.clone(),
             state.config.clone(),
             state.network,
             state.identity_secret,

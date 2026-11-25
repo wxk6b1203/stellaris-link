@@ -25,9 +25,6 @@ overlay_ip="10.115.0.1"
 [network]
 name="exitnat"
 cidr="10.115.0.0/16"
-[network.auth]
-mode="psk"
-secret="exit-secret"
 [transport]
 relay_urls=[]
 disable_relay=true
@@ -49,9 +46,6 @@ overlay_ip="10.115.0.2"
 [network]
 name="exitnat"
 cidr="10.115.0.0/16"
-[network.auth]
-mode="psk"
-secret="exit-secret"
 [transport]
 relay_urls=[]
 disable_relay=true

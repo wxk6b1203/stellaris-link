@@ -426,7 +426,23 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 
 > 真实互联网 PTB 的边界：需要 MTU <1500 的链路或可控路由器才能验证；当前 8 台云主机跨地域路径均为 1500，且 1473B 探测先被本机 MTU 拦截，因此"真实路由器生成 PTB"仍属未验证。
 
-### 3.13 仍未验证
+### 3.13 2026-11-25 单一成员凭据（本地验证，无云主机）
+
+本轮把入网收敛为 controller 签名的 `MembershipCredential`，删除 PSK / join token /
+`admission.mode`。8 台临时主机已在 2026-11-25 00:25 释放，因此全部验证在本机完成：
+
+| 项 | 方式 | 结果 |
+|---|---|---|
+| 凭据密码学 | `credential::tests`（5 个） | ✅ 往返、篡改 grants 被拒、过期、跨网络、错误 node/issuer、revision 回滚、2/3 续签时机 |
+| controller 签发 | `controller::tests` 预注册/审批 | ✅ 预注册直接返回凭据；未知节点 202；非 admin 审批 401；批准后 200；deny 后 403（tombstone） |
+| 凭据必须由节点私钥签名 | `enrollment_rejects_a_signature_from_another_key` | ✅ 403 |
+| HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
+| 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
+| iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
+| 全量测试 | `cargo test --workspace` | **172 passed**（agent 128 + types 19 + 其余 25） |
+| 静态检查 | `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` | ✅ |
+
+### 3.14 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot
@@ -600,13 +616,15 @@ peer path MTU: 1414
 - agent 真实流量穿越 PTB 黑洞后的长连接恢复
 - 磁盘满 503、撕裂 log fail-closed
 - Docker host-network TUN
+- 应用层分片重组、ACL reject/drop、入网审批（2026-11-24）
+- 单一成员凭据：签发/审批/撤销/握手/续签（2026-11-25，本地）
 
 仍未验证/未实现：
 
 - 真正 multipath（双 direct 同时承载、RTT/丢包调度、双 relay）
-- 应用层 fragment reassembly
-- agent 客户端/整集群滚动重启后的 snapshot 续传
-- 动态 Raft membership
+- 真实互联网路由器 PTB（云网络路径均为 1500）
+- GitHub Actions 实跑、systemd unit 的 `systemd-analyze verify`
 - Docker 双容器网络/CI
 - macOS/Windows NAT
-- 大规模/长时间 soak
+- 大规模/长时间 soak、磁盘慢 IO 注入
+- 多 controller 用各自 key 签发凭据的跨地域实测（本地只验证单 controller）

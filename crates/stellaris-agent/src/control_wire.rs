@@ -38,6 +38,19 @@ pub enum Request {
         #[serde(default)]
         secret: Option<String>,
     },
+    /// Ask the controller for a membership credential. The requester is
+    /// authenticated by the iroh endpoint key, so no extra signature is
+    /// needed: `conn.remote_id()` *is* the claimed NodeId.
+    Enroll {
+        #[serde(default)]
+        overlay_ip: Option<std::net::IpAddr>,
+        #[serde(default)]
+        zone: Option<String>,
+        #[serde(default)]
+        addrs: Vec<std::net::SocketAddr>,
+        #[serde(default)]
+        secret: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,6 +67,19 @@ pub enum Response {
     Error {
         code: u16,
         message: String,
+    },
+    /// Controller signed a credential for this member.
+    Credential {
+        credential: crate::credential::SignedCredential,
+    },
+    /// Enrollment was queued for an administrator decision.
+    Pending {
+        node: String,
+    },
+    /// Enrollment was refused (revoked node, bad network, or admin decision).
+    Denied {
+        node: String,
+        reason: String,
     },
 }
 
