@@ -512,7 +512,9 @@ crates/stellaris-agent/src/controller_raft.rs
 
 H1 当时限制（H2/H3 已解除）：
 
-- log/vote/state 落盘到 `raft-log.json` / `raft-state.json`
+- log 落盘为 `raft-log/` 分段追加文件 + `raft-log/meta.json`；state 为
+  `raft-state.json` 快照 + `raft-state.wal` 追加日志（每 512 条 compact 一次）；
+  旧 `raft-log.json`/`raft-state.json` 自动迁移
 - snapshot 数据从 state machine 重建；后续已加分块/校验
 - `RaftNetworkV2` 当时只是单节点 placeholder
 - 后续已接入 HTTP controller 和 3 controller bootstrap/membership

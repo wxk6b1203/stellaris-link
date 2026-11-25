@@ -49,6 +49,7 @@
 - [x] 成都 netns PMTUD：1500/1400/1300、PTB 黑洞/恢复、2 MiB TCP。
 - [x] openraft H0 确定性 ControllerModel/Command，作为 controller shadow 接入（`/v1/model` + durable command log）。
 - [x] openraft H1 单节点原型：storage/state machine/single voter；支持 raft-log/raft-state 落盘重启恢复。
+- [x] 2026-11-25 持久化重构：分段追加日志 + 状态快照/WAL（5.1k LSA 16.4s、重启 0.14s）。
 - [x] openraft H2 3 节点：进程内 leader 复制/failover + HTTP Raft RPC（共享 secret/snapshot）+ 落盘重启恢复。
 - [x] controller API Raft 写路径（`control.raft_dir`，LSA/join/revoke/ack + snapshot/model）。
 - [x] Raft snapshot 线性化读（`ensure_linearizable(ReadIndex)`）

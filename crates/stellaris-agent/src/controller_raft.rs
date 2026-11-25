@@ -110,12 +110,195 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Maximum size of one append-only log segment.
+const LOG_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Write a full state snapshot every N applied entries.
+const SNAPSHOT_EVERY_ENTRIES: u64 = 512;
+const MAX_FRAME_BYTES: usize = 64 << 20;
+
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedLogMeta {
+    vote: Option<VoteOf<TypeConfig>>,
+    last_purged: Option<LogIdOf<TypeConfig>>,
+    committed: Option<LogIdOf<TypeConfig>>,
+}
+
+fn invalid_data(e: impl fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+fn log_dir(path: &Path) -> PathBuf {
+    path.with_extension("")
+}
+
+fn write_frame<W: Write>(writer: &mut W, index: u64, bytes: &[u8]) -> io::Result<()> {
+    writer.write_all(&index.to_be_bytes())?;
+    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    writer.write_all(bytes)
+}
+
+/// Read an append-only entry segment, truncating an incomplete tail frame.
+fn read_log_segment(path: &Path) -> io::Result<Vec<(u64, Vec<u8>)>> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let mut out = Vec::new();
+    let mut valid = 0u64;
+    loop {
+        let mut header = [0u8; 12];
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let index = u64::from_be_bytes(header[..8].try_into().expect("8 bytes"));
+        let size = u32::from_be_bytes(header[8..].try_into().expect("4 bytes")) as usize;
+        if size > MAX_FRAME_BYTES {
+            return Err(invalid_data(format!("log frame too large: {size}")));
+        }
+        let mut bytes = vec![0u8; size];
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                file.set_len(valid)?;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+        valid += 12 + size as u64;
+        out.push((index, bytes));
+    }
+    let _ = file.seek(io::SeekFrom::Start(valid));
+    Ok(out)
+}
+
+#[derive(Default)]
+struct LogFiles {
+    dir: PathBuf,
+    /// (first index, last index, path)
+    segments: Vec<(u64, u64, PathBuf)>,
+    active: Option<std::fs::File>,
+    active_bytes: u64,
+}
+
+impl LogFiles {
+    fn open(dir: PathBuf) -> io::Result<Self> {
+        std::fs::create_dir_all(&dir)?;
+        let mut segment_paths = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("seg-")
+                && name.ends_with(".wal")
+                && let Some(first) = name
+                    .trim_start_matches("seg-")
+                    .trim_end_matches(".wal")
+                    .parse::<u64>()
+                    .ok()
+            {
+                segment_paths.push((first, entry.path()));
+            }
+        }
+        segment_paths.sort_by_key(|(first, _)| *first);
+        let mut files = Self {
+            dir,
+            ..Default::default()
+        };
+        for (first, path) in segment_paths {
+            let entries = read_log_segment(&path)?;
+            let last = entries
+                .last()
+                .map(|(index, _)| *index)
+                .unwrap_or(first.saturating_sub(1));
+            files.segments.push((first, last, path.clone()));
+        }
+        if let Some((_, _, path)) = files.segments.last() {
+            let file = std::fs::OpenOptions::new().append(true).open(path)?;
+            files.active_bytes = file.metadata()?.len();
+            files.active = Some(file);
+        }
+        Ok(files)
+    }
+
+    fn rotate(&mut self, first: u64) -> io::Result<()> {
+        if let Some(file) = self.active.take() {
+            file.sync_data()?;
+        }
+        let path = self.dir.join(format!("seg-{first:020}.wal"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        self.active_bytes = file.metadata()?.len();
+        self.active = Some(file);
+        self.segments.push((first, first.saturating_sub(1), path));
+        Ok(())
+    }
+
+    fn append(&mut self, batch: &[(u64, Vec<u8>)]) -> io::Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for (index, bytes) in batch {
+            if self.active.is_none() || self.active_bytes >= LOG_SEGMENT_MAX_BYTES {
+                self.rotate(*index)?;
+            }
+            let file = self.active.as_mut().expect("active segment");
+            write_frame(file, *index, bytes)?;
+            self.active_bytes += 12 + bytes.len() as u64;
+            if let Some(segment) = self.segments.last_mut() {
+                segment.1 = *index;
+            }
+        }
+        if let Some(file) = self.active.as_mut() {
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self, entries: &[(u64, Vec<u8>)]) -> io::Result<()> {
+        if let Some(file) = self.active.take() {
+            let _ = file.sync_data();
+        }
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("seg-") && name.ends_with(".wal") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        self.segments.clear();
+        self.active_bytes = 0;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let first = entries.first().map(|(index, _)| *index).unwrap_or(0);
+        self.rotate(first)?;
+        for (index, bytes) in entries {
+            let file = self.active.as_mut().expect("active segment");
+            write_frame(file, *index, bytes)?;
+            self.active_bytes += 12 + bytes.len() as u64;
+            if let Some(segment) = self.segments.last_mut() {
+                segment.1 = *index;
+            }
+        }
+        if let Some(file) = self.active.as_mut() {
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
 pub struct LogStore {
     log: RwLock<BTreeMap<u64, Vec<u8>>>,
     vote: RwLock<Option<VoteOf<TypeConfig>>>,
     last_purged: RwLock<Option<LogIdOf<TypeConfig>>>,
     committed: RwLock<Option<LogIdOf<TypeConfig>>>,
     path: Option<PathBuf>,
+    files: std::sync::Mutex<LogFiles>,
+    init_error: Option<String>,
 }
 
 impl Default for LogStore {
@@ -125,57 +308,136 @@ impl Default for LogStore {
 }
 
 impl LogStore {
+    /// `path` is the legacy `raft-log.json` path; segments live in the sibling
+    /// directory without the extension.
     pub fn new(path: Option<PathBuf>) -> Self {
-        let persisted = path
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice::<PersistedLog>(&bytes).ok())
-            .unwrap_or_default();
+        let mut entries: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut meta = PersistedLogMeta::default();
+        let mut init_error = None;
+        let mut files = LogFiles::default();
+        if let Some(path) = &path {
+            let dir = log_dir(path);
+            let legacy = path.is_file();
+            if !dir.exists() && legacy {
+                match std::fs::read(path)
+                    .map_err(invalid_data)
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<PersistedLog>(&bytes).map_err(invalid_data)
+                    }) {
+                    Ok(persisted) => {
+                        entries = persisted
+                            .log
+                            .into_iter()
+                            .map(|(index, bytes)| (index, bytes.into_bytes()))
+                            .collect();
+                        meta = PersistedLogMeta {
+                            vote: persisted.vote,
+                            last_purged: persisted.last_purged,
+                            committed: persisted.committed,
+                        };
+                        match LogFiles::open(dir.clone()).and_then(|mut files| {
+                            let batch: Vec<(u64, Vec<u8>)> = entries
+                                .iter()
+                                .map(|(index, bytes)| (*index, bytes.clone()))
+                                .collect();
+                            files.reset(&batch)?;
+                            Ok(files)
+                        }) {
+                            Ok(opened) => {
+                                let meta_bytes = serde_json::to_vec(&meta).map_err(invalid_data);
+                                match meta_bytes
+                                    .and_then(|bytes| atomic_write(&dir.join("meta.json"), &bytes))
+                                {
+                                    Ok(()) => {
+                                        let _ = std::fs::rename(
+                                            path,
+                                            path.with_extension("json.legacy"),
+                                        );
+                                        files = opened;
+                                    }
+                                    Err(e) => init_error = Some(e.to_string()),
+                                }
+                            }
+                            Err(e) => init_error = Some(e.to_string()),
+                        }
+                    }
+                    Err(e) => init_error = Some(e.to_string()),
+                }
+            } else {
+                match LogFiles::open(dir.clone()) {
+                    Ok(opened) => {
+                        for (_, _, segment) in &opened.segments {
+                            match read_log_segment(segment) {
+                                Ok(segment_entries) => {
+                                    for (index, bytes) in segment_entries {
+                                        entries.insert(index, bytes);
+                                    }
+                                }
+                                Err(e) => {
+                                    init_error = Some(e.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        if init_error.is_none() {
+                            match std::fs::read(dir.join("meta.json")) {
+                                Ok(bytes) => {
+                                    match serde_json::from_slice::<PersistedLogMeta>(&bytes) {
+                                        Ok(parsed) => meta = parsed,
+                                        Err(e) => init_error = Some(invalid_data(e).to_string()),
+                                    }
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                                Err(e) => init_error = Some(e.to_string()),
+                            }
+                        }
+                        files = opened;
+                        if init_error.is_some() {
+                            files = LogFiles::default();
+                        }
+                    }
+                    Err(e) => init_error = Some(e.to_string()),
+                }
+            }
+        }
         Self {
-            log: RwLock::new(
-                persisted
-                    .log
-                    .into_iter()
-                    .map(|(index, bytes)| (index, bytes.into_bytes()))
-                    .collect(),
-            ),
-            vote: RwLock::new(persisted.vote),
-            last_purged: RwLock::new(persisted.last_purged),
-            committed: RwLock::new(persisted.committed),
+            log: RwLock::new(entries),
+            vote: RwLock::new(meta.vote),
+            last_purged: RwLock::new(meta.last_purged),
+            committed: RwLock::new(meta.committed),
             path,
+            files: std::sync::Mutex::new(files),
+            init_error,
         }
     }
 
-    async fn persist(&self) -> io::Result<()> {
+    fn check_init(&self) -> io::Result<()> {
+        match &self.init_error {
+            Some(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error.clone())),
+            None => Ok(()),
+        }
+    }
+
+    async fn persist_meta(&self) -> io::Result<()> {
+        self.check_init()?;
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let persisted = PersistedLog {
-            log: self
-                .log
-                .read()
-                .await
-                .iter()
-                .map(|(index, bytes)| (*index, String::from_utf8_lossy(bytes).into_owned()))
-                .collect(),
+        let meta = PersistedLogMeta {
             vote: *self.vote.read().await,
             last_purged: *self.last_purged.read().await,
             committed: *self.committed.read().await,
         };
-        let bytes = serde_json::to_vec(&persisted).map_err(invalid_data)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        atomic_write(path, &bytes)
+        let dir = log_dir(path);
+        std::fs::create_dir_all(&dir)?;
+        let bytes = serde_json::to_vec(&meta).map_err(invalid_data)?;
+        atomic_write(&dir.join("meta.json"), &bytes)?;
+        Ok(())
     }
 
     pub async fn is_empty(&self) -> bool {
         self.log.read().await.is_empty()
     }
-}
-
-fn invalid_data(e: impl fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
 impl RaftLogReader<TypeConfig> for Arc<LogStore> {
@@ -221,18 +483,18 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
     }
 
     async fn save_vote(&mut self, vote: &VoteOf<TypeConfig>) -> Result<(), io::Error> {
+        self.check_init()?;
         *self.vote.write().await = Some(*vote);
-        self.persist().await?;
-        Ok(())
+        self.persist_meta().await
     }
 
     async fn save_committed(
         &mut self,
         committed: Option<LogIdOf<TypeConfig>>,
     ) -> Result<(), io::Error> {
+        self.check_init()?;
         *self.committed.write().await = committed;
-        self.persist().await?;
-        Ok(())
+        self.persist_meta().await
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogIdOf<TypeConfig>>, io::Error> {
@@ -247,13 +509,27 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
     where
         I: IntoIterator<Item = EntryOf<TypeConfig>> + OptionalSend,
     {
+        self.check_init()?;
+        let batch: Vec<(u64, Vec<u8>)> = entries
+            .into_iter()
+            .map(|entry| {
+                let index = entry.index();
+                serde_json::to_vec(&entry)
+                    .map(|bytes| (index, bytes))
+                    .map_err(invalid_data)
+            })
+            .collect::<Result<_, _>>()?;
+        {
+            let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            if self.path.is_some() {
+                files.append(&batch)?;
+            }
+        }
         let mut log = self.log.write().await;
-        for entry in entries {
-            let bytes = serde_json::to_vec(&entry).map_err(invalid_data)?;
-            log.insert(entry.index(), bytes);
+        for (index, bytes) in batch {
+            log.insert(index, bytes);
         }
         drop(log);
-        self.persist().await?;
         callback.io_completed(Ok(()));
         Ok(())
     }
@@ -262,37 +538,65 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
         &mut self,
         last_log_id: Option<LogIdOf<TypeConfig>>,
     ) -> Result<(), io::Error> {
-        let start = last_log_id.map(|id| id.index() + 1).unwrap_or(0);
-        let mut log = self.log.write().await;
-        let keys: Vec<u64> = log.range(start..).map(|(k, _)| *k).collect();
-        for key in keys {
-            log.remove(&key);
+        self.check_init()?;
+        let keep_through = last_log_id.map(|id| id.index());
+        let purged = *self.last_purged.read().await;
+        let survivors: Vec<(u64, Vec<u8>)> = {
+            let log = self.log.read().await;
+            log.iter()
+                .filter(|(index, _)| {
+                    keep_through.is_some_and(|through| **index <= through)
+                        && purged.is_none_or(|purged| **index > purged.index())
+                })
+                .map(|(index, bytes)| (*index, bytes.clone()))
+                .collect()
+        };
+        if self.path.is_some() {
+            let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            files.reset(&survivors)?;
         }
-        drop(log);
-        self.persist().await?;
+        let mut log = self.log.write().await;
+        *log = survivors.into_iter().collect();
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogIdOf<TypeConfig>) -> Result<(), io::Error> {
+        self.check_init()?;
         *self.last_purged.write().await = Some(log_id);
-        let mut log = self.log.write().await;
-        let keys: Vec<u64> = log.range(..=log_id.index()).map(|(k, _)| *k).collect();
-        for key in keys {
-            log.remove(&key);
+        let survivors: Vec<(u64, Vec<u8>)> = {
+            let log = self.log.read().await;
+            log.iter()
+                .filter(|(index, _)| **index > log_id.index())
+                .map(|(index, bytes)| (*index, bytes.clone()))
+                .collect()
+        };
+        if self.path.is_some() {
+            let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            files.reset(&survivors)?;
         }
-        drop(log);
-        self.persist().await?;
-        Ok(())
+        let mut log = self.log.write().await;
+        *log = survivors.into_iter().collect();
+        self.persist_meta().await
     }
 }
 
 type SnapshotState = (SnapshotMetaOf<TypeConfig>, Vec<u8>);
+
+struct StateFiles {
+    wal: Option<std::fs::File>,
+    applied_since_snapshot: u64,
+}
 
 #[derive(Clone)]
 pub struct StateMachineStore {
     inner: Arc<RwLock<StateMachineData>>,
     snapshot: Arc<RwLock<Option<SnapshotState>>>,
     path: Option<PathBuf>,
+    files: Arc<std::sync::Mutex<StateFiles>>,
+    init_error: Option<String>,
+    /// Test-only failure injection to prove that a failed durable write is not
+    /// acknowledged or applied.
+    fail_next_commit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -302,37 +606,178 @@ struct StateMachineData {
     last_membership: StoredMembershipOf<TypeConfig>,
 }
 
+fn apply_entry_to_data(data: &mut StateMachineData, entry: &EntryOf<TypeConfig>) {
+    data.last_applied = Some(entry.log_id);
+    match &entry.payload {
+        EntryPayload::Blank => {}
+        EntryPayload::Normal(command) => {
+            data.model.apply(command.clone());
+        }
+        EntryPayload::Membership(membership) => {
+            data.last_membership =
+                StoredMembershipOf::<TypeConfig>::new(Some(entry.log_id), membership.clone());
+        }
+    }
+}
+
+fn read_state_wal(path: &Path) -> io::Result<Vec<EntryOf<TypeConfig>>> {
+    use std::io::{Read, Seek};
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    let mut valid = 0u64;
+    loop {
+        let mut header = [0u8; 4];
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let size = u32::from_be_bytes(header) as usize;
+        if size > MAX_FRAME_BYTES {
+            return Err(invalid_data(format!("state frame too large: {size}")));
+        }
+        let mut bytes = vec![0u8; size];
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                file.set_len(valid)?;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+        valid += 4 + size as u64;
+        out.push(serde_json::from_slice(&bytes).map_err(invalid_data)?);
+    }
+    let _ = file.seek(io::SeekFrom::Start(valid));
+    Ok(out)
+}
+
 impl StateMachineStore {
     pub fn new(model: ControllerModel, path: Option<PathBuf>) -> Self {
-        let data = path
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice::<StateMachineData>(&bytes).ok())
-            .unwrap_or_else(|| StateMachineData {
-                model,
-                last_applied: None,
-                last_membership: StoredMembershipOf::<TypeConfig>::default(),
-            });
+        let mut data = StateMachineData {
+            model,
+            last_applied: None,
+            last_membership: StoredMembershipOf::<TypeConfig>::default(),
+        };
+        let mut init_error = None;
+        let mut wal = None;
+        let mut applied_since_snapshot = 0u64;
+        if let Some(path) = &path {
+            if path.exists() {
+                match std::fs::read(path).map_err(invalid_data).and_then(|bytes| {
+                    serde_json::from_slice::<StateMachineData>(&bytes).map_err(invalid_data)
+                }) {
+                    Ok(loaded) => data = loaded,
+                    Err(e) => init_error = Some(e.to_string()),
+                }
+            }
+            let wal_path = path.with_extension("wal");
+            if init_error.is_none() {
+                match read_state_wal(&wal_path) {
+                    Ok(entries) => {
+                        for entry in &entries {
+                            if data
+                                .last_applied
+                                .is_none_or(|applied| entry.index() > applied.index())
+                            {
+                                apply_entry_to_data(&mut data, entry);
+                                applied_since_snapshot += 1;
+                            }
+                        }
+                    }
+                    Err(e) => init_error = Some(e.to_string()),
+                }
+            }
+            if init_error.is_none() {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&wal_path)
+                {
+                    Ok(file) => wal = Some(file),
+                    Err(e) => init_error = Some(e.to_string()),
+                }
+            }
+        }
         Self {
             inner: Arc::new(RwLock::new(data)),
             snapshot: Arc::new(RwLock::new(None)),
             path,
+            files: Arc::new(std::sync::Mutex::new(StateFiles {
+                wal,
+                applied_since_snapshot,
+            })),
+            init_error,
+            fail_next_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    async fn persist(&self) -> io::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit(&self) {
+        self.fail_next_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check_init(&self) -> io::Result<()> {
+        match &self.init_error {
+            Some(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Durably append one entry to the WAL before the in-memory state changes.
+    fn append_wal(&self, entry: &EntryOf<TypeConfig>) -> io::Result<()> {
+        self.check_init()?;
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other("injected commit failure"));
+        }
+        let Some(_path) = &self.path else {
+            return Ok(());
+        };
+        let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        let wal = files
+            .wal
+            .as_mut()
+            .ok_or_else(|| io::Error::other("state WAL is not open"))?;
+        let bytes = serde_json::to_vec(entry).map_err(invalid_data)?;
+        wal.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        wal.write_all(&bytes)?;
+        wal.sync_data()?;
+        files.applied_since_snapshot += 1;
+        Ok(())
+    }
+
+    /// Periodically collapse the WAL into a full snapshot. Failure here only
+    /// delays compaction: the WAL already contains the durable state.
+    fn maybe_snapshot(&self, data: &StateMachineData) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let data = {
-            let inner = self.inner.read().await;
-            serde_json::to_vec(&*inner)
-        };
-        let bytes = data.map_err(invalid_data)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        if files.applied_since_snapshot < SNAPSHOT_EVERY_ENTRIES {
+            return Ok(());
         }
-        atomic_write(path, &bytes)
+        let snapshot = serde_json::to_vec(data).map_err(invalid_data)?;
+        atomic_write(path, &snapshot)?;
+        let wal = files
+            .wal
+            .as_mut()
+            .ok_or_else(|| io::Error::other("state WAL is not open"))?;
+        wal.set_len(0)?;
+        wal.seek(SeekFrom::Start(0))?;
+        files.applied_since_snapshot = 0;
+        Ok(())
     }
 
     pub async fn model(&self) -> ControllerModel {
@@ -380,33 +825,20 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     {
         use futures::TryStreamExt;
         while let Some((entry, responder)) = entries.try_next().await? {
+            // The WAL write happens before mutating memory: a failed durable
+            // write must not leave the state machine ahead of disk.
+            self.append_wal(&entry)?;
             let response = {
                 let mut inner = self.inner.write().await;
-                inner.last_applied = Some(entry.log_id);
-                match entry.payload {
-                    EntryPayload::Blank => CommandResult {
-                        generation: inner.model.generation,
-                        epoch: inner.model.epoch,
-                    },
-                    EntryPayload::Normal(command) => {
-                        inner.model.apply(command);
-                        CommandResult {
-                            generation: inner.model.generation,
-                            epoch: inner.model.epoch,
-                        }
-                    }
-                    EntryPayload::Membership(membership) => {
-                        inner.last_membership =
-                            StoredMembershipOf::<TypeConfig>::new(Some(entry.log_id), membership);
-                        CommandResult {
-                            generation: inner.model.generation,
-                            epoch: inner.model.epoch,
-                        }
-                    }
+                apply_entry_to_data(&mut inner, &entry);
+                if let Err(error) = self.maybe_snapshot(&inner) {
+                    tracing::warn!(%error, "state snapshot failed; keeping the WAL");
+                }
+                CommandResult {
+                    generation: inner.model.generation,
+                    epoch: inner.model.epoch,
                 }
             };
-            // Acknowledge only after the new state is durable.
-            self.persist().await?;
             if let Some(responder) = responder {
                 responder.send(response);
             }
@@ -427,15 +859,25 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         meta: &SnapshotMetaOf<TypeConfig>,
         snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
+        self.check_init()?;
         let model: ControllerModel =
             serde_json::from_slice(snapshot.get_ref()).map_err(invalid_data)?;
         let mut inner = self.inner.write().await;
         inner.model = model;
         inner.last_applied = meta.last_log_id;
         inner.last_membership = meta.last_membership.clone();
+        if let Some(path) = &self.path {
+            let bytes = serde_json::to_vec(&*inner).map_err(invalid_data)?;
+            atomic_write(path, &bytes)?;
+            let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(wal) = files.wal.as_mut() {
+                wal.set_len(0)?;
+                wal.seek(SeekFrom::Start(0))?;
+            }
+            files.applied_since_snapshot = 0;
+        }
         drop(inner);
         *self.snapshot.write().await = Some((meta.clone(), snapshot.into_inner()));
-        self.persist().await?;
         Ok(())
     }
 
@@ -2686,10 +3128,8 @@ mod tests {
         assert!(store.save_vote(&vote).await.is_err());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn disk_write_failure_does_not_apply_command() {
-        use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("stellaris-raft-diskfail-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2706,19 +3146,14 @@ mod tests {
             overlay_ip: Some("10.7.0.15".parse().unwrap()),
             addrs: vec![],
         };
-        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-        perms.set_mode(0o555);
-        std::fs::set_permissions(&dir, perms).unwrap();
+        node.store.fail_next_commit();
         let result = node
             .raft
             .client_write(ControllerCommand::ApplyLsa { lsa })
             .await;
-        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dir, perms).unwrap();
         assert!(
             result.is_err(),
-            "write should fail when raft dir is read-only"
+            "write should fail when the WAL write fails"
         );
         assert!(!node.store.model().await.lsas.contains_key(&node_id));
         let _ = node.raft.shutdown().await;
@@ -2748,5 +3183,164 @@ mod tests {
         let model = node.store.model().await;
         assert!(model.lsas.contains_key(&NodeId::new([1u8; 32])));
         assert!(model.generation > 1);
+    }
+
+    fn test_log_id(index: u64) -> LogIdOf<TypeConfig> {
+        LogIdOf::<TypeConfig>::new(
+            openraft::impls::leader_id_adv::LeaderId {
+                term: index,
+                node_id: 1,
+            },
+            index,
+        )
+    }
+
+    fn dir_size(path: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn log_store_appends_without_rewriting_the_whole_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "stellaris-raft-log-append-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("raft-log.json");
+        let mut store = Arc::new(LogStore::new(Some(path.clone())));
+        let mut payload_bytes = 0u64;
+        for i in 1..=200u64 {
+            let entry = EntryOf::<TypeConfig>::new(
+                test_log_id(i),
+                EntryPayload::Normal(ControllerCommand::SetEpoch { epoch: i }),
+            );
+            payload_bytes += serde_json::to_vec(&entry).unwrap().len() as u64;
+            store.append(vec![entry], IOFlushed::noop()).await.unwrap();
+        }
+        let log_bytes = dir_size(&log_dir(&path));
+        assert!(
+            log_bytes < payload_bytes * 2 + 1024,
+            "append-only log grew too much: {log_bytes} vs payload {payload_bytes}"
+        );
+        let reopened = Arc::new(LogStore::new(Some(path.clone())));
+        let mut reader = reopened.clone();
+        let entries = reader.try_get_log_entries(1u64..=200u64).await.unwrap();
+        assert_eq!(entries.len(), 200);
+        assert_eq!(entries.last().unwrap().index(), 200);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn log_store_purge_and_truncate_keep_consistent_state() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-raft-log-purge-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("raft-log.json");
+        let mut store = Arc::new(LogStore::new(Some(path.clone())));
+        for i in 1..=20u64 {
+            let entry = EntryOf::<TypeConfig>::new(
+                test_log_id(i),
+                EntryPayload::Normal(ControllerCommand::SetEpoch { epoch: i }),
+            );
+            store.append(vec![entry], IOFlushed::noop()).await.unwrap();
+        }
+        store.purge(test_log_id(10)).await.unwrap();
+        store.truncate_after(Some(test_log_id(15))).await.unwrap();
+        let mut reader = Arc::new(LogStore::new(Some(path)));
+        let entries = reader.try_get_log_entries(..).await.unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.first().unwrap().index(), 11);
+        assert_eq!(entries.last().unwrap().index(), 15);
+        let state = reader.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id.map(|id| id.index()), Some(15));
+        assert_eq!(state.last_purged_log_id.map(|id| id.index()), Some(10));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn state_machine_snapshots_periodically_and_recovers_from_wal() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-snapshot-wal-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("raft-state.json");
+        let mut store = StateMachineStore::new(
+            ControllerModel::new(NetworkId::new(), 1),
+            Some(path.clone()),
+        );
+        for i in 1..=600u64 {
+            let entry = EntryOf::<TypeConfig>::new(
+                test_log_id(i),
+                EntryPayload::Normal(ControllerCommand::SetEpoch { epoch: i }),
+            );
+            let items: Vec<Result<EntryResponder<TypeConfig>, io::Error>> = vec![Ok((entry, None))];
+            store.apply(futures::stream::iter(items)).await.unwrap();
+        }
+        let snapshot = std::fs::read(&path).unwrap();
+        let loaded: StateMachineData = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(loaded.model.epoch, 512);
+        assert!(
+            path.with_extension("wal").metadata().unwrap().len() < 512 * 256,
+            "WAL should contain only the tail"
+        );
+        let reopened = StateMachineStore::new(
+            ControllerModel::new(NetworkId::new(), 1),
+            Some(path.clone()),
+        );
+        assert_eq!(reopened.model().await.epoch, 600);
+        let (last_applied, _) = {
+            let mut reopened = reopened;
+            reopened.applied_state().await.unwrap()
+        };
+        assert_eq!(last_applied.map(|id| id.index()), Some(600));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_json_log_and_state_are_migrated() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-raft-legacy-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("raft-log.json");
+        let entry = EntryOf::<TypeConfig>::new(
+            test_log_id(1),
+            EntryPayload::Normal(ControllerCommand::SetEpoch { epoch: 7 }),
+        );
+        let legacy = PersistedLog {
+            log: [(1u64, serde_json::to_string(&entry).unwrap())]
+                .into_iter()
+                .collect(),
+            vote: None,
+            last_purged: None,
+            committed: None,
+        };
+        std::fs::write(&log_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let store = Arc::new(LogStore::new(Some(log_path.clone())));
+        let mut reader = store.clone();
+        let entries = reader.try_get_log_entries(..).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index(), 1);
+        assert!(log_path.with_extension("json.legacy").exists());
+
+        let state_path = dir.join("raft-state.json");
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::SetEpoch { epoch: 9 });
+        let old = StateMachineData {
+            model,
+            last_applied: Some(test_log_id(1)),
+            last_membership: StoredMembershipOf::<TypeConfig>::default(),
+        };
+        std::fs::write(&state_path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let reopened =
+            StateMachineStore::new(ControllerModel::new(NetworkId::new(), 1), Some(state_path));
+        assert_eq!(reopened.model().await.epoch, 9);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

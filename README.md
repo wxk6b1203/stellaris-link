@@ -11,7 +11,7 @@
 
 - **路由引擎**：Intent / RIB / FIB 三层（Path 层未实现，`set_path_hint` 当前为空操作）；LPM、admin distance、local_pref、metric、ECMP、pin、drain、reset、dry-run、generation、持久化。
 - **HTTP API**：`/v1/status`、`/v1/peers`、`/v1/routes`、`/v1/routes/lookup`、`/v1/routes/explain`、`/v1/routes/pin`、`/v1/routes/drain`、`/v1/routes/reset`、`/v1/routes/{id}`。
-- **controller**：openraft 3 节点 HA；HTTP Raft RPC + mTLS；snapshot/manifest 带 epoch、member、underlay addrs；leader failover、partition recovery、crash recovery；member 通过单个 controller URL 接入并由 Raft 复制；`control.iroh_port` 的 iroh 控制入口同样走 Raft（线性化快照读 + Raft 写，2026-11-24 起）。
+- **controller**：持久化为分段追加日志 + 状态快照/WAL（5.1k LSA 导入 16.4s、重启 0.14s）；openraft 3 节点 HA；HTTP Raft RPC + mTLS；snapshot/manifest 带 epoch、member、underlay addrs；leader failover、partition recovery、crash recovery；member 通过单个 controller URL 接入并由 Raft 复制；`control.iroh_port` 的 iroh 控制入口同样走 Raft（线性化快照读 + Raft 写，2026-11-24 起）。
 - **Link-state 自动路由**：两种模式：① member 通过 iroh control stream 直接洪泛 LSA，节点本地 SPF；② controller 汇聚 LSA 并按节点计算。LSA 带 underlay `addrs`，节点会自动发现并连接新 peer；link metric 使用当前 RTT（每 5s 刷新 LSA）+ 跨 AZ penalty；LSA 30s 过期（分布式模式；Raft controller 模式由 leader 周期提交 `ExpireLsa`，`control.lsa_ttl_secs` 可配）；等代价路径生成 ECMP；Ping/Pong heartbeat（2s/7s）自动撤回故障链路。
 - **ACL/QoS**：ACL allow/deny（方向、五元组、peer、zone、优先级）；QoS 按类设置 DSCP + 包速率/字节速率 token-bucket（`rate_pps/rate_bps`）+ egress 优先级队列（`qos.queue_depth` 可配，默认 4096）；`/v1/status` 暴露 ACL/QoS/转发 counters 和每 ACL 规则命中数 `acl_hits`；`/metrics` 提供 Prometheus counters/gauges；ACL 拒绝写 `stellaris_audit` 日志；可通过 `GET/PUT /v1/policy` 动态更新并持久化到 `state_dir/policy.json`；在 TUN 收发包路径执行。
 - **AZ 选路**：`zone` 标签 + 同 AZ `local_pref` 加成 + 跨 AZ link penalty（`routing.cross_zone_penalty`），`explain` 可见 zone。

@@ -439,7 +439,7 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **186 passed**（agent 139 + types 22 + 其余 25） |
+| 全量测试 | `cargo test --workspace` | **190 passed**（agent 143 + types 22 + 其余 25） |
 | Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
 | Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
 | 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
@@ -477,7 +477,28 @@ member 配置 `node.ipam = "auto"`，controller 池 `10.66.0.0/24`：
 > 环境说明：这批主机的安全组只放行 5689–6000；controller HTTP 用 5801，
 > member 的 iroh 端口用 5901–5903，因此测试直接使用公网地址，无需隧道。
 
-### 3.16 仍未验证
+### 3.16 2026-11-25 controller 持久化重构
+
+原实现每次 append/apply 重写整份 JSON。现改为：
+
+- 日志：`raft-log/seg-*.wal` 追加（8 MiB 分段）+ `raft-log/meta.json`（vote/committed/purged）；
+- 状态：`raft-state.json` 每 512 条应用写一次快照，`raft-state.wal` 追加每次 applied entry；
+- 启动时先载入快照，再重放 WAL 尾部；旧 `raft-log.json`/`raft-state.json` 自动迁移。
+
+| 项 | 结果 |
+|---|---|
+| 5,100 LSA×24 prefixes 导入（单节点 Raft，8 线程） | **16.41 s**（重构前 331 s，约 20×） |
+| 重启恢复 | **0.14 s**，generation/lsas 完整（5102/5100） |
+| 磁盘 | 7.2 MB（log 1.31 MB + snapshot 5.28 MB + WAL 0.59 MB） |
+| 三节点故障/重启 | `test-controller-raft-3node.sh` ✅ |
+| 三副本状态复制/恢复 | `test-controller-state-ha.sh` ✅ |
+| 单测 | 追加日志不重写、purge/truncate、512 条快照+WAL 恢复、旧格式迁移、持久化失败不 apply |
+| 脚本 | `scripts/test-raft-persistence.sh` |
+
+> 升级注意：新布局与旧二进制不兼容；启动时会迁移并重命名旧 `raft-log.json`，
+> 回滚需要恢复升级前备份。
+
+### 3.17 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot
@@ -654,6 +675,7 @@ peer path MTU: 1414
 - 应用层分片重组、ACL reject/drop、入网审批（2026-11-24）
 - 单一成员凭据：签发/审批/撤销/握手/续签（2026-11-25，本地）
 - IPAM：自动分配、租约、TUN 地址、重启复用、撤销隔离（2026-11-25，4 主机）
+- controller 持久化：分段日志 + 快照/WAL（2026-11-25，导入 16.4s、重启 0.14s）
 
 仍未验证/未实现：
 

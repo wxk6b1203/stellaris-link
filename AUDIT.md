@@ -238,7 +238,13 @@ P0 证据速查：
 - **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
 - **relay 自动 failover**：见上，需要传输层改动。
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。
-- **大状态写入/追赶性能（措辞修正）**：`LogStore::append` 每次重写整份 `raft-log.json`，`apply` 每条重写整份 `raft-state.json`。**批量导入 n 条且模型随每条增长时**总 I/O 为 Θ(n²)：5,100 LSA×24 前缀实测约 **5 分 50 秒**（state 5.84 MB、log 1.51 MB）。已安装 snapshot 的 follower 追赶尾部 m 条时，成本是 **Θ(m×状态大小)**，不是严格 O(m²)；只有从空状态重放全部 n 条（无 snapshot）才是 Θ(n²)。此前 LSA 过期逐条写会造成 m×大状态 的长时间追赶，已改为批量 `ExpireLsas`。未做日志分片/增量持久化。
+- **大状态写入/追赶性能（2026-11-25 已修复）**：原实现 `LogStore::append` 每次重写整份
+  `raft-log.json`，`apply` 每条重写整份 `raft-state.json`；批量导入 n 条且模型增长时总
+  I/O 为 Θ(n²)，5,100 LSA 实测 **5 分 50 秒**。现改为：日志按 **8 MiB 分段追加**（`raft-log/seg-*.wal`
+  + 小 `meta.json`），状态机用 **`raft-state.json` 周期快照（每 512 条）+ 追加 WAL**；
+  同样的 5,100 LSA×24 前缀实测 **16.4 秒**（约 21×），重启恢复 **0.14 秒**、目录 7.2 MB。
+  旧 `raft-log.json`/`raft-state.json` 在启动时自动迁移；升级后不支持回滚到旧二进制。
+  仍未做：日志/快照的压缩与远端对象存储（见 §7.3 其他项）。
 - **iroh 大帧**：8 MiB 已验证；>64 MiB 仍会失败（无分块）。
 - **P2 未动**：真 multipath、真实互联网 PTB（无小 MTU 链路可测）、macOS NAT/Windows、磁盘满/慢 IO 注入、CI 仓库推送与实跑。
 
