@@ -319,11 +319,9 @@ impl LogStore {
             let dir = log_dir(path);
             let legacy = path.is_file();
             if !dir.exists() && legacy {
-                match std::fs::read(path)
-                    .map_err(invalid_data)
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<PersistedLog>(&bytes).map_err(invalid_data)
-                    }) {
+                match std::fs::read(path).map_err(invalid_data).and_then(|bytes| {
+                    serde_json::from_slice::<PersistedLog>(&bytes).map_err(invalid_data)
+                }) {
                     Ok(persisted) => {
                         entries = persisted
                             .log

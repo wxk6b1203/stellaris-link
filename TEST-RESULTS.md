@@ -498,7 +498,39 @@ member 配置 `node.ipam = "auto"`，controller 池 `10.66.0.0/24`：
 > 升级注意：新布局与旧二进制不兼容；启动时会迁移并重命名旧 `raft-log.json`，
 > 回滚需要恢复升级前备份。
 
-### 3.17 仍未验证
+### 3.17 2026-11-25 NAT 后面的主机（真实家庭宽带）
+
+拓扑：本机 `10.0.10.42`（Ubuntu，8C/15G，`enp1s0` MTU 1500，无公网入向、无端口映射）
+作为 member；controller 在深圳 `.223`（公网 5801），另一个 member 在深圳 `.202`
+（公网 5901）。NATed agent 只主动出站，未配置 relay（`disable_relay=true`）。
+
+| 项 | 结果 |
+|---|---|
+| enroll / approve / IPAM | ✅ 自动拿到 `10.66.0.1`；云端 peer 为 `10.66.0.2` |
+| NAT 穿透 | ✅ `path=direct`；云端看到 NAT 公网映射 `120.85.169.79:9637`，无需端口映射/relay |
+| overlay ping | ✅ 双向 0% loss，RTT 约 10–18 ms |
+| 吞吐（20 MiB TCP） | 9.36 Mbps（NAT+overlay）vs 10.31 Mbps（同机直连公网 TCP），约 9% 开销；受家宽上行限制 |
+| 空闲 3 分钟 | ✅ 连接保持，0% loss，RTT 9.6 ms；QUIC keepalive 保住 NAT 映射 |
+| NAT 侧 agent 重启 | ✅ 重启后自动重连（秒级恢复 ping） |
+| 云端 peer 重启 | ✅ 约 31 s 恢复（QUIC 默认 idle timeout 30 s + 2 s 重连间隔） |
+| PMTU | ✅ TUN 1280；1252 字节 payload 双向通过，1253 字节按 MTU 正确失败 |
+
+测试中发现并修复：
+
+- **TUN MTU 抖动**：iroh 建连初期 datagram size 为保守的 1200，MTU monitor 会在
+  1280/1114 之间反复切换；瞬时下调还会在 Linux 路由缓存留下 `mtu 1146`，导致
+  >1146 的 ping 全部 EMSGSIZE。修复：下调需连续 30 个采样（约 60 s），上调时
+  `ip route flush cache`。两端都升级后 TUN 稳定在 1280，1252 字节双向通过，
+  1253 字节按 MTU 正确失败。只升级一端仍可能被对端 PTB 打回 1146。
+- **重启检测慢（未修）**：QUIC 默认 idle timeout 30 s，云端 peer 重启后 NAT 侧要等
+  旧连接超时才会重连（约 31 s）。试过把 idle timeout 调到 15 s，能把恢复降到 17.4 s，
+  但会破坏 `endpoint_fails_over_to_the_second_relay...` 测试（relay 切换不再发生），
+  因此保留默认值，记为已知限制。
+
+仍**未测**：NAT↔NAT（两侧都无公网映射/对称 NAT）、relay-only 回退、家庭路由器
+UDP 映射超时 <3 分钟、IPv6-only 路径、弱网/丢包下的 NAT 重绑定。
+
+### 3.18 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot

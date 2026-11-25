@@ -736,6 +736,10 @@ POST       /v1/ipam/allocate           {node, pool?, zone?}
 - agent 的路由写 API 只接受 `scope=local`；network scope 目前只能通过 controller 配置/静态路由（`api.rs:365-369` 会拒绝 network scope）。
 - ACL/QoS 支持 API 动态更新 + token-bucket + per-priority/per-class queue depth/bytes + DSCP；内置静态 Web UI（`crates/stellaris-agent/static/index.html`）只覆盖 peers/routes/status/policy。anti-spoof 允许 peer 自身 overlay IP + 它广告的前缀；subnet gateway 的 NAT66 目前仅 Linux（macOS 待做）。
 - **控制帧没有逐帧签名**：iroh 连接在 controller 模式下由 membership credential 双向认证（绑定 node key），static 模式由 peers 白名单认证；LSA 另有 Ed25519 签名；但控制帧本身没有逐帧签名，仍不要把 MVP 直接暴露在不可信网络。
+- **NAT 穿透**：已验证 NAT 后的 member 主动出站到公网 controller/peer（direct 路径，
+  无需端口映射或 relay），空闲 3 分钟和双方重启可恢复；NAT↔NAT（尤其对称 NAT）、
+  relay-only 回退和弱网重绑定仍未验证。公网 peer 无法反向拨入 NAT 内网地址，连接
+  由 NAT 侧发起。
 - **static 模式不支持动态成员**：discovery/LSA 不能引入不在 `[[peers]]` 里的节点；增删成员要改每台配置。多节点/需要撤销与自动地址时用 controller。
 - **IPAM 地址热变更不支持**：运行中 controller 改了某成员地址时 agent 只告警，需要重启
   该 agent 才会切换 TUN 地址（首次自动分配和重启复用已支持）。

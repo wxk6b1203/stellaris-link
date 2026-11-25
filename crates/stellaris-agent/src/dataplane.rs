@@ -509,6 +509,16 @@ fn effective_mtu(configured_max: u16, max_datagram: usize, ipv6: bool) -> u16 {
         .max(floor as usize) as u16
 }
 
+#[cfg(target_os = "linux")]
+fn flush_route_cache() {
+    let _ = std::process::Command::new("ip")
+        .args(["route", "flush", "cache"])
+        .status();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn flush_route_cache() {}
+
 fn spawn_mtu_monitor(
     dev: Arc<AsyncDevice>,
     transport: Arc<IrohTransport>,
@@ -518,6 +528,12 @@ fn spawn_mtu_monitor(
     tokio::spawn(async move {
         let mut current = configured_max.min(1100);
         let mut warned = false;
+        // QUIC's initial datagram size is conservative and can dip to ~1200
+        // when a path is revalidated. Lowering the TUN MTU immediately makes it
+        // flap and leaves stale PMTU entries in the kernel route cache, so only
+        // accept a smaller value after it has persisted for a minute.
+        const LOWER_AFTER_SAMPLES: u32 = 30;
+        let mut low_streak = 0u32;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let Some(max) = transport.max_datagram_size() else {
@@ -531,11 +547,24 @@ fn spawn_mtu_monitor(
                     "IPv6 requires at least 1280-byte packets; TUN MTU held at 1280 and oversized packets rely on PTB/MSS"
                 );
             }
+            if target < current {
+                low_streak = low_streak.saturating_add(1);
+                if low_streak < LOWER_AFTER_SAMPLES {
+                    continue;
+                }
+            } else {
+                low_streak = 0;
+            }
             if target != current {
+                let raised = target > current;
                 match dev.set_mtu(target) {
                     Ok(()) => {
                         info!(from = current, to = target, "TUN MTU adjusted");
                         current = target;
+                        if raised {
+                            // PMTUD may have cached the old, smaller MTU.
+                            flush_route_cache();
+                        }
                     }
                     Err(e) => debug!(error = %e, target, "failed to adjust TUN MTU"),
                 }
@@ -1419,8 +1448,8 @@ overlay_ip = "10.7.0.2"
     #[test]
     fn route_ownership_is_parsed_from_ip_output() {
         use super::RouteState;
-        let ours = "10.9.0.0/16 dev stellaris0 proto 186 scope link";
-        assert_eq!(route_state_from("stellaris0", ours), RouteState::Ours);
+        let ours = format!("10.9.0.0/16 dev stellaris0 proto {ROUTE_PROTO} scope link");
+        assert_eq!(route_state_from("stellaris0", &ours), RouteState::Ours);
         let foreign = "10.9.0.0/16 dev eth0 scope link";
         assert_eq!(route_state_from("stellaris0", foreign), RouteState::Foreign);
         assert_eq!(route_state_from("stellaris0", ""), RouteState::Free);

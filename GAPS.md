@@ -245,7 +245,9 @@ iroh 入口走 Raft、Raft RPC 鉴权/超时/checksum、routes/LSA TTL/epoch 入
 metrics/audit、systemd/CI 矩阵、签名审批入网。
 2026-11-25：入网进一步收敛为单一 controller 签名凭据（`MembershipCredential` + `/v1/enroll`），
 删除 PSK/join token/`admission.mode`；撤销后 ≤10s 断连并丢弃 grant，grant 可单独更新。
-仍未验证：多 controller 各自 key 签发的跨地域实测、真实路由器 PTB、CI 实跑。
+NAT 后的成员已用真实家宽验证（direct 穿透、双向 ping、9.4 Mbps、空闲 3 分钟、重启恢复）；
+仍未验证：NAT↔NAT/对称 NAT、relay-only 回退、弱网重绑定、多 controller 各自 key 的跨地域实测、
+真实路由器 PTB、CI 实跑。
 （动态 membership 3→4 与 iroh 8 MiB 快照已在 2026-11-24 晚验证通过。）
 
 ### 4.4 平台/运维
