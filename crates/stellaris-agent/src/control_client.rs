@@ -213,8 +213,11 @@ async fn run_iroh(
         };
         loop {
             if credential_needs_renewal(&state) {
+                let auto = state.config.node.ipam == stellaris_types::IpamMode::Auto;
                 let req = Request::Enroll {
                     overlay_ip: state.config.node.overlay_ip,
+                    auto,
+                    pool: None,
                     zone: state.config.node.zone.clone(),
                     addrs: state.config.transport.advertise.clone(),
                     secret: secret.clone(),
@@ -436,7 +439,24 @@ fn install_credential(state: &AgentState, signed: &crate::credential::SignedCred
         0,
         crate::credential::now_secs(),
     ) {
-        Ok(_) => {
+        Ok(verified) => {
+            if state.config.node.ipam == stellaris_types::IpamMode::Auto {
+                match (verified.overlay_ip, state.local_overlay()) {
+                    (Some(ip), None) => {
+                        state.set_local_overlay(ip);
+                        tracing::info!(%ip, "controller allocated overlay address");
+                    }
+                    (Some(ip), Some(existing)) if existing != ip => {
+                        tracing::warn!(
+                            %existing,
+                            %ip,
+                            "controller changed the overlay address; restart to apply it"
+                        );
+                    }
+                    (Some(_), Some(_)) => {}
+                    (None, _) => tracing::warn!("credential has no overlay address"),
+                }
+            }
             state.set_credential(signed.clone());
             true
         }
@@ -492,6 +512,7 @@ async fn enroll_http(
     state: &AgentState,
     secret: Option<&str>,
 ) {
+    let auto = state.config.node.ipam == stellaris_types::IpamMode::Auto;
     let overlay = state.config.node.overlay_ip;
     let overlay_text = overlay.map(|ip| ip.to_string());
     let payload = crate::controller::enroll_payload_bytes(
@@ -506,6 +527,7 @@ async fn enroll_http(
         .json(&serde_json::json!({
             "node_id": state.node_id.to_string(),
             "overlay_ip": overlay_text,
+            "auto": auto,
             "zone": state.config.node.zone,
             "addrs": state.config.transport.advertise,
             "signature": signature,
@@ -763,7 +785,7 @@ fn local_lsa(state: &AgentState, seq: u64) -> Lsa {
         .collect();
 
     let mut prefixes = Vec::new();
-    if let Some(ip) = state.config.node.overlay_ip {
+    if let Some(ip) = state.local_overlay() {
         prefixes.push(Prefix {
             prefix: stellaris_types::host_prefix(ip),
             metric: 0,
@@ -782,7 +804,7 @@ fn local_lsa(state: &AgentState, seq: u64) -> Lsa {
         zone: state.config.node.zone.clone(),
         links,
         prefixes,
-        overlay_ip: state.config.node.overlay_ip,
+        overlay_ip: state.local_overlay(),
         addrs: state.config.transport.advertise.clone(),
     }
 }
@@ -976,5 +998,85 @@ prefixes = ["192.168.50.0/24"]
         assert!(!state.grants.read().unwrap().contains_key(&node));
         // The revoked node's still-valid credential is fenced locally.
         assert_eq!(state.revision(node), 6);
+    }
+
+    #[tokio::test]
+    async fn auto_enrollment_adopts_the_controller_allocated_address() {
+        let controller_secret = [9u8; 32];
+        let controller = node_for(controller_secret);
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-auto-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent_toml = format!(
+            r#"
+[node]
+name = "m"
+state_dir = "{}"
+ipam = "auto"
+
+[network]
+name = "ipam-demo"
+cidr = "10.30.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+url = "http://127.0.0.1:1"
+secret = "s3cret"
+controller_keys = ["{controller}"]
+credential_ttl_secs = 600
+"#,
+            dir.join("agent").display()
+        );
+        let agent = AgentState::build(Config::from_toml(&agent_toml).unwrap()).unwrap();
+        assert!(agent.local_overlay().is_none());
+        let cdir = dir.join("controller");
+        std::fs::create_dir_all(&cdir).unwrap();
+        let controller_toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "ipam-demo"
+cidr = "10.30.0.0/16"
+
+[control]
+secret = "s3cret"
+
+[control.ipam]
+[[control.ipam.pools]]
+id = "p"
+cidr = "10.30.0.0/24"
+lease_secs = 600
+
+[[control.members]]
+node_id = "{}"
+"#,
+            cdir.display(),
+            agent.node_id
+        );
+        let mut controller_state = crate::controller::ControllerState::from_config(
+            &Config::from_toml(&controller_toml).unwrap(),
+        )
+        .unwrap();
+        controller_state.set_signing_key(controller_secret);
+        let app = crate::controller::router(controller_state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = http_client(&agent.config).unwrap();
+        enroll_http(&client, &format!("http://{addr}"), &agent, Some("s3cret")).await;
+        let credential = agent.credential().expect("credential installed");
+        assert_eq!(
+            credential.credential.overlay_ip,
+            Some("10.30.0.1".parse().unwrap())
+        );
+        assert_eq!(agent.local_overlay(), Some("10.30.0.1".parse().unwrap()));
     }
 }

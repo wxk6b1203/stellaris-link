@@ -32,7 +32,7 @@ pub async fn start(
     transport: Arc<IrohTransport>,
     mut inbound_rx: mpsc::Receiver<InboundPacket>,
 ) -> anyhow::Result<()> {
-    let local_ip = local_ip(&state)?;
+    let local_ip = wait_for_overlay(&state).await?;
     let tun_name = tun_name(&state);
     if !state.config.dataplane.advertise.is_empty() {
         crate::gateway::ensure_forwarding()?;
@@ -83,7 +83,7 @@ pub async fn start(
         dev.clone(),
         transport.clone(),
         state.config.dataplane.mtu,
-        state.config.node.overlay_ip.is_some_and(|ip| ip.is_ipv6()),
+        state.local_overlay().is_some_and(|ip| ip.is_ipv6()),
     );
     spawn_route_reconciler(
         state.routes.clone(),
@@ -203,12 +203,31 @@ fn tun_name(state: &AgentState) -> String {
     }
 }
 
+async fn wait_for_overlay(state: &AgentState) -> anyhow::Result<IpAddr> {
+    if let Some(ip) = state.local_overlay() {
+        return Ok(ip);
+    }
+    if state.config.node.ipam != stellaris_types::IpamMode::Auto {
+        return local_ip(state);
+    }
+    // The control client runs concurrently and stores the credential before
+    // the data plane starts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(ip) = state.local_overlay() {
+            return Ok(ip);
+        }
+    }
+    anyhow::bail!("timed out waiting for a controller-allocated overlay address")
+}
+
 fn local_ip(state: &AgentState) -> anyhow::Result<IpAddr> {
-    state
-        .config
-        .node
-        .overlay_ip
-        .ok_or_else(|| anyhow::anyhow!("node.overlay_ip is required when dataplane is enabled"))
+    state.local_overlay().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no overlay address yet: set node.overlay_ip or use node.ipam = \"auto\" with a controller"
+        )
+    })
 }
 
 fn spawn_route_reconciler(
@@ -743,7 +762,7 @@ fn route_outbound_priority(
     packet: &[u8],
 ) -> Option<(stellaris_types::NodeId, Bytes, i32, Option<usize>)> {
     let info = PacketInfo::parse(packet)?;
-    let local = state.config.node.overlay_ip?;
+    let local = state.local_overlay()?;
     if info.dst == local {
         return None;
     }
@@ -861,7 +880,7 @@ async fn handle_inbound(
                         .unwrap_or_default()
                         .to_vec();
                     if state.config.acl.deny_action == stellaris_types::AclDenyAction::Reject
-                        && let Some(local) = state.config.node.overlay_ip
+                        && let Some(local) = state.local_overlay()
                         && let Some(icmp) = wire::icmp_admin_prohibited(&original, local)
                         && let Some(info) = PacketInfo::parse(&original)
                     {
@@ -922,7 +941,7 @@ fn too_big_action(
     if packet.len() <= mtu as usize {
         return None;
     }
-    let local = state.config.node.overlay_ip?;
+    let local = state.local_overlay()?;
     let mut error = wire::icmp_too_big(packet, mtu, local)?;
     let error_info = PacketInfo::parse(&error)?;
     let entry = state.routes.lookup(error_info.dst)?;
@@ -977,7 +996,7 @@ pub fn decide_inbound(
         return action;
     }
 
-    let Some(local) = state.config.node.overlay_ip else {
+    let Some(local) = state.local_overlay() else {
         return InboundAction::Drop("no local overlay IP");
     };
     let is_local = info.dst == local;

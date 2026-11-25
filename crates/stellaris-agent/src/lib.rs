@@ -48,6 +48,8 @@ pub struct AgentState {
     pub credential: Arc<RwLock<Option<credential::SignedCredential>>>,
     /// Highest credential revision observed per node (replay fencing).
     pub revisions: Arc<RwLock<HashMap<NodeId, u64>>>,
+    /// Effective local overlay address (config or controller-allocated).
+    pub local_overlay: Arc<RwLock<Option<std::net::IpAddr>>>,
     pub policy: Arc<RwLock<policy::Policy>>,
     pub stats: Arc<stats::Stats>,
     pub reassembly: Arc<std::sync::Mutex<reassembly::Reassembler>>,
@@ -171,7 +173,18 @@ impl AgentState {
             policy::Policy::from_config(config.acl.clone(), config.qos.clone())
         };
         let policy = Arc::new(RwLock::new(policy));
-        let credential = load_credential(&state_dir);
+        let credential = load_credential(&state_dir).filter(|credential| {
+            credential.credential.network == network.to_string()
+                && credential.credential.node == identity.node_id
+        });
+        let cached_overlay = if config.node.ipam == stellaris_types::IpamMode::Auto {
+            credential
+                .as_ref()
+                .and_then(|credential| credential.credential.overlay_ip)
+        } else {
+            None
+        };
+        let local_overlay = config.node.overlay_ip.or(cached_overlay);
 
         Ok(Self {
             config: Arc::new(config),
@@ -183,6 +196,7 @@ impl AgentState {
             grants: Arc::new(RwLock::new(HashMap::new())),
             credential: Arc::new(RwLock::new(credential)),
             revisions: Arc::new(RwLock::new(HashMap::new())),
+            local_overlay: Arc::new(RwLock::new(local_overlay)),
             policy,
             stats: Arc::new(stats::Stats::default()),
             reassembly: Arc::new(std::sync::Mutex::new(reassembly::Reassembler::default())),
@@ -192,6 +206,18 @@ impl AgentState {
 
     pub fn routes_path(&self) -> PathBuf {
         PathBuf::from(&self.config.node.state_dir).join("routes.json")
+    }
+
+    /// Effective overlay address for this node.
+    pub fn local_overlay(&self) -> Option<std::net::IpAddr> {
+        *self.local_overlay.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_local_overlay(&self, ip: std::net::IpAddr) {
+        *self
+            .local_overlay
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(ip);
     }
 
     pub fn credential_path(&self) -> PathBuf {
@@ -307,7 +333,6 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
         || control_configured
         || state.config.transport.discovery_port.is_some()
         || state.config.transport.mdns;
-    let mut transport_handle = None;
     if want_transport {
         let transport = transport::IrohTransport::start(
             state.clone(),
@@ -319,7 +344,15 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
             control_tx,
         )
         .await?;
-        transport_handle = Some(transport.clone());
+        if state.config.control.url.is_some() || state.config.control.endpoint_id.is_some() {
+            let control_state = state.clone();
+            let base = control_state.config.control.url.clone();
+            let secret = control_state.config.control.secret.clone();
+            let control_transport = transport.clone();
+            tokio::spawn(async move {
+                control_client::run(control_state, base, secret, Some(control_transport)).await;
+            });
+        }
         discovery::start(state.clone(), transport.clone());
         if let Some(rx) = control_rx {
             let state = state.clone();
@@ -340,16 +373,6 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
         }
     } else {
         tracing::info!("dataplane/transport disabled; API-only mode");
-    }
-
-    if state.config.control.url.is_some() || state.config.control.endpoint_id.is_some() {
-        let state = state.clone();
-        let base = state.config.control.url.clone();
-        let secret = state.config.control.secret.clone();
-        let transport = transport_handle.clone();
-        tokio::spawn(async move {
-            control_client::run(state, base, secret, transport).await;
-        });
     }
 
     {

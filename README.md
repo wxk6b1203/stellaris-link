@@ -21,8 +21,9 @@
 - **数据面**：TUN（Linux/macOS）+ 16 字节 MeshHeader；IPv4 + IPv6 overlay；TTL/转发/anti-spoof；subnet gateway；NAT44/NAT66 public exit；fragment 解析/ACL；TCP MSS clamp、peer path MTU、ICMPv4/v6 PTB；初始 MTU 1100 + 自适应；需要 root/CAP_NET_ADMIN。
 - **API/控制面**：非 loopback `api.bind` 必须配置 `api.token`；`api.read_token` 只允许读操作，写操作仍需要 admin token；`api.previous_tokens` / `control.previous_secrets` 支持轮换窗口；controller 可配置 `control.leader_id`，legacy 路径非 leader 拒绝写入（Raft 路径由 quorum/leader hint 处理）；非 loopback `control.bind`/controller iroh 必须配置 `control.secret`。
 - **入网安全**：无控制面的小规模部署可用 `network.auth.mode = "static"`（WireGuard 式：只接受 `[[peers]]` 里的 node key，iroh 握手本身已完成 key 认证）；生产多节点用 controller 签发的 `MembershipCredential`（network/node/overlay/prefixes/capabilities/revision/not_after），peer 在 iroh 握手时用 `control.controller_keys` 验签；没有共享秘密、没有 join token。`POST /v1/enroll` 是唯一签发入口（预注册即签发，否则进 Raft 待审队列由管理员 `approve/deny`）；`POST /v1/members/{node}/grants` 独立更新授权；`POST /v1/revoke` 撤销后 member ≤10s 断连并丢弃 grant；数据面 source grant（转发他人源地址需要 `transit` capability）、LSA 前缀 grant 与凭据同源；`control.admin_secret` 与 member secret 分权。
+- **IPAM**：controller 侧地址池/CIDR/范围/排除项、租约与隔离期、`/v1/ipam/*` CRUD、enroll/approve 自动分配；member 用 `node.ipam = "auto"` 从凭据取地址并配置 TUN，重启复用缓存地址。DHCP 明确不做。
 - **RoutePolicy**：配置化 policy engine（Accept/Deny/SetLocalPref/SetMetric/SetAdminDistance/SetWeight），在 RIB→FIB 前执行；`Match.zone` 已实现 AZ 匹配。
-- **测试**：FIB/路由/持久化/报文解析/数据面决策/ACL/QoS/API 鉴权/controller 签名/SPF 单元测试；`demo-two-node.sh` 双节点 iroh（static 模式）；`test-real-static-mesh.sh` 4 主机 static 全互联；`docker-two-node-tun.sh` 双容器 TUN；`docker-subnet-gateway.sh` a→b→c 1000B ping；`demo-linkstate.sh`/`demo-distributed-linkstate.sh` 自动路由与 `TEST_FAILOVER=1` 撤路；`demo-iroh-controller.sh` iroh control；`demo-controller-discovery.sh` controller 自动发现成员；`test-real-3host-ha.sh` / `test-real-3host-overlay.sh` / `test-real-3host-ipv6.sh` / `test-real-3host-roaming.sh` 真实物理三主机 HA、IPv4/IPv6、roaming。
+- **测试**：FIB/路由/持久化/报文解析/数据面决策/ACL/QoS/API 鉴权/controller 签名/SPF 单元测试；`demo-two-node.sh` 双节点 iroh（static 模式）；`test-real-static-mesh.sh` 4 主机 static 全互联；`test-real-ipam.sh` 4 主机自动地址分配、mesh ping、重启复用、撤销隔离；`docker-two-node-tun.sh` 双容器 TUN；`docker-subnet-gateway.sh` a→b→c 1000B ping；`demo-linkstate.sh`/`demo-distributed-linkstate.sh` 自动路由与 `TEST_FAILOVER=1` 撤路；`demo-iroh-controller.sh` iroh control；`demo-controller-discovery.sh` controller 自动发现成员；`test-real-3host-ha.sh` / `test-real-3host-overlay.sh` / `test-real-3host-ipv6.sh` / `test-real-3host-roaming.sh` 真实物理三主机 HA、IPv4/IPv6、roaming。
 
 ## 尚未实现（剩余硬化）
 
@@ -672,6 +673,61 @@ curl -X POST -H "x-stellaris-secret: admin-secret" \
 `transport.allow_unauthenticated_discovery = true`。验证见 [TEST-RESULTS.md](TEST-RESULTS.md)
 与 `credential::tests`、`transport::tests::controller_credentials_gate_connections_and_install_grants`。
 
+### 14. IPAM：地址池与自动分配
+
+controller 可以代替手工 `overlay_ip`：
+
+```toml
+# controller
+[control]
+secret = "member-secret"
+admin_secret = "admin-secret"
+
+[control.ipam]
+[[control.ipam.pools]]
+id = "overlay-v4"
+cidr = "10.7.0.0/16"
+range = ["10.7.0.10", "10.7.0.250"]   # 可选；IPv4 池建议 <= /16
+exclude = ["10.7.0.1/32"]
+lease_secs = 3600
+quarantine_secs = 60
+```
+
+```toml
+# member：不要写 overlay_ip
+[node]
+name = "member"
+ipam = "auto"
+
+[network.auth]
+mode = "controller"
+
+[control]
+url = "http://controller:5801"
+secret = "member-secret"
+controller_keys = ["<controller-node-id>"]
+```
+
+流程：agent 签名 enroll（`auto=true`）→ controller 待审队列 → 管理员 approve 时分配地址 →
+凭据携带 `overlay_ip` → agent 用该地址创建 TUN（等待上限 120s）并落盘
+`credential.json`；重启直接复用。
+
+API（admin secret）：
+
+```text
+GET/POST   /v1/ipam/pools
+PATCH/DELETE /v1/ipam/pools/{id}[?force=true]
+GET        /v1/ipam/leases
+POST       /v1/ipam/leases/{node}/renew|release
+POST       /v1/ipam/reservations
+DELETE     /v1/ipam/reservations/{node}
+POST       /v1/ipam/allocate           {node, pool?, zone?}
+```
+
+行为：最低空闲分配（IPv6 用 hash probe）、池内排除/保留/隔离、租约到期由 leader
+批量回收、revoke 释放并隔离、重复/池外静态地址被 409 拒绝。设计细节与限制见
+[IPAM.md](IPAM.md)。
+
 ## 已知限制
 
 - controller 已完成 openraft quorum/leader election/mTLS/snapshot/failover；member 入口仍是单 URL（可指向 LB/任一 controller）。旧 fanout 已移除。
@@ -681,7 +737,8 @@ curl -X POST -H "x-stellaris-secret: admin-secret" \
 - ACL/QoS 支持 API 动态更新 + token-bucket + per-priority/per-class queue depth/bytes + DSCP；内置静态 Web UI（`crates/stellaris-agent/static/index.html`）只覆盖 peers/routes/status/policy。anti-spoof 允许 peer 自身 overlay IP + 它广告的前缀；subnet gateway 的 NAT66 目前仅 Linux（macOS 待做）。
 - **控制帧没有逐帧签名**：iroh 连接在 controller 模式下由 membership credential 双向认证（绑定 node key），static 模式由 peers 白名单认证；LSA 另有 Ed25519 签名；但控制帧本身没有逐帧签名，仍不要把 MVP 直接暴露在不可信网络。
 - **static 模式不支持动态成员**：discovery/LSA 不能引入不在 `[[peers]]` 里的节点；增删成员要改每台配置。多节点/需要撤销与自动地址时用 controller。
-- **IPAM 尚未实现**：overlay IP 仍要手工写；地址池/CIDR CRUD/租约/自动分配的设计见 [IPAM.md](IPAM.md)。
+- **IPAM 地址热变更不支持**：运行中 controller 改了某成员地址时 agent 只告警，需要重启
+  该 agent 才会切换 TUN 地址（首次自动分配和重启复用已支持）。
 - relay 建连、direct→relay 切换已测；relay 故障后会在旧连接关闭时经 `transport.relay_urls` 列表重连（实测约 60s，非秒级切换；多 relay 同时承载未实现）。生产建议自建 relay 并监控（见 AUDIT.md）。
 - 2026-11-24 完成静态审计（[AUDIT.md](AUDIT.md)）并修复 P0：LSA 签名、transit 强制、OS 路由防护、iroh 走 Raft、Raft RPC 必须配 `raft_secret` 且有超时、admin secret、routes/LSA TTL/epoch 入 Raft、动态 membership。2026-11-25 进一步把入网收敛为 controller 签名的成员凭据。仍没有第三方安全审计，MVP 仅用于开发/实验。
 - 2026-11-25 配置变更（不兼容）：删除 `network.auth.secret`、`network.auth.allowed_nodes`、`control.join_token(s)`、`control.require_join_signature`、`control.admission`、`control.request_admission`；新增 `control.credential_ttl_secs`。`network.auth.mode` 只剩 `none`（仅实验）和 `controller`，配 `controller` 时必须给 `control.controller_keys` 以及 `control.endpoint_id` 或 `control.url`。`POST /v1/join` 由 `POST /v1/enroll` 取代，`GET /v1/status` 不再有 `join_config_hash`。

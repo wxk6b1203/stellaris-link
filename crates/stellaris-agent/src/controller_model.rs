@@ -5,11 +5,13 @@
 //! state on every replica; openraft can later drive `apply()`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use stellaris_linkstate::{LinkStateDb, Lsa};
-use stellaris_types::{NetworkId, NodeId, RouteEntry};
+use stellaris_types::{AddressPool, NetworkId, NodeId, RouteEntry};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemberRecord {
@@ -18,9 +20,37 @@ pub struct MemberRecord {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingAdmission {
-    pub overlay_ip: IpAddr,
+    /// Requested address; `None` means the controller allocates one.
+    #[serde(default)]
+    pub overlay_ip: Option<IpAddr>,
+    #[serde(default)]
+    pub auto: bool,
+    #[serde(default)]
+    pub pool: Option<String>,
+    #[serde(default)]
+    pub zone: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Lease {
+    pub node: NodeId,
+    pub ip: IpAddr,
+    pub pool: String,
+    pub issued_at: u64,
+    /// 0 for a reserved address, otherwise unix seconds.
+    pub expires_at: u64,
+    pub reserved: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reservation {
+    pub node: NodeId,
+    pub ip: IpAddr,
+    pub pool: String,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,22 +79,71 @@ pub enum ControllerCommand {
     /// Signed join request waiting for an administrator decision.
     RequestAdmission {
         node: NodeId,
-        overlay_ip: IpAddr,
+        #[serde(default)]
+        overlay_ip: Option<IpAddr>,
+        #[serde(default)]
+        auto: bool,
+        #[serde(default)]
+        pool: Option<String>,
+        #[serde(default)]
+        zone: Option<String>,
     },
     /// Administrator approval: grants exactly the supplied member record.
+    /// When `auto` is set and `member.overlay_ip` is `None`, `apply` allocates
+    /// a free address from the pools (deterministically across replicas).
     ApproveAdmission {
         node: NodeId,
         member: MemberRecord,
+        #[serde(default)]
+        auto: bool,
+        #[serde(default)]
+        pool: Option<String>,
+        #[serde(default)]
+        zone: Option<String>,
+        #[serde(default)]
+        now: u64,
     },
     DenyAdmission {
         node: NodeId,
+        #[serde(default)]
+        now: u64,
     },
     UpsertMember {
         node: NodeId,
         member: MemberRecord,
     },
+    CreatePool {
+        pool: AddressPool,
+    },
+    UpdatePool {
+        pool: AddressPool,
+    },
+    DeletePool {
+        id: String,
+        force: bool,
+        now: u64,
+    },
+    ReserveAddress {
+        node: NodeId,
+        ip: IpAddr,
+        pool: Option<String>,
+        note: Option<String>,
+    },
+    ReleaseAddress {
+        node: NodeId,
+        now: u64,
+    },
+    RenewLease {
+        node: NodeId,
+        now: u64,
+    },
+    ExpireLeases {
+        now: u64,
+    },
     RevokeMember {
         node: NodeId,
+        #[serde(default)]
+        now: u64,
     },
     Ack {
         node: NodeId,
@@ -95,6 +174,18 @@ pub struct ControllerModel {
     /// administrator admits them again.
     #[serde(default)]
     pub revoked: BTreeSet<NodeId>,
+    #[serde(default)]
+    pub pools: BTreeMap<String, AddressPool>,
+    /// address -> lease (a single index enforces uniqueness).
+    #[serde(default)]
+    pub leases: BTreeMap<IpAddr, Lease>,
+    #[serde(default)]
+    pub node_leases: BTreeMap<NodeId, IpAddr>,
+    #[serde(default)]
+    pub reservations: BTreeMap<NodeId, Reservation>,
+    /// Released addresses stay unusable until this timestamp.
+    #[serde(default)]
+    pub quarantine: BTreeMap<IpAddr, u64>,
     /// Controller-pushed routes: prefix -> next hop -> metric.
     #[serde(default)]
     pub routes: BTreeMap<String, BTreeMap<NodeId, u32>>,
@@ -114,6 +205,11 @@ impl ControllerModel {
             acks: BTreeMap::new(),
             member_revisions: BTreeMap::new(),
             revoked: BTreeSet::new(),
+            pools: BTreeMap::new(),
+            leases: BTreeMap::new(),
+            node_leases: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            quarantine: BTreeMap::new(),
             routes: BTreeMap::new(),
             pending_admissions: BTreeMap::new(),
         }
@@ -172,9 +268,10 @@ impl ControllerModel {
                 self.revoked.remove(&node);
                 true
             }
-            ControllerCommand::RevokeMember { node } => {
+            ControllerCommand::RevokeMember { node, now } => {
                 let removed = self.members.remove(&node).is_some();
                 let lsa_removed = self.lsas.remove(&node).is_some();
+                self.release_lease(node, now);
                 self.revoked.insert(node);
                 self.bump_revision(node);
                 if removed || lsa_removed {
@@ -196,29 +293,196 @@ impl ControllerModel {
                 }
                 changed
             }
-            ControllerCommand::RequestAdmission { node, overlay_ip } => {
+            ControllerCommand::RequestAdmission {
+                node,
+                overlay_ip,
+                auto,
+                pool,
+                zone,
+            } => {
                 if self.members.contains_key(&node)
                     || self.pending_admissions.contains_key(&node)
                     || self.revoked.contains(&node)
                 {
                     false
                 } else {
-                    self.pending_admissions
-                        .insert(node, PendingAdmission { overlay_ip });
+                    self.pending_admissions.insert(
+                        node,
+                        PendingAdmission {
+                            overlay_ip,
+                            auto,
+                            pool,
+                            zone,
+                        },
+                    );
                     true
                 }
             }
-            ControllerCommand::ApproveAdmission { node, member } => {
+            ControllerCommand::ApproveAdmission {
+                node,
+                mut member,
+                auto,
+                pool,
+                zone,
+                now,
+            } => {
+                if member.overlay_ip.is_none() {
+                    if !auto {
+                        return false;
+                    }
+                    match self.allocate_address(node, pool.as_deref(), zone.as_deref(), now) {
+                        Ok((ip, pool_id, _, reserved)) => {
+                            member.overlay_ip = Some(ip);
+                            self.assign_lease(node, ip, &pool_id, now, reserved);
+                        }
+                        Err(_) => return false,
+                    }
+                } else if let Some(ip) = member.overlay_ip {
+                    if self.overlay_taken(ip, node) {
+                        return false;
+                    }
+                    if let Some(old) = self.node_leases.get(&node).copied()
+                        && old != ip
+                    {
+                        self.release_lease(node, now);
+                    }
+                    let pool_id = self
+                        .pool_of(ip)
+                        .map(|pool| pool.id.clone())
+                        .or_else(|| self.leases.get(&ip).map(|lease| lease.pool.clone()))
+                        .unwrap_or_default();
+                    let reserved = self.reservations.get(&node).map(|r| r.ip) == Some(ip);
+                    if !pool_id.is_empty() {
+                        self.assign_lease(node, ip, &pool_id, now, reserved);
+                    }
+                }
                 self.bump_revision(node);
                 self.members.insert(node, member);
                 self.revoked.remove(&node);
                 self.pending_admissions.remove(&node);
                 true
             }
-            ControllerCommand::DenyAdmission { node } => {
+            ControllerCommand::DenyAdmission { node, now } => {
                 let changed = self.pending_admissions.remove(&node).is_some();
+                self.release_lease(node, now);
                 self.revoked.insert(node);
                 self.bump_revision(node);
+                changed
+            }
+            ControllerCommand::CreatePool { pool } => {
+                if pool.id.trim().is_empty() || self.pools.contains_key(&pool.id) {
+                    false
+                } else {
+                    self.pools.insert(pool.id.clone(), pool);
+                    true
+                }
+            }
+            ControllerCommand::UpdatePool { pool } => {
+                if self.pools.contains_key(&pool.id) {
+                    self.pools.insert(pool.id.clone(), pool);
+                    true
+                } else {
+                    false
+                }
+            }
+            ControllerCommand::DeletePool { id, force, now } => {
+                if !self.pools.contains_key(&id) {
+                    return false;
+                }
+                let has_leases = self.leases.values().any(|lease| lease.pool == id);
+                if has_leases && !force {
+                    return false;
+                }
+                self.pools.remove(&id);
+                self.release_pool(&id, now);
+                true
+            }
+            ControllerCommand::ReserveAddress {
+                node,
+                ip,
+                pool,
+                note,
+            } => {
+                let Some(pool) = pool.or_else(|| self.pool_of(ip).map(|p| p.id.clone())) else {
+                    return false;
+                };
+                if !self.pools.contains_key(&pool) || self.overlay_taken(ip, node) {
+                    return false;
+                }
+                self.release_lease(node, 0);
+                self.reservations.insert(
+                    node,
+                    Reservation {
+                        node,
+                        ip,
+                        pool: pool.clone(),
+                        note,
+                    },
+                );
+                self.node_leases.insert(node, ip);
+                self.leases.insert(
+                    ip,
+                    Lease {
+                        node,
+                        ip,
+                        pool,
+                        issued_at: 0,
+                        expires_at: 0,
+                        reserved: true,
+                    },
+                );
+                true
+            }
+            ControllerCommand::ReleaseAddress { node, now } => {
+                let had =
+                    self.node_leases.contains_key(&node) || self.reservations.contains_key(&node);
+                self.release_lease(node, now);
+                had
+            }
+            ControllerCommand::RenewLease { node, now } => {
+                let Some(ip) = self.node_leases.get(&node).copied() else {
+                    return false;
+                };
+                let Some(lease) = self.leases.get(&ip).cloned() else {
+                    return false;
+                };
+                if lease.reserved || lease.expires_at == 0 {
+                    return false;
+                }
+                let lease_secs = self
+                    .pools
+                    .get(&lease.pool)
+                    .map(|pool| pool.lease_secs)
+                    .unwrap_or(3600);
+                let mut renewed = lease;
+                renewed.expires_at = now.saturating_add(lease_secs);
+                self.leases.insert(ip, renewed);
+                true
+            }
+            ControllerCommand::ExpireLeases { now } => {
+                let expired: Vec<IpAddr> = self
+                    .leases
+                    .iter()
+                    .filter(|(_, lease)| lease.expires_at > 0 && lease.expires_at <= now)
+                    .map(|(ip, _)| *ip)
+                    .collect();
+                let changed = !expired.is_empty();
+                for ip in expired {
+                    if let Some(lease) = self.leases.remove(&ip) {
+                        self.node_leases.remove(&lease.node);
+                        self.members.remove(&lease.node);
+                        self.lsas.remove(&lease.node);
+                        self.bump_revision(lease.node);
+                        let quarantine = self
+                            .pools
+                            .get(&lease.pool)
+                            .map(|pool| pool.quarantine_secs)
+                            .unwrap_or(60);
+                        if quarantine > 0 {
+                            self.quarantine.insert(ip, now.saturating_add(quarantine));
+                        }
+                    }
+                }
                 changed
             }
             ControllerCommand::UpsertRoute {
@@ -250,6 +514,238 @@ impl ControllerModel {
         }
     }
 
+    pub fn pool_of(&self, ip: IpAddr) -> Option<&AddressPool> {
+        self.pools.values().find(|pool| pool.cidr.contains(&ip))
+    }
+
+    /// True when another node already owns or reserved `ip`.
+    pub fn overlay_taken(&self, ip: IpAddr, node: NodeId) -> bool {
+        self.leases.get(&ip).is_some_and(|lease| lease.node != node)
+            || self
+                .members
+                .iter()
+                .any(|(other, member)| *other != node && member.overlay_ip == Some(ip))
+            || self
+                .reservations
+                .iter()
+                .any(|(other, reservation)| *other != node && reservation.ip == ip)
+    }
+
+    fn assign_lease(&mut self, node: NodeId, ip: IpAddr, pool: &str, now: u64, reserved: bool) {
+        let lease_secs = self
+            .pools
+            .get(pool)
+            .map(|pool| pool.lease_secs)
+            .unwrap_or(3600);
+        // `now == 0` marks config-time pre-registration: the lease never
+        // expires until an administrator changes it.
+        let expires_at = if reserved || now == 0 {
+            0
+        } else {
+            now.saturating_add(lease_secs)
+        };
+        self.quarantine.remove(&ip);
+        self.node_leases.insert(node, ip);
+        self.leases.insert(
+            ip,
+            Lease {
+                node,
+                ip,
+                pool: pool.to_string(),
+                issued_at: now,
+                expires_at,
+                reserved,
+            },
+        );
+    }
+
+    fn release_lease(&mut self, node: NodeId, now: u64) {
+        self.reservations.remove(&node);
+        let Some(ip) = self.node_leases.remove(&node) else {
+            return;
+        };
+        let lease = self.leases.remove(&ip);
+        let quarantine = lease
+            .as_ref()
+            .and_then(|lease| self.pools.get(&lease.pool))
+            .map(|pool| pool.quarantine_secs)
+            .unwrap_or(60);
+        if quarantine > 0 {
+            self.quarantine.insert(ip, now.saturating_add(quarantine));
+        }
+    }
+
+    fn release_pool(&mut self, id: &str, now: u64) {
+        let ips: Vec<IpAddr> = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.pool == id)
+            .map(|(ip, _)| *ip)
+            .collect();
+        for ip in ips {
+            if let Some(lease) = self.leases.remove(&ip) {
+                self.node_leases.remove(&lease.node);
+                let quarantine = self
+                    .pools
+                    .get(id)
+                    .map(|pool| pool.quarantine_secs)
+                    .unwrap_or(60);
+                if quarantine > 0 {
+                    self.quarantine.insert(ip, now.saturating_add(quarantine));
+                }
+            }
+        }
+        self.reservations
+            .retain(|_, reservation| reservation.pool != id);
+    }
+
+    /// Deterministically allocate or reuse an address for `node`.
+    ///
+    /// Returns `(ip, pool_id, expires_at, reserved)`. The algorithm only reads
+    /// model state plus command fields, so every Raft replica computes the same
+    /// answer.
+    pub fn allocate_address(
+        &self,
+        node: NodeId,
+        pool_hint: Option<&str>,
+        zone: Option<&str>,
+        now: u64,
+    ) -> Result<(IpAddr, String, u64, bool), String> {
+        if let Some(reservation) = self.reservations.get(&node) {
+            return Ok((reservation.ip, reservation.pool.clone(), 0, true));
+        }
+        if let Some(ip) = self.node_leases.get(&node).copied()
+            && let Some(lease) = self.leases.get(&ip)
+            && (lease.reserved || lease.expires_at == 0 || lease.expires_at > now)
+        {
+            return Ok((ip, lease.pool.clone(), lease.expires_at, lease.reserved));
+        }
+        let mut pools: Vec<&AddressPool> = self
+            .pools
+            .values()
+            .filter(|pool| pool_hint.is_none_or(|hint| hint == pool.id))
+            .collect();
+        pools.sort_by(|a, b| {
+            let affinity = |pool: &AddressPool| (pool.zone.as_deref() != zone) as u8;
+            affinity(a).cmp(&affinity(b)).then_with(|| a.id.cmp(&b.id))
+        });
+        for pool in pools {
+            if let Some(ip) = self.find_free(pool, node, now) {
+                let expires_at = if now == 0 {
+                    0
+                } else {
+                    now.saturating_add(pool.lease_secs)
+                };
+                return Ok((ip, pool.id.clone(), expires_at, false));
+            }
+        }
+        Err("no free address in configured IPAM pools".into())
+    }
+
+    fn find_free(&self, pool: &AddressPool, node: NodeId, now: u64) -> Option<IpAddr> {
+        let free = |ip: IpAddr| -> bool {
+            if pool.exclude.iter().any(|exclude| exclude.contains(&ip)) {
+                return false;
+            }
+            if self.leases.contains_key(&ip) {
+                return false;
+            }
+            if self
+                .reservations
+                .values()
+                .any(|reservation| reservation.ip == ip)
+            {
+                return false;
+            }
+            if self.quarantine.get(&ip).is_some_and(|until| *until > now) {
+                return false;
+            }
+            !self
+                .members
+                .iter()
+                .any(|(other, member)| *other != node && member.overlay_ip == Some(ip))
+        };
+        match pool.cidr {
+            IpNet::V4(net) => {
+                let (start, end) = match pool.range {
+                    Some((IpAddr::V4(start), IpAddr::V4(end))) => {
+                        (u32::from(start), u32::from(end))
+                    }
+                    _ => {
+                        let prefix = net.prefix_len();
+                        let network = u32::from(net.network());
+                        let broadcast = u32::from(net.broadcast());
+                        if prefix < 31 {
+                            (network + 1, broadcast.saturating_sub(1))
+                        } else {
+                            (network, broadcast)
+                        }
+                    }
+                };
+                if start > end {
+                    return None;
+                }
+                // Validation keeps IPv4 pools at /16 or smaller.
+                for value in start..=end {
+                    let ip = IpAddr::V4(Ipv4Addr::from(value));
+                    if free(ip) {
+                        return Some(ip);
+                    }
+                }
+                None
+            }
+            IpNet::V6(net) => {
+                let (start, end) = match pool.range {
+                    Some((IpAddr::V6(start), IpAddr::V6(end))) => {
+                        (u128::from(start), u128::from(end))
+                    }
+                    _ => {
+                        let prefix = net.prefix_len();
+                        let base = u128::from(net.network());
+                        let host_bits = 128u32.saturating_sub(prefix as u32);
+                        if host_bits == 0 {
+                            let ip = IpAddr::V6(net.network());
+                            return free(ip).then_some(ip);
+                        }
+                        let mask = u128::MAX >> (128 - host_bits);
+                        let mut hasher = Sha256::new();
+                        hasher.update(self.network.to_string().as_bytes());
+                        hasher.update(pool.id.as_bytes());
+                        hasher.update(node.as_bytes());
+                        let digest = hasher.finalize();
+                        let mut seed = [0u8; 16];
+                        seed.copy_from_slice(&digest[..16]);
+                        (base | (u128::from_be_bytes(seed) & mask), base | mask)
+                    }
+                };
+                if start > end {
+                    return None;
+                }
+                let span = end - start;
+                if span > 4096 {
+                    for offset in 0..4096u128 {
+                        let value = start.wrapping_add(offset);
+                        if value > end {
+                            break;
+                        }
+                        let ip = IpAddr::V6(Ipv6Addr::from(value));
+                        if free(ip) {
+                            return Some(ip);
+                        }
+                    }
+                } else {
+                    for value in start..=end {
+                        let ip = IpAddr::V6(Ipv6Addr::from(value));
+                        if free(ip) {
+                            return Some(ip);
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
     fn bump_revision(&mut self, node: NodeId) {
         let entry = self.member_revisions.entry(node).or_insert(0);
         *entry = entry.saturating_add(1);
@@ -267,6 +763,11 @@ impl ControllerModel {
             acks: Vec<(&'a NodeId, &'a AckRecord)>,
             member_revisions: Vec<(&'a NodeId, &'a u64)>,
             revoked: Vec<&'a NodeId>,
+            pools: Vec<(&'a String, &'a AddressPool)>,
+            leases: Vec<(&'a IpAddr, &'a Lease)>,
+            node_leases: Vec<(&'a NodeId, &'a IpAddr)>,
+            reservations: Vec<(&'a NodeId, &'a Reservation)>,
+            quarantine: Vec<(&'a IpAddr, &'a u64)>,
             routes: Vec<(&'a String, Vec<(&'a NodeId, &'a u32)>)>,
             pending_admissions: Vec<(&'a NodeId, &'a PendingAdmission)>,
         }
@@ -279,6 +780,11 @@ impl ControllerModel {
             acks: self.acks.iter().collect(),
             member_revisions: self.member_revisions.iter().collect(),
             revoked: self.revoked.iter().collect(),
+            pools: self.pools.iter().collect(),
+            leases: self.leases.iter().collect(),
+            node_leases: self.node_leases.iter().collect(),
+            reservations: self.reservations.iter().collect(),
+            quarantine: self.quarantine.iter().collect(),
             routes: self
                 .routes
                 .iter()
@@ -433,7 +939,10 @@ mod tests {
         let mut b = ControllerModel::new(a.network, 1);
         let request = ControllerCommand::RequestAdmission {
             node,
-            overlay_ip: "10.7.0.9".parse().unwrap(),
+            overlay_ip: Some("10.7.0.9".parse().unwrap()),
+            auto: false,
+            pool: None,
+            zone: None,
         };
         assert!(a.apply(request.clone()));
         assert!(b.apply(request));
@@ -447,23 +956,44 @@ mod tests {
         assert!(a.apply(ControllerCommand::ApproveAdmission {
             node,
             member: member.clone(),
+            auto: false,
+            pool: None,
+            zone: None,
+            now: 0,
         }));
-        b.apply(ControllerCommand::ApproveAdmission { node, member });
+        b.apply(ControllerCommand::ApproveAdmission {
+            node,
+            member: member.clone(),
+            auto: false,
+            pool: None,
+            zone: None,
+            now: 0,
+        });
         assert!(a.members.contains_key(&node));
         assert!(a.pending_admissions.is_empty());
         assert_eq!(a.snapshot_bytes(), b.snapshot_bytes());
         // Approving again is idempotent but still changes authorization state.
         assert!(a.apply(ControllerCommand::ApproveAdmission {
             node,
-            member: MemberRecord::default(),
+            member,
+            auto: false,
+            pool: None,
+            zone: None,
+            now: 0,
         }));
         // Deny removes a pending request only.
         let other = NodeId::new([10u8; 32]);
         a.apply(ControllerCommand::RequestAdmission {
             node: other,
-            overlay_ip: "10.7.0.10".parse().unwrap(),
+            overlay_ip: Some("10.7.0.10".parse().unwrap()),
+            auto: false,
+            pool: None,
+            zone: None,
         });
-        assert!(a.apply(ControllerCommand::DenyAdmission { node: other }));
+        assert!(a.apply(ControllerCommand::DenyAdmission {
+            node: other,
+            now: 0,
+        }));
         assert!(!a.pending_admissions.contains_key(&other));
     }
 
@@ -510,7 +1040,7 @@ mod tests {
             member: MemberRecord::default(),
         });
         assert_eq!(model.epoch, 10);
-        assert!(model.apply(ControllerCommand::RevokeMember { node }));
+        assert!(model.apply(ControllerCommand::RevokeMember { node, now: 0 }));
         assert!(model.epoch > 10, "revoke must fence old manifests");
         assert!(!model.members.contains_key(&node));
     }
@@ -547,8 +1077,158 @@ mod tests {
             node,
             member: MemberRecord::default(),
         });
-        assert!(model.apply(ControllerCommand::RevokeMember { node }));
+        assert!(model.apply(ControllerCommand::RevokeMember { node, now: 0 }));
         assert!(!model.lsas.contains_key(&node));
         assert!(!model.members.contains_key(&node));
+    }
+
+    fn test_pool(id: &str, cidr: &str, lease_secs: u64, quarantine_secs: u64) -> AddressPool {
+        AddressPool {
+            id: id.into(),
+            cidr: cidr.parse().unwrap(),
+            range: None,
+            exclude: Vec::new(),
+            lease_secs,
+            quarantine_secs,
+            strategy: stellaris_types::AllocStrategy::LowestFree,
+            zone: None,
+            description: None,
+        }
+    }
+
+    fn approve_auto(
+        model: &mut ControllerModel,
+        node: NodeId,
+        now: u64,
+    ) -> Option<std::net::IpAddr> {
+        let applied = model.apply(ControllerCommand::ApproveAdmission {
+            node,
+            member: MemberRecord::default(),
+            auto: true,
+            pool: None,
+            zone: None,
+            now,
+        });
+        assert!(applied, "allocation should succeed");
+        model
+            .members
+            .get(&node)
+            .and_then(|member| member.overlay_ip)
+    }
+
+    #[test]
+    fn lowest_free_allocation_skips_excludes_and_reservations() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        let mut pool = test_pool("p", "10.9.0.0/24", 60, 30);
+        pool.range = Some(("10.9.0.10".parse().unwrap(), "10.9.0.20".parse().unwrap()));
+        pool.exclude = vec!["10.9.0.12/32".parse().unwrap()];
+        model.apply(ControllerCommand::CreatePool { pool });
+        let a = NodeId::new([1u8; 32]);
+        let b = NodeId::new([2u8; 32]);
+        let c = NodeId::new([3u8; 32]);
+        let d = NodeId::new([4u8; 32]);
+        assert_eq!(
+            approve_auto(&mut model, a, 100),
+            Some("10.9.0.10".parse().unwrap())
+        );
+        assert_eq!(
+            approve_auto(&mut model, b, 100),
+            Some("10.9.0.11".parse().unwrap())
+        );
+        assert!(model.apply(ControllerCommand::ReserveAddress {
+            node: c,
+            ip: "10.9.0.15".parse().unwrap(),
+            pool: None,
+            note: Some("vip".into()),
+        }));
+        assert_eq!(
+            approve_auto(&mut model, d, 100),
+            Some("10.9.0.13".parse().unwrap())
+        );
+        assert_eq!(model.leases.len(), 4);
+    }
+
+    #[test]
+    fn expired_leases_are_quarantined_then_reused() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::CreatePool {
+            pool: test_pool("p", "10.10.0.0/24", 10, 30),
+        });
+        let a = NodeId::new([1u8; 32]);
+        let b = NodeId::new([2u8; 32]);
+        let c = NodeId::new([3u8; 32]);
+        assert_eq!(
+            approve_auto(&mut model, a, 1000),
+            Some("10.10.0.1".parse().unwrap())
+        );
+        assert!(!model.apply(ControllerCommand::ExpireLeases { now: 1005 }));
+        assert!(model.apply(ControllerCommand::ExpireLeases { now: 1010 }));
+        assert!(model.leases.is_empty());
+        assert_eq!(
+            model.quarantine.get(&"10.10.0.1".parse().unwrap()).copied(),
+            Some(1040)
+        );
+        // Still quarantined: the next node gets a different address.
+        assert_eq!(
+            approve_auto(&mut model, b, 1010),
+            Some("10.10.0.2".parse().unwrap())
+        );
+        // Once the quarantine ends the address is reusable.
+        assert_eq!(
+            approve_auto(&mut model, c, 1041),
+            Some("10.10.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn ipv6_hash_probe_is_deterministic() {
+        let network = NetworkId::new();
+        let node = NodeId::new([7u8; 32]);
+        let mut a = ControllerModel::new(network, 1);
+        let mut b = ControllerModel::new(network, 1);
+        let mut pool = test_pool("v6", "fd00:9::/120", 60, 30);
+        pool.strategy = stellaris_types::AllocStrategy::HashProbe;
+        a.apply(ControllerCommand::CreatePool { pool: pool.clone() });
+        b.apply(ControllerCommand::CreatePool { pool });
+        let ip_a = approve_auto(&mut a, node, 100);
+        let ip_b = approve_auto(&mut b, node, 100);
+        assert!(ip_a.is_some(), "ipv6 pool must allocate");
+        assert_eq!(ip_a, ip_b);
+        assert_eq!(a.snapshot_bytes(), b.snapshot_bytes());
+    }
+
+    #[test]
+    fn revoke_releases_the_lease() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::CreatePool {
+            pool: test_pool("p", "10.11.0.0/24", 60, 30),
+        });
+        let a = NodeId::new([1u8; 32]);
+        let ip = approve_auto(&mut model, a, 100).unwrap();
+        assert!(model.apply(ControllerCommand::RevokeMember { node: a, now: 200 }));
+        assert!(model.leases.is_empty());
+        assert!(model.node_leases.is_empty());
+        assert_eq!(model.quarantine.get(&ip).copied(), Some(230));
+    }
+
+    #[test]
+    fn deleting_a_pool_requires_force_when_leases_exist() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::CreatePool {
+            pool: test_pool("p", "10.12.0.0/24", 60, 30),
+        });
+        approve_auto(&mut model, NodeId::new([1u8; 32]), 100);
+        assert!(!model.apply(ControllerCommand::DeletePool {
+            id: "p".into(),
+            force: false,
+            now: 200,
+        }));
+        assert!(model.apply(ControllerCommand::DeletePool {
+            id: "p".into(),
+            force: true,
+            now: 200,
+        }));
+        assert!(model.pools.is_empty());
+        assert!(model.leases.is_empty());
     }
 }

@@ -35,6 +35,17 @@ pub struct Config {
     pub routes: Vec<StaticRouteConfig>,
 }
 
+/// How a member obtains its overlay address.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpamMode {
+    /// `node.overlay_ip` is configured by the operator.
+    #[default]
+    Static,
+    /// The controller allocates an address and returns it in the credential.
+    Auto,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub name: String,
@@ -49,6 +60,9 @@ pub struct NodeConfig {
     /// Optional availability-zone / failure-domain label.
     #[serde(default)]
     pub zone: Option<String>,
+    /// Static (default) or controller-allocated overlay address.
+    #[serde(default)]
+    pub ipam: IpamMode,
 }
 
 impl Default for NodeConfig {
@@ -59,6 +73,7 @@ impl Default for NodeConfig {
             state_dir: default_state_dir(),
             overlay_ip: None,
             zone: None,
+            ipam: IpamMode::Static,
         }
     }
 }
@@ -176,6 +191,13 @@ impl Default for RaftTiming {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IpamConfig {
+    /// Controller-side pools. IPAM is enabled when this list is non-empty.
+    #[serde(default)]
+    pub pools: Vec<crate::ipam::AddressPool>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlConfig {
     /// Controller base URL for members (MVP: HTTP).
@@ -255,6 +277,9 @@ pub struct ControlConfig {
     /// from the replicated model by an ``ExpireLsa`` command.
     #[serde(default = "default_lsa_ttl")]
     pub lsa_ttl_secs: u64,
+    /// Controller-managed overlay address pools.
+    #[serde(default)]
+    pub ipam: IpamConfig,
     /// Trusted controller NodeIds for verifying Ed25519 snapshots.
     #[serde(default)]
     pub controller_keys: Vec<String>,
@@ -328,6 +353,7 @@ impl Default for ControlConfig {
             raft_tls_require_client_cert: false,
             manifest_ttl_secs: default_manifest_ttl(),
             lsa_ttl_secs: default_lsa_ttl(),
+            ipam: IpamConfig::default(),
             controller_keys: Vec::new(),
             allow_unsigned_snapshot: false,
             controller_threshold: 1,
@@ -691,6 +717,122 @@ impl Config {
                 self.network.cidr
             )));
         }
+        if self.node.ipam == IpamMode::Auto {
+            if self.node.role == "controller" {
+                return Err(ConfigError::Invalid(
+                    "node.ipam = auto is only valid for members".into(),
+                ));
+            }
+            if self.node.overlay_ip.is_some() {
+                return Err(ConfigError::Invalid(
+                    "node.ipam = auto conflicts with node.overlay_ip".into(),
+                ));
+            }
+            if self.network.auth.mode != AuthMode::Controller {
+                return Err(ConfigError::Invalid(
+                    "node.ipam = auto requires network.auth.mode = controller".into(),
+                ));
+            }
+            if self.control.url.is_none() && self.control.endpoint_id.is_none() {
+                return Err(ConfigError::Invalid(
+                    "node.ipam = auto requires control.url or control.endpoint_id".into(),
+                ));
+            }
+        } else if self.dataplane.enabled && self.node.overlay_ip.is_none() {
+            return Err(ConfigError::Invalid(
+                "node.overlay_ip is required when dataplane is enabled; set node.ipam = \"auto\" to let the controller allocate one".into(),
+            ));
+        }
+        let mut pool_ids = HashSet::new();
+        let mut pool_nets: Vec<(String, IpNet)> = Vec::new();
+        for pool in &self.control.ipam.pools {
+            if pool.id.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "ipam pool id must not be empty".into(),
+                ));
+            }
+            if !pool_ids.insert(pool.id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate ipam pool id {}",
+                    pool.id
+                )));
+            }
+            let same_family = matches!(
+                (&pool.cidr, &self.network.cidr),
+                (IpNet::V4(_), IpNet::V4(_)) | (IpNet::V6(_), IpNet::V6(_))
+            );
+            if !same_family {
+                return Err(ConfigError::Invalid(format!(
+                    "ipam pool {} address family differs from network.cidr",
+                    pool.id
+                )));
+            }
+            if pool.cidr.prefix_len() < self.network.cidr.prefix_len()
+                || !self.network.cidr.contains(&pool.cidr.network())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "ipam pool {} ({}) is outside network.cidr {}",
+                    pool.id, pool.cidr, self.network.cidr
+                )));
+            }
+            if let Some((start, end)) = pool.range {
+                if !pool.cidr.contains(&start) || !pool.cidr.contains(&end) {
+                    return Err(ConfigError::Invalid(format!(
+                        "ipam pool {} range is outside {}",
+                        pool.id, pool.cidr
+                    )));
+                }
+                let ordered = match (start, end) {
+                    (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                        u32::from(a) <= u32::from(b)
+                    }
+                    (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                        u128::from(a) <= u128::from(b)
+                    }
+                    _ => false,
+                };
+                if !ordered {
+                    return Err(ConfigError::Invalid(format!(
+                        "ipam pool {} range start must be <= end and use one family",
+                        pool.id
+                    )));
+                }
+            }
+            for excluded in &pool.exclude {
+                if !pool.cidr.contains(&excluded.network())
+                    || excluded.prefix_len() < pool.cidr.prefix_len()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "ipam pool {} exclude {} is outside {}",
+                        pool.id, excluded, pool.cidr
+                    )));
+                }
+            }
+            if pool.lease_secs == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "ipam pool {} lease_secs must be > 0",
+                    pool.id
+                )));
+            }
+            if matches!(pool.cidr, IpNet::V4(_))
+                && pool.range.is_none()
+                && pool.cidr.prefix_len() < 16
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "ipam pool {} is larger than /16; set an explicit range",
+                    pool.id
+                )));
+            }
+            for (other_id, other) in &pool_nets {
+                if other.contains(&pool.cidr.network()) || pool.cidr.contains(&other.network()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "ipam pools {other_id} and {} overlap",
+                        pool.id
+                    )));
+                }
+            }
+            pool_nets.push((pool.id.clone(), pool.cidr));
+        }
         if self.control.credential_ttl_secs == 0 {
             return Err(ConfigError::Invalid(
                 "control.credential_ttl_secs must be > 0".into(),
@@ -847,6 +989,7 @@ impl Config {
             ));
         }
         let mut member_ids = HashSet::new();
+        let mut member_overlays = HashSet::new();
         for member in &self.control.members {
             let node: NodeId = member
                 .node_id
@@ -857,6 +1000,19 @@ impl Config {
                     "duplicate controller member {}",
                     member.node_id
                 )));
+            }
+            if let Some(ip) = member.overlay_ip {
+                if !self.network.cidr.contains(&ip) {
+                    return Err(ConfigError::Invalid(format!(
+                        "controller member {} overlay {ip} is outside network.cidr",
+                        member.node_id
+                    )));
+                }
+                if !member_overlays.insert(ip) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate controller member overlay {ip}"
+                    )));
+                }
             }
         }
         if self.network.auth.mode == AuthMode::Static
@@ -1059,7 +1215,10 @@ impl Config {
                 self.network.cidr
             )));
         }
-        if self.dataplane.enabled && self.node.overlay_ip.is_none() {
+        if self.dataplane.enabled
+            && self.node.overlay_ip.is_none()
+            && self.node.ipam != IpamMode::Auto
+        {
             return Err(ConfigError::Invalid(
                 "node.overlay_ip is required when dataplane.enabled = true".into(),
             ));
@@ -1520,5 +1679,79 @@ mdns = true
             hex::encode([2u8; 32])
         );
         assert!(Config::from_toml(&with_peer).is_ok());
+    }
+
+    #[test]
+    fn ipam_auto_requires_controller_and_no_static_address() {
+        let base = r#"
+[node]
+name = "a"
+ipam = "auto"
+[network]
+name = "demo"
+cidr = "10.30.0.0/16"
+[network.auth]
+mode = "controller"
+[control]
+url = "http://127.0.0.1:1"
+controller_keys = ["0202020202020202020202020202020202020202020202020202020202020202"]
+[dataplane]
+enabled = true
+"#;
+        assert!(Config::from_toml(base).is_ok());
+        let with_overlay = base.replace(
+            "[node]\nname = \"a\"",
+            "[node]\nname = \"a\"\noverlay_ip = \"10.30.0.2\"",
+        );
+        let error = Config::from_toml(&with_overlay).unwrap_err().to_string();
+        assert!(error.contains("overlay_ip"), "{error}");
+        let no_controller = base.replace("mode = \"controller\"", "mode = \"none\"");
+        let error = Config::from_toml(&no_controller).unwrap_err().to_string();
+        assert!(error.contains("controller"), "{error}");
+        let static_without_overlay = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.30.0.0/16"
+[dataplane]
+enabled = true
+"#;
+        let error = Config::from_toml(static_without_overlay)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlay_ip"), "{error}");
+    }
+
+    #[test]
+    fn ipam_pools_are_validated() {
+        let base = r#"
+[node]
+name = "ctrl"
+role = "controller"
+[network]
+name = "demo"
+cidr = "10.30.0.0/16"
+[control.ipam]
+[[control.ipam.pools]]
+id = "p"
+cidr = "10.30.0.0/24"
+lease_secs = 600
+"#;
+        assert!(Config::from_toml(base).is_ok());
+        let outside = base.replace("cidr = \"10.30.0.0/24\"", "cidr = \"10.31.0.0/24\"");
+        assert!(Config::from_toml(&outside).is_err());
+        let zero_lease = base.replace("lease_secs = 600", "lease_secs = 0");
+        assert!(Config::from_toml(&zero_lease).is_err());
+        let too_large = base.replace("cidr = \"10.30.0.0/24\"", "cidr = \"10.0.0.0/8\"");
+        assert!(Config::from_toml(&too_large).is_err());
+        let overlap = format!(
+            "{base}
+[[control.ipam.pools]]
+id = \"q\"
+cidr = \"10.30.0.0/25\"
+"
+        );
+        assert!(Config::from_toml(&overlap).is_err());
     }
 }

@@ -87,7 +87,7 @@
 - [x] PSK 入网认证 + allowlist；controller Ed25519 snapshot 签名；controller 侧 member/prefix grant；一次性 join token；member 侧 LSA prefix grant 强制；signed membership manifest；真实 3 节点 TUN/LSA transit 通过。（PSK/join token 已于 2026-11-25 删除，见下一行）
 - [x] 2026-11-25：入网收敛为单一 controller 签名 `MembershipCredential`；`/v1/enroll`、`/v1/members/{node}/grants`、撤销断连、自动续签。
 - [x] 2026-11-25：`network.auth.mode = "static"`（WireGuard 式 peers 白名单）。
-- [ ] IPAM：地址池/CIDR CRUD/租约/自动分配（设计见 [IPAM.md](IPAM.md)）。
+- [x] IPAM：地址池/CIDR CRUD/租约/自动分配（实现与验证见 [IPAM.md](IPAM.md)、TEST-RESULTS §3.15）；DHCP 不做。
 - [x] join token 过期/撤销；旧 manifest threshold/多 controller 聚合已移除。
 - [ ] ACL/QoS 审计日志、复杂整形。
 - [ ] 完整 PMTUD 状态机、应用层 fragment reassembly、强制 multipath、磁盘满/撕裂写注入、Windows/macOS NAT。

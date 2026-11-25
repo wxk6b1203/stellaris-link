@@ -380,7 +380,7 @@ fn local_lsa(state: &AgentState, seq: u64, connected: &HashSet<NodeId>) -> Lsa {
         .collect();
 
     let mut prefixes = Vec::new();
-    if let Some(ip) = state.config.node.overlay_ip {
+    if let Some(ip) = state.local_overlay() {
         prefixes.push(Prefix {
             prefix: stellaris_types::host_prefix(ip),
             metric: 0,
@@ -399,7 +399,7 @@ fn local_lsa(state: &AgentState, seq: u64, connected: &HashSet<NodeId>) -> Lsa {
         zone: state.config.node.zone.clone(),
         links,
         prefixes,
-        overlay_ip: state.config.node.overlay_ip,
+        overlay_ip: state.local_overlay(),
         addrs: state.config.transport.advertise.clone(),
     }
 }

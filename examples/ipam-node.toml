@@ -1,0 +1,29 @@
+# Member that gets its overlay address from the controller (no overlay_ip).
+[node]
+name = "member"
+state_dir = "./state/ipam-member"
+ipam = "auto"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+url = "http://127.0.0.1:5801"          # or endpoint_id + addrs for iroh
+secret = "change-me-member-secret"
+controller_keys = ["0000000000000000000000000000000000000000000000000000000000000000"]
+
+[transport]
+listen_port = 5901
+advertise = ["192.0.2.10:5901"]
+
+[dataplane]
+enabled = true
+tun_name = "stellaris0"
+mtu = 1280
+
+[api]
+bind = "127.0.0.1:7777"

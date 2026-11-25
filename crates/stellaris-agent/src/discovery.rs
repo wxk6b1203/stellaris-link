@@ -48,7 +48,7 @@ fn start_broadcast(state: AgentState, transport: Arc<IrohTransport>) {
         warn!("transport.discovery_port requires transport.advertise");
         return;
     }
-    let Some(overlay_ip) = state.config.node.overlay_ip else {
+    let Some(overlay_ip) = state.local_overlay() else {
         warn!("transport.discovery_port requires node.overlay_ip");
         return;
     };
@@ -146,7 +146,7 @@ fn start_mdns(state: AgentState, transport: Arc<IrohTransport>) {
         warn!("transport.mdns requires transport.advertise");
         return;
     };
-    let Some(overlay_ip) = state.config.node.overlay_ip else {
+    let Some(overlay_ip) = state.local_overlay() else {
         warn!("transport.mdns requires node.overlay_ip");
         return;
     };

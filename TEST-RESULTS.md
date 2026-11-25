@@ -439,7 +439,7 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **175 passed**（agent 130 + types 20 + 其余 25） |
+| 全量测试 | `cargo test --workspace` | **186 passed**（agent 139 + types 22 + 其余 25） |
 | Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
 | Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
 | 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
@@ -460,7 +460,24 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 
 > 云环境注意：第一次用随机 UDP 端口（47190）启动 rogue 时 QUIC 握手无法完成——安全组只放行各节点的固定端口；改用 n1 的 47101 后测试通过。脚本 `scripts/test-real-static-mesh.sh` 已按此实现。
 
-### 3.15 仍未验证
+### 3.15 2026-11-25 IPAM（4 台真实主机）
+
+controller 在深圳 `.223`，3 个 member 分布在深圳 `.202`、乌兰察布 `.235/.111`；
+member 配置 `node.ipam = "auto"`，controller 池 `10.66.0.0/24`：
+
+| 项 | 结果 |
+|---|---|
+| 自动分配 | ✅ enroll → 待审 → admin approve → 凭据携带 `10.66.0.1/2/3`；三个 TUN 均配置对应地址 |
+| 租约 | ✅ `/v1/ipam/leases` 3 条；最低空闲顺序分配 |
+| 数据面 | ✅ 等待 peer mesh 后 3×2 方向 ping 全部通过 |
+| 重启复用 | ✅ 重启 n1 后仍是 `10.66.0.1`（缓存 `credential.json`） |
+| 撤销 | ✅ 撤销 n3 后租约降到 2、`10.66.0.3` 进入 quarantine；剩余成员继续互通 |
+| 脚本 | ✅ `scripts/test-real-ipam.sh` |
+
+> 环境说明：这批主机的安全组只放行 5689–6000；controller HTTP 用 5801，
+> member 的 iroh 端口用 5901–5903，因此测试直接使用公网地址，无需隧道。
+
+### 3.16 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot
@@ -636,6 +653,7 @@ peer path MTU: 1414
 - Docker host-network TUN
 - 应用层分片重组、ACL reject/drop、入网审批（2026-11-24）
 - 单一成员凭据：签发/审批/撤销/握手/续签（2026-11-25，本地）
+- IPAM：自动分配、租约、TUN 地址、重启复用、撤销隔离（2026-11-25，4 主机）
 
 仍未验证/未实现：
 

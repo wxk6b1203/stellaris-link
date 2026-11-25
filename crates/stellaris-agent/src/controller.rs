@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderValue;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
@@ -25,8 +25,8 @@ use serde_json::json;
 use sha2::Sha256;
 use stellaris_linkstate::{LinkStateDb, Lsa};
 use stellaris_types::{
-    Config, ControllerMemberConfig, NetworkId, NodeId, RaftTiming, RouteEntry, RouteId,
-    RouteSource, RouteState,
+    AddressPool, Config, ControllerMemberConfig, NetworkId, NodeId, RaftTiming, RouteEntry,
+    RouteId, RouteSource, RouteState,
 };
 
 use crate::credential::{MembershipCredential, SignedCredential};
@@ -52,6 +52,7 @@ struct PersistedLsas {
 #[derive(Clone)]
 pub struct ControllerState {
     pub network: NetworkId,
+    pub cidr: IpNet,
     secret: Option<String>,
     admin_secret: Option<String>,
     routes: Arc<RwLock<Vec<RouteEntry>>>,
@@ -290,18 +291,44 @@ impl ControllerState {
         for command in replay {
             model.apply(command);
         }
-        for (node, grant) in &grants {
-            model.apply(ControllerCommand::UpsertMember {
-                node: *node,
-                member: MemberRecord {
-                    overlay_ip: grant.overlay_ip,
-                    prefixes: grant.prefixes.iter().map(|p| p.to_string()).collect(),
-                    capabilities: grant.capabilities.clone(),
-                },
-            });
+        for pool in &config.control.ipam.pools {
+            model.apply(ControllerCommand::CreatePool { pool: pool.clone() });
+        }
+        let mut seeded: Vec<(&NodeId, &ControllerMemberConfig)> = grants.iter().collect();
+        seeded.sort_by(|a, b| a.0.cmp(b.0));
+        for (node, grant) in seeded {
+            let mut member = MemberRecord {
+                overlay_ip: grant.overlay_ip,
+                prefixes: grant.prefixes.iter().map(|p| p.to_string()).collect(),
+                capabilities: grant.capabilities.clone(),
+            };
+            if member.overlay_ip.is_none() && !model.pools.is_empty() {
+                match model.allocate_address(*node, None, None, 0) {
+                    Ok((ip, _pool, _, _)) => member.overlay_ip = Some(ip),
+                    Err(error) => {
+                        tracing::warn!(%node, %error, "pre-registered member has no address")
+                    }
+                }
+            }
+            if member.overlay_ip.is_none() {
+                model.apply(ControllerCommand::UpsertMember {
+                    node: *node,
+                    member,
+                });
+            } else {
+                model.apply(ControllerCommand::ApproveAdmission {
+                    node: *node,
+                    member,
+                    auto: false,
+                    pool: None,
+                    zone: None,
+                    now: 0,
+                });
+            }
         }
         Ok(Self {
             network,
+            cidr: config.network.cidr,
             secret: config.control.secret.clone(),
             admin_secret: config.control.admin_secret.clone(),
             routes: Arc::new(RwLock::new(routes)),
@@ -351,11 +378,44 @@ impl ControllerState {
         &self,
         node: NodeId,
         overlay: Option<std::net::IpAddr>,
+        auto: bool,
+        pool: Option<String>,
+        zone: Option<String>,
     ) -> Result<EnrollOutcome, (u16, String)> {
+        let now = crate::credential::now_secs();
         let model = self.model_current().await;
-        if let Some(member) = model.members.get(&node) {
+        if let Some(member) = model.members.get(&node).cloned() {
+            if member.overlay_ip.is_none() {
+                if !auto {
+                    return Err((409, "member has no overlay address".into()));
+                }
+                let (ip, pool_id, _, _) = model
+                    .allocate_address(node, pool.as_deref(), zone.as_deref(), now)
+                    .map_err(|error| (409, error))?;
+                let mut updated = member.clone();
+                updated.overlay_ip = Some(ip);
+                self.commit_command(ControllerCommand::ApproveAdmission {
+                    node,
+                    member: updated,
+                    auto: false,
+                    pool: Some(pool_id),
+                    zone: zone.clone(),
+                    now,
+                })
+                .await?;
+                let model = self.model_current().await;
+                let member = model
+                    .members
+                    .get(&node)
+                    .cloned()
+                    .ok_or((503, "member vanished during allocation".to_string()))?;
+                let revision = model.member_revisions.get(&node).copied().unwrap_or(1);
+                let credential = self.issue_credential(node, &member, revision)?;
+                return Ok(EnrollOutcome::Credential(Box::new(credential)));
+            }
+            self.renew_lease_if_needed(&model, node, now).await;
             let revision = model.member_revisions.get(&node).copied().unwrap_or(1);
-            let credential = self.issue_credential(node, member, revision)?;
+            let credential = self.issue_credential(node, &member, revision)?;
             return Ok(EnrollOutcome::Credential(Box::new(credential)));
         }
         if model.revoked.contains(&node) {
@@ -363,12 +423,25 @@ impl ControllerState {
                 "node was revoked by an administrator".into(),
             ));
         }
-        let Some(overlay) = overlay else {
-            return Err((400, "overlay_ip is required for a new member".into()));
-        };
+        if auto {
+            if model.pools.is_empty() {
+                return Err((
+                    409,
+                    "node.ipam = auto but no IPAM pools are configured".into(),
+                ));
+            }
+        } else {
+            let Some(ip) = overlay else {
+                return Err((400, "overlay_ip is required unless node.ipam = auto".into()));
+            };
+            self.validate_overlay(&model, node, ip)?;
+        }
         let command = ControllerCommand::RequestAdmission {
             node,
             overlay_ip: overlay,
+            auto,
+            pool,
+            zone,
         };
         if let Some(raft) = &self.raft {
             raft.client_write(command)
@@ -383,6 +456,47 @@ impl ControllerState {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
         Ok(EnrollOutcome::Pending)
+    }
+
+    async fn renew_lease_if_needed(&self, model: &ControllerModel, node: NodeId, now: u64) {
+        let Some(ip) = model.node_leases.get(&node).copied() else {
+            return;
+        };
+        if !model
+            .leases
+            .get(&ip)
+            .is_some_and(|lease| !lease.reserved && lease.expires_at > 0)
+        {
+            return;
+        }
+        let command = ControllerCommand::RenewLease { node, now };
+        if let Some(raft) = &self.raft {
+            let _ = raft.client_write(command).await;
+        } else {
+            self.append_command(command.clone());
+            self.model
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .apply(command);
+        }
+    }
+
+    fn validate_overlay(
+        &self,
+        model: &ControllerModel,
+        node: NodeId,
+        ip: std::net::IpAddr,
+    ) -> Result<(), (u16, String)> {
+        if model.overlay_taken(ip, node) {
+            return Err((409, format!("overlay address {ip} is already in use")));
+        }
+        if !model.pools.is_empty() && model.pool_of(ip).is_none() {
+            return Err((
+                409,
+                format!("overlay address {ip} is outside the configured IPAM pools"),
+            ));
+        }
+        Ok(())
     }
 
     fn issue_credential(
@@ -435,7 +549,7 @@ impl ControllerState {
     fn mirror_member_command(&self, command: &ControllerCommand) {
         let mut changed = false;
         match command {
-            ControllerCommand::ApproveAdmission { node, member }
+            ControllerCommand::ApproveAdmission { node, member, .. }
             | ControllerCommand::UpsertMember { node, member } => {
                 self.grants
                     .write()
@@ -455,8 +569,8 @@ impl ControllerState {
                     );
                 changed = true;
             }
-            ControllerCommand::RevokeMember { node }
-            | ControllerCommand::DenyAdmission { node } => {
+            ControllerCommand::RevokeMember { node, .. }
+            | ControllerCommand::DenyAdmission { node, .. } => {
                 changed = self
                     .grants
                     .write()
@@ -740,7 +854,38 @@ impl ControllerState {
                     }
                 }
             }
+            let now = crate::credential::now_secs();
+            let model = self.model_current().await;
+            if model
+                .leases
+                .values()
+                .any(|lease| lease.expires_at > 0 && lease.expires_at <= now)
+                && let Err(error) = raft
+                    .client_write(ControllerCommand::ExpireLeases { now })
+                    .await
+            {
+                tracing::debug!(%error, "raft lease expiry failed");
+            }
         }
+    }
+
+    /// Expire leases on a controller without Raft.
+    async fn expire_leases_local(&self) {
+        let now = crate::credential::now_secs();
+        let model = self.model_current().await;
+        if !model
+            .leases
+            .values()
+            .any(|lease| lease.expires_at > 0 && lease.expires_at <= now)
+        {
+            return;
+        }
+        let command = ControllerCommand::ExpireLeases { now };
+        self.append_command(command.clone());
+        self.model
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(command);
     }
 
     pub fn manifest(&self) -> MembershipManifest {
@@ -1088,10 +1233,13 @@ impl ControllerState {
 
     async fn revoke_current(&self, node: NodeId) -> Result<(), (u16, String)> {
         if let Some(raft) = &self.raft {
-            raft.client_write(ControllerCommand::RevokeMember { node })
-                .await
-                .map(|_| ())
-                .map_err(|e| (503, format!("raft revoke failed: {e}")))
+            raft.client_write(ControllerCommand::RevokeMember {
+                node,
+                now: crate::credential::now_secs(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| (503, format!("raft revoke failed: {e}")))
         } else {
             self.revoke(node)
         }
@@ -1137,11 +1285,12 @@ impl ControllerState {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(node);
-        self.append_command(ControllerCommand::RevokeMember { node });
+        let now = crate::credential::now_secs();
+        self.append_command(ControllerCommand::RevokeMember { node, now });
         self.model
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .apply(ControllerCommand::RevokeMember { node });
+            .apply(ControllerCommand::RevokeMember { node, now });
         self.persist_lsas();
         self.acks
             .write()
@@ -1380,7 +1529,367 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/admissions", get(list_admissions))
         .route("/v1/admissions/{node}/approve", post(approve_admission))
         .route("/v1/admissions/{node}/deny", post(deny_admission))
+        .route("/v1/ipam/pools", get(list_pools).post(create_pool))
+        .route(
+            "/v1/ipam/pools/{id}",
+            patch(update_pool).delete(delete_pool),
+        )
+        .route("/v1/ipam/leases", get(list_leases))
+        .route("/v1/ipam/leases/{node}/renew", post(renew_lease))
+        .route("/v1/ipam/leases/{node}/release", post(release_lease))
+        .route("/v1/ipam/reservations", post(reserve_address))
+        .route("/v1/ipam/reservations/{node}", delete(remove_reservation))
+        .route("/v1/ipam/allocate", post(allocate_address))
         .with_state(state)
+}
+
+fn validate_pool(
+    pool: &AddressPool,
+    network_cidr: IpNet,
+    model: &ControllerModel,
+) -> Result<(), (u16, String)> {
+    if pool.id.trim().is_empty() {
+        return Err((400, "pool id must not be empty".into()));
+    }
+    let same_family = matches!(
+        (&pool.cidr, &network_cidr),
+        (IpNet::V4(_), IpNet::V4(_)) | (IpNet::V6(_), IpNet::V6(_))
+    );
+    if !same_family {
+        return Err((400, "pool address family differs from network.cidr".into()));
+    }
+    if pool.cidr.prefix_len() < network_cidr.prefix_len()
+        || !network_cidr.contains(&pool.cidr.network())
+    {
+        return Err((
+            400,
+            format!("pool {} is outside network.cidr {network_cidr}", pool.cidr),
+        ));
+    }
+    if pool.lease_secs == 0 {
+        return Err((400, "pool lease_secs must be > 0".into()));
+    }
+    if let Some((start, end)) = pool.range
+        && (!pool.cidr.contains(&start) || !pool.cidr.contains(&end))
+    {
+        return Err((400, "pool range is outside its cidr".into()));
+    }
+    for excluded in &pool.exclude {
+        if !pool.cidr.contains(&excluded.network())
+            || excluded.prefix_len() < pool.cidr.prefix_len()
+        {
+            return Err((400, format!("exclude {excluded} is outside {}", pool.cidr)));
+        }
+    }
+    if let IpNet::V4(_) = pool.cidr
+        && pool.range.is_none()
+        && pool.cidr.prefix_len() < 16
+    {
+        return Err((
+            400,
+            "IPv4 pools larger than /16 require an explicit range".into(),
+        ));
+    }
+    for other in model.pools.values().filter(|other| other.id != pool.id) {
+        if other.cidr.contains(&pool.cidr.network()) || pool.cidr.contains(&other.cidr.network()) {
+            return Err((409, format!("pool overlaps {}", other.id)));
+        }
+    }
+    Ok(())
+}
+
+async fn list_pools(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let model = state.model_current().await;
+    let pools: Vec<_> = model
+        .pools
+        .values()
+        .map(|pool| {
+            json!({
+                "pool": pool,
+                "allocated": model.leases.values().filter(|lease| lease.pool == pool.id).count(),
+            })
+        })
+        .collect();
+    Json(json!({
+        "pools": pools,
+        "leases": model.leases.len(),
+        "quarantined": model.quarantine.len(),
+    }))
+    .into_response()
+}
+
+async fn create_pool(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Json(pool): Json<AddressPool>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let model = state.model_current().await;
+    if let Err((code, message)) = validate_pool(&pool, state.cidr, &model) {
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            message,
+        )
+            .into_response();
+    }
+    let id = pool.id.clone();
+    match state
+        .commit_command(ControllerCommand::CreatePool { pool })
+        .await
+    {
+        Ok(()) => Json(json!({"created": id})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+async fn update_pool(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(mut pool): Json<AddressPool>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    pool.id = id;
+    let model = state.model_current().await;
+    if let Err((code, message)) = validate_pool(&pool, state.cidr, &model) {
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            message,
+        )
+            .into_response();
+    }
+    let pool_id = pool.id.clone();
+    match state
+        .commit_command(ControllerCommand::UpdatePool { pool })
+        .await
+    {
+        Ok(()) => Json(json!({"updated": pool_id})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeletePoolQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn delete_pool(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<DeletePoolQuery>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state
+        .commit_command(ControllerCommand::DeletePool {
+            id,
+            force: query.force,
+            now: crate::credential::now_secs(),
+        })
+        .await
+    {
+        Ok(()) => Json(json!({"deleted": true})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+async fn list_leases(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let model = state.model_current().await;
+    Json(json!({
+        "leases": model.leases.values().collect::<Vec<_>>(),
+        "reservations": model.reservations.values().collect::<Vec<_>>(),
+        "quarantine": model
+            .quarantine
+            .iter()
+            .map(|(ip, until)| json!({"ip": ip, "until": until}))
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+async fn renew_lease(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(node) = node.parse::<NodeId>() else {
+        return (StatusCode::BAD_REQUEST, "invalid node").into_response();
+    };
+    match state
+        .commit_command(ControllerCommand::RenewLease {
+            node,
+            now: crate::credential::now_secs(),
+        })
+        .await
+    {
+        Ok(()) => Json(json!({"renewed": node.to_string()})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+async fn release_lease(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(node) = node.parse::<NodeId>() else {
+        return (StatusCode::BAD_REQUEST, "invalid node").into_response();
+    };
+    match state
+        .commit_command(ControllerCommand::ReleaseAddress {
+            node,
+            now: crate::credential::now_secs(),
+        })
+        .await
+    {
+        Ok(()) => Json(json!({"released": node.to_string()})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReservationRequest {
+    node: String,
+    ip: String,
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn reserve_address(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Json(req): Json<ReservationRequest>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match req.node.parse() {
+        Ok(node) => node,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
+    };
+    let ip: std::net::IpAddr = match req.ip.parse() {
+        Ok(ip) => ip,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid ip: {e}")).into_response(),
+    };
+    let model = state.model_current().await;
+    if state.validate_overlay(&model, node, ip).is_err() {
+        return (StatusCode::CONFLICT, "address is already in use").into_response();
+    }
+    if let Some(pool) = &req.pool
+        && !model.pools.contains_key(pool)
+    {
+        return (StatusCode::BAD_REQUEST, "unknown pool").into_response();
+    }
+    match state
+        .commit_command(ControllerCommand::ReserveAddress {
+            node,
+            ip,
+            pool: req.pool,
+            note: req.note,
+        })
+        .await
+    {
+        Ok(()) => Json(json!({"reserved": node.to_string(), "ip": ip.to_string()})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+async fn remove_reservation(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(node) = node.parse::<NodeId>() else {
+        return (StatusCode::BAD_REQUEST, "invalid node").into_response();
+    };
+    match state
+        .commit_command(ControllerCommand::ReleaseAddress {
+            node,
+            now: crate::credential::now_secs(),
+        })
+        .await
+    {
+        Ok(()) => Json(json!({"released": node.to_string()})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AllocateRequest {
+    node: String,
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+}
+
+async fn allocate_address(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Json(req): Json<AllocateRequest>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match req.node.parse() {
+        Ok(node) => node,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
+    };
+    let model = state.model_current().await;
+    let Some(member) = model.members.get(&node).cloned() else {
+        return (StatusCode::NOT_FOUND, "member not found").into_response();
+    };
+    if member.overlay_ip.is_some() {
+        return (StatusCode::CONFLICT, "member already has an address").into_response();
+    }
+    let now = crate::credential::now_secs();
+    let (ip, pool_id, _, _) =
+        match model.allocate_address(node, req.pool.as_deref(), req.zone.as_deref(), now) {
+            Ok(allocation) => allocation,
+            Err(error) => return (StatusCode::CONFLICT, error).into_response(),
+        };
+    let mut updated = member;
+    updated.overlay_ip = Some(ip);
+    match state
+        .commit_command(ControllerCommand::ApproveAdmission {
+            node,
+            member: updated,
+            auto: false,
+            pool: Some(pool_id),
+            zone: req.zone,
+            now,
+        })
+        .await
+    {
+        Ok(()) => {
+            Json(json!({"allocated": ip.to_string(), "node": node.to_string()})).into_response()
+        }
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
 }
 
 async fn status(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
@@ -1495,6 +2004,10 @@ struct EnrollRequest {
     #[serde(default)]
     overlay_ip: Option<String>,
     #[serde(default)]
+    auto: bool,
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
     zone: Option<String>,
     #[serde(default)]
     addrs: Vec<SocketAddr>,
@@ -1562,7 +2075,10 @@ async fn enroll(
             .into_response();
     }
     let _ = req.addrs;
-    match state.enroll(node, overlay).await {
+    match state
+        .enroll(node, overlay, req.auto, req.pool.clone(), req.zone.clone())
+        .await
+    {
         Ok(EnrollOutcome::Credential(credential)) => {
             Json(json!({"credential": credential})).into_response()
         }
@@ -1644,7 +2160,10 @@ async fn list_admissions(State(state): State<ControllerState>, headers: HeaderMa
         .map(|(node, admission)| {
             json!({
                 "node": node.to_string(),
-                "overlay_ip": admission.overlay_ip.to_string(),
+                "overlay_ip": admission.overlay_ip.map(|ip| ip.to_string()),
+                "auto": admission.auto,
+                "pool": admission.pool,
+                "zone": admission.zone,
             })
         })
         .collect();
@@ -1681,13 +2200,35 @@ async fn approve_admission(
             return (StatusCode::BAD_REQUEST, format!("invalid prefix: {prefix}")).into_response();
         }
     }
+    let now = crate::credential::now_secs();
+    let overlay = match pending.overlay_ip {
+        Some(ip) => ip,
+        None => match model.allocate_address(
+            node,
+            pending.pool.as_deref(),
+            pending.zone.as_deref(),
+            now,
+        ) {
+            Ok((ip, _, _, _)) => ip,
+            Err(error) => {
+                return (StatusCode::CONFLICT, error).into_response();
+            }
+        },
+    };
     let member = crate::controller_model::MemberRecord {
-        overlay_ip: Some(pending.overlay_ip),
+        overlay_ip: Some(overlay),
         prefixes: req.prefixes.clone(),
         capabilities: req.capabilities.clone(),
     };
     match state
-        .commit_command(ControllerCommand::ApproveAdmission { node, member })
+        .commit_command(ControllerCommand::ApproveAdmission {
+            node,
+            member,
+            auto: false,
+            pool: pending.pool.clone(),
+            zone: pending.zone.clone(),
+            now,
+        })
         .await
     {
         Ok(()) => Json(json!({"approved": node.to_string()})).into_response(),
@@ -1708,7 +2249,10 @@ async fn deny_admission(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
     };
     match state
-        .commit_command(ControllerCommand::DenyAdmission { node })
+        .commit_command(ControllerCommand::DenyAdmission {
+            node,
+            now: crate::credential::now_secs(),
+        })
         .await
     {
         Ok(()) => Json(json!({"denied": node.to_string()})).into_response(),
@@ -2003,6 +2547,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             let _ = node.server.await;
         });
     }
+    if state.raft.is_none() {
+        let expiry = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                expiry.expire_leases_local().await;
+            }
+        });
+    }
     if config.control.iroh_port.is_some() {
         let state = state.clone();
         let config = config.clone();
@@ -2169,18 +2724,20 @@ async fn dispatch_control(
         }
         Request::Enroll {
             overlay_ip,
+            auto,
+            pool,
             zone,
             addrs,
             secret,
         } => {
-            let _ = (zone, addrs);
+            let _ = addrs;
             if !state.authorized_secret(secret.as_deref()) {
                 return Response::Error {
                     code: 401,
                     message: "unauthorized".into(),
                 };
             }
-            match state.enroll(remote, overlay_ip).await {
+            match state.enroll(remote, overlay_ip, auto, pool, zone).await {
                 Ok(EnrollOutcome::Credential(credential)) => Response::Credential {
                     credential: *credential,
                 },
@@ -3777,5 +4334,246 @@ prefixes = ["192.168.50.0/24"]
         let value = json(response).await;
         assert_eq!(value["generation"], 2);
         assert_eq!(value["route"]["prefix"], "10.9.0.0/16");
+    }
+
+    fn ipam_config(state_dir: &str, pools: &str, members: &str) -> Config {
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "ipam-demo"
+cidr = "10.20.0.0/16"
+
+[control]
+secret = "s3cret"
+admin_secret = "admin-secret"
+
+[control.ipam]
+{pools}
+{members}
+"#,
+            state_dir
+        );
+        Config::from_toml(&toml).unwrap()
+    }
+
+    async fn post_enroll(
+        app: &Router,
+        network: &NetworkId,
+        secret: [u8; 32],
+        auto: bool,
+        overlay: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let node = node_for(secret);
+        let payload = enroll_payload_bytes(&network.to_string(), &node.to_string(), overlay, None);
+        let signature = sign_ed25519(&secret, &payload);
+        let body = json!({
+            "node_id": node.to_string(),
+            "overlay_ip": overlay,
+            "auto": auto,
+            "signature": signature,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/enroll")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(json!(null)),
+        )
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("x-stellaris-secret", "admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(json!(null)),
+        )
+    }
+
+    #[test]
+    fn ipam_pre_registered_member_gets_a_deterministic_address() {
+        let dir = temp_state_dir();
+        let config = ipam_config(
+            &dir,
+            r#"[[control.ipam.pools]]
+id = "p"
+cidr = "10.20.0.0/24"
+lease_secs = 600"#,
+            r#"[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101""#,
+        );
+        let state = ControllerState::from_config(&config).unwrap();
+        let model = state.model();
+        let node = NodeId::new([1u8; 32]);
+        assert_eq!(
+            model.members[&node].overlay_ip,
+            Some("10.20.0.1".parse().unwrap())
+        );
+        assert_eq!(model.leases[&"10.20.0.1".parse().unwrap()].node, node);
+    }
+
+    #[tokio::test]
+    async fn ipam_auto_enrollment_allocates_and_issues_credentials() {
+        let dir = temp_state_dir();
+        let config = ipam_config(
+            &dir,
+            r#"[[control.ipam.pools]]
+id = "p"
+cidr = "10.20.0.0/24"
+lease_secs = 600
+quarantine_secs = 30"#,
+            "",
+        );
+        let mut state = ControllerState::from_config(&config).unwrap();
+        state.set_signing_key([7u8; 32]);
+        let network = state.network;
+        let app = router(state);
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert_eq!(
+            post_enroll(&app, &network, a, true, None).await.0,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            post_enroll(&app, &network, b, true, None).await.0,
+            StatusCode::ACCEPTED
+        );
+        let (status, pending) = get_json(&app, "/v1/admissions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 2);
+
+        for (index, secret) in [a, b].into_iter().enumerate() {
+            let node = node_for(secret);
+            let approve = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/admissions/{node}/approve"))
+                        .header("x-stellaris-secret", "admin-secret")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"prefixes": []}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(approve.status(), StatusCode::OK);
+            let (status, body) = post_enroll(&app, &network, secret, true, None).await;
+            assert_eq!(status, StatusCode::OK);
+            let credential: SignedCredential =
+                serde_json::from_value(body["credential"].clone()).unwrap();
+            let expected: std::net::IpAddr = format!("10.20.0.{}", index + 1).parse().unwrap();
+            assert_eq!(credential.credential.overlay_ip, Some(expected));
+        }
+
+        let (status, leases) = get_json(&app, "/v1/ipam/leases").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(leases["leases"].as_array().unwrap().len(), 2);
+
+        // Pool CRUD is admin-scoped and validates membership in the CIDR.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ipam/pools")
+                    .header("x-stellaris-secret", "member-only")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"id": "x", "cidr": "10.20.1.0/24"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        let (status, pools) = get_json(&app, "/v1/ipam/pools").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pools["pools"].as_array().unwrap().len(), 1);
+        let (status, _) = get_json(&app, "/v1/ipam/pools").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ipam_rejects_out_of_pool_and_duplicate_static_overlays() {
+        let dir = temp_state_dir();
+        let config = ipam_config(
+            &dir,
+            r#"[[control.ipam.pools]]
+id = "p"
+cidr = "10.20.0.0/24"
+lease_secs = 600"#,
+            "",
+        );
+        let mut state = ControllerState::from_config(&config).unwrap();
+        state.set_signing_key([7u8; 32]);
+        let network = state.network;
+        let app = router(state);
+        assert_eq!(
+            post_enroll(&app, &network, [3u8; 32], false, Some("10.99.0.5"))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_enroll(&app, &network, [4u8; 32], false, Some("10.20.0.5"))
+                .await
+                .0,
+            StatusCode::ACCEPTED
+        );
+        let node = node_for([4u8; 32]);
+        let approve = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/admissions/{node}/approve"))
+                    .header("x-stellaris-secret", "admin-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"prefixes": []}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approve.status(), StatusCode::OK);
+        // Another node cannot claim the same static address.
+        assert_eq!(
+            post_enroll(&app, &network, [5u8; 32], false, Some("10.20.0.5"))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
     }
 }

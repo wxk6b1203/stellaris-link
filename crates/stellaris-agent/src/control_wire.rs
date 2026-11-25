@@ -45,6 +45,10 @@ pub enum Request {
         #[serde(default)]
         overlay_ip: Option<std::net::IpAddr>,
         #[serde(default)]
+        auto: bool,
+        #[serde(default)]
+        pool: Option<String>,
+        #[serde(default)]
         zone: Option<String>,
         #[serde(default)]
         addrs: Vec<std::net::SocketAddr>,

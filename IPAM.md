@@ -1,6 +1,7 @@
 # IPAM 设计规划（控制面地址分配）
 
-> 状态：**设计稿 v1 完成，待实施**（2026-11-25）。本文只做规划，未改实现。
+> 状态：**P1–P5 已实现，并完成 4 台真实主机验证**（2026-11-25）。
+> DHCP 明确不做（§9）。
 > 关联：[MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、
 > [PROTOCOL.md](PROTOCOL.md)、[README.md](README.md)。
 
@@ -311,9 +312,10 @@ ipam = "auto"          # 新增；默认 "static"
 ### 8.4 地址变更
 
 - controller 改保留/池导致的地址变化会体现在新凭据（revision+1）；
-- agent 收到新凭据 → 重配 TUN → 重新发布 LSA（新 overlay_ip）；
+- 当前实现：agent 运行中检测到地址变化只打印警告，**重启后**用新地址创建 TUN
+  （避免热改 TUN/路由导致状态不一致）；
 - 旧地址的路由靠 LSA TTL（`control.lsa_ttl_secs`）自然过期；
-- 对端 anti-spoof 以新凭据 grant 为准，旧地址立刻失效。
+- 对端 anti-spoof 以新凭据 grant 为准。
 
 ---
 
@@ -432,13 +434,14 @@ stellaris_ipam_quarantined                         1
 
 | 阶段 | 内容 | 产出 | 估算 |
 |---|---|---|---|
-| P1 | model + 命令 + 确定性算法 + 单测 | `controller_model` 扩展、池/租约/隔离 | 1.5 天 |
-| P2 | API CRUD + 预注册/审批分配 + controller 校验（CIDR/唯一） | `/v1/ipam/*`、enroll/approve 集成 | 1.5 天 |
-| P3 | agent `ipam=auto` + 缓存凭据地址 + TUN 延迟/重配 | dataplane 重构、状态机 | 2 天 |
-| P4 | metrics/audit、文档、示例 | 运维可见性 | 0.5 天 |
-| P5 | 本地 + 4 主机实测 | TEST-RESULTS | 1 天 |
+| P1 ✅ | model + 命令 + 确定性算法 + 单测 | `controller_model` 扩展、池/租约/隔离 | 1.5 天 |
+| P2 ✅ | API CRUD + 预注册/审批分配 + controller 校验（CIDR/唯一） | `/v1/ipam/*`、enroll/approve 集成 | 1.5 天 |
+| P3 ✅ | agent `ipam=auto` + 缓存凭据地址 + TUN 延迟配置 | dataplane 重构、状态机 | 2 天 |
+| P4 ✅ | 文档、示例、状态字段 | 运维可见性 | 0.5 天 |
+| P5 ✅ | 本地 + 4 主机实测 | TEST-RESULTS | 1 天 |
 
-总计 P1–P5 约 **6.5 天**；可与 static 模式并行（互不依赖）。
+总计 P1–P5 约 **6.5 天**；可与 static 模式并行（互不依赖）。实现中还修复了 auto 节点的 LSA
+使用旧配置地址的问题（此前 LSA overlay 为空，controller 拒绝、peer 无法发现）。
 
 ---
 
@@ -533,7 +536,8 @@ IPAM 的数据模型支持多个池（不同 CIDR），但**数据面目前只�
 ## 17. 待定问题
 
 1. 地址池是否允许 `0.0.0.0/0` 这类超大 v4 池？建议拒绝（> /16）或强制给 range。
-2. 地址变更时是否保持旧地址一段时间双栈并存？建议不保留（凭据 revision 立即生效）。
+2. 地址变更时是否保持旧地址一段时间双栈并存？当前实现：运行中检测到新地址只告警，
+   需要重启 agent 才切换 TUN 地址（避免 TUN/路由状态不一致）。
 3. 预注册无 overlay 的分配顺序：按 node id 排序（确定性），是否要允许配置优先级？
 4. 租约续期频率：跟凭据续签（TTL/3）还是独立心跳？建议跟凭据，减少 Raft 写。
 5. 多网络场景：地址池按 network 隔离，还是允许共享池？建议按 network 隔离。

@@ -1,0 +1,34 @@
+# Controller that owns an overlay address pool.
+# Members with `node.ipam = "auto"` enroll, get approved, and receive an
+# address inside this pool in their signed membership credential.
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "./state/ipam-controller"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+bind = "0.0.0.0:5801"
+secret = "change-me-member-secret"
+admin_secret = "change-me-admin-secret"
+credential_ttl_secs = 3600
+
+[control.ipam]
+[[control.ipam.pools]]
+id = "overlay-v4"
+cidr = "10.7.0.0/16"
+# Only hand out .10-.250; .1 can be reserved for the controller/gateway.
+range = ["10.7.0.10", "10.7.0.250"]
+exclude = ["10.7.0.1/32"]
+lease_secs = 3600
+quarantine_secs = 60
+# Optional AZ affinity: nodes in this zone prefer this pool.
+# zone = "az-a"
+
+# Optional pre-registration. Omitting overlay_ip lets the controller allocate.
+# [[control.members]]
+# node_id = "<node id hex>"
+# prefixes = ["192.168.50.0/24"]
