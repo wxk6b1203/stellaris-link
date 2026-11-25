@@ -417,7 +417,10 @@ fn credential_needs_renewal(state: &AgentState) -> bool {
     let Some(credential) = state.credential() else {
         return true;
     };
-    credential.needs_renewal(crate::credential::now_secs())
+    // The controller revises a member on address/prefix/capability changes;
+    // pick those up immediately instead of waiting for the TTL to run down.
+    state.revision(state.node_id) > credential.credential.revision
+        || credential.needs_renewal(crate::credential::now_secs())
 }
 
 fn install_credential(state: &AgentState, signed: &crate::credential::SignedCredential) -> bool {
@@ -442,16 +445,34 @@ fn install_credential(state: &AgentState, signed: &crate::credential::SignedCred
         Ok(verified) => {
             if state.config.node.ipam == stellaris_types::IpamMode::Auto {
                 match (verified.overlay_ip, state.local_overlay()) {
-                    (Some(ip), None) => {
-                        state.set_local_overlay(ip);
-                        tracing::info!(%ip, "controller allocated overlay address");
-                    }
+                    (Some(ip), None) => match state.reconfigure_overlay(ip) {
+                        Ok(()) => {
+                            tracing::info!(%ip, "controller allocated overlay address");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%ip, %error, "failed to configure overlay address");
+                            return false;
+                        }
+                    },
                     (Some(ip), Some(existing)) if existing != ip => {
-                        tracing::warn!(
-                            %existing,
-                            %ip,
-                            "controller changed the overlay address; restart to apply it"
-                        );
+                        match state.reconfigure_overlay(ip) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    %existing,
+                                    %ip,
+                                    "controller changed the overlay address; TUN reconfigured"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %existing,
+                                    %ip,
+                                    %error,
+                                    "failed to reconfigure the overlay address; keeping the old one"
+                                );
+                                return false;
+                            }
+                        }
                     }
                     (Some(_), Some(_)) => {}
                     (None, _) => tracing::warn!("credential has no overlay address"),
@@ -478,7 +499,24 @@ fn apply_members(
     for member in members {
         if let Ok(node) = member.node_id.parse::<NodeId>() {
             known.insert(node);
+            let previous = state.revision(node);
             state.observe_revision(node, member.revision);
+            if node != state.node_id && member.revision > previous {
+                if let Some(ip) = member.overlay_ip
+                    && state.peers.update_overlay(&node, ip)
+                {
+                    tracing::info!(
+                        peer = %node.short(),
+                        %ip,
+                        "controller changed a member overlay; reconnecting"
+                    );
+                }
+                // Force re-authentication so the peer's new credential (and
+                // its overlay grant) replaces the cached one.
+                if let Some(transport) = transport {
+                    transport.close_peer(node);
+                }
+            }
         }
     }
     let stale: Vec<NodeId> = state
@@ -719,7 +757,13 @@ fn discover_members(
         let Ok(node) = member.node_id.parse::<NodeId>() else {
             continue;
         };
-        if node == state.node_id || state.peers.get(&node).is_some() {
+        if node == state.node_id {
+            continue;
+        }
+        if state.peers.get(&node).is_some() {
+            if let Some(ip) = member.overlay_ip {
+                state.peers.update_overlay(&node, ip);
+            }
             continue;
         }
         let Some(overlay_ip) = member.overlay_ip else {

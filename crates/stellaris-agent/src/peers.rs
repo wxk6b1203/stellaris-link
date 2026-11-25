@@ -107,6 +107,19 @@ impl PeerRegistry {
         }
     }
 
+    /// Update the overlay address of an existing peer; returns true if it
+    /// changed.
+    pub fn update_overlay(&self, node: &NodeId, ip: IpAddr) -> bool {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(peer) = guard.get_mut(node)
+            && peer.overlay_ip != ip
+        {
+            peer.overlay_ip = ip;
+            return true;
+        }
+        false
+    }
+
     pub fn connected_count(&self) -> usize {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         guard.values().filter(|p| p.connected).count()

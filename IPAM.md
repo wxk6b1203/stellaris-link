@@ -38,7 +38,7 @@
 | controller enroll/approve 原样接受上报的 overlay | [controller.rs](crates/stellaris-agent/src/controller.rs) | 不校验 CIDR、不查重；两个节点可抢同一个 IP |
 | 凭据携带 overlay_ip | [credential.rs](crates/stellaris-agent/src/credential.rs) | 已具备"下发地址"的通道，但 agent 不采用（仍用 config） |
 | `network.cidr` 只有一个 | config | 多池/多网段需要扩展 |
-| 没有地址变更路径 | — | 改 IP 只能 revoke + 重新审批 |
+| 地址变更 | `POST /v1/ipam/leases/{node}/reassign` | 进程内重配 TUN；旧地址隔离；见 [IPAM-RECONFIG.md](IPAM-RECONFIG.md) |
 
 结论：**下发通道（凭据）已经存在，缺的是地址池/租约模型与 agent 采用地址。**
 
@@ -309,13 +309,15 @@ ipam = "auto"          # 新增；默认 "static"
 - controller 不可达时保持缓存地址直到凭据过期；过期后数据面继续用旧地址但 peer
   会拒绝其凭据（fail-closed），需要 controller 恢复后续签。
 
-### 8.4 地址变更
+### 8.4 地址变更（已实现）
 
-- controller 改保留/池导致的地址变化会体现在新凭据（revision+1）；
-- 当前实现：agent 运行中检测到地址变化只打印警告，**重启后**用新地址创建 TUN
-  （避免热改 TUN/路由导致状态不一致）；
-- 旧地址的路由靠 LSA TTL（`control.lsa_ttl_secs`）自然过期；
-- 对端 anti-spoof 以新凭据 grant 为准。
+`POST /v1/ipam/leases/{node}/reassign`（admin）可显式指定新 IP，或从池中自动选
+（排除旧地址）。controller 在一个 Raft 命令里释放旧租约（旧地址按 quarantine 隔离）、
+分配新租约、更新 member overlay 并 bump revision；agent 收到新凭据后调用
+`DataplaneHandle::reconfigure` 在进程内 flush/add TUN 地址，LSA 下一次 tick 发布新地址。
+详见 [IPAM-RECONFIG.md](IPAM-RECONFIG.md)。
+
+限制：Linux 的 `ip` 路径；切换瞬间在途 TCP 会断；静态 `overlay_ip` 不参与。
 
 ---
 
@@ -536,8 +538,8 @@ IPAM 的数据模型支持多个池（不同 CIDR），但**数据面目前只�
 ## 17. 待定问题
 
 1. 地址池是否允许 `0.0.0.0/0` 这类超大 v4 池？建议拒绝（> /16）或强制给 range。
-2. 地址变更时是否保持旧地址一段时间双栈并存？当前实现：运行中检测到新地址只告警，
-   需要重启 agent 才切换 TUN 地址（避免 TUN/路由状态不一致）。
+2. 地址变更时是否保持旧地址一段时间双栈并存？当前实现是立即切换（旧地址 quarantine），
+   不做双地址 grace；零中断需要双 grant/双地址，列入后续。
 3. 预注册无 overlay 的分配顺序：按 node id 排序（确定性），是否要允许配置优先级？
 4. 租约续期频率：跟凭据续签（TTL/3）还是独立心跳？建议跟凭据，减少 Raft 写。
 5. 多网络场景：地址池按 network 隔离，还是允许共享池？建议按 network 隔离。

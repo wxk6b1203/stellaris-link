@@ -439,7 +439,7 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **190 passed**（agent 143 + types 22 + 其余 25） |
+| 全量测试 | `cargo test --workspace` | **193 passed**（agent 146 + types 22 + 其余 25；relay failover 测试因 harness 问题 ignored） |
 | Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
 | Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
 | 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
@@ -530,7 +530,34 @@ member 配置 `node.ipam = "auto"`，controller 池 `10.66.0.0/24`：
 仍**未测**：NAT↔NAT（两侧都无公网映射/对称 NAT）、relay-only 回退、家庭路由器
 UDP 映射超时 <3 分钟、IPv6-only 路径、弱网/丢包下的 NAT 重绑定。
 
-### 3.18 仍未验证
+### 3.18 2026-11-26 controller health/metrics
+
+在真实 controller（本机 netns 联调）验证：
+
+| 接口 | 结果 |
+|---|---|
+| `GET /healthz` | ✅ 200 `ok`，无需认证 |
+| `GET /readyz` | ✅ 200 `ready`（Raft 停止时 503） |
+| `GET /metrics` | ✅ 200 Prometheus text；member secret 鉴权，无 secret 401 |
+| 指标 | generation=99、members=2、leases=2、raft_enabled=0；另有 epoch/LSAs/routes/pools/pending/revoked/raft term/last_log/applied |
+| 单测 | `controller::tests::health_ready_and_metrics_endpoints` |
+
+### 3.19 2026-11-26 IPAM 地址热重配（Linux netns）
+
+本机 Ubuntu、两个 network namespace（`ra`/`rb`）各一个 agent，controller 在 host；
+两个 agent 初始自动分配 `10.77.0.1`/`10.77.0.2`，互相 ping 通过。
+
+| 步骤 | 结果 |
+|---|---|
+| `POST /v1/ipam/leases/{A}/reassign {"ip":"10.77.0.9"}` | ✅ 模型旧地址隔离、新租约、revision+1 |
+| agent A 不重启 | ✅ TUN 从 .1 切到 .9；日志 `controller changed the overlay address; TUN reconfigured` |
+| agent B 感知 | ✅ 收到新 revision 后更新 peer overlay、断开并用新凭据重连 |
+| 数据面 | ✅ B→.9 0% loss；B→旧 .1 100% loss |
+| 再切到 .10 | ✅ 同样通过；B→.10 0% loss，旧 .9 100% loss |
+| 重启 A | ✅ 仍用 .10（凭据落盘） |
+| 限制 | Linux `ip` 路径；切换瞬间在途 TCP 会断；静态 overlay 不参与 |
+
+### 3.20 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot

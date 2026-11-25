@@ -5,7 +5,7 @@ use std::collections::BinaryHeap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -16,6 +16,97 @@ use crate::transport::{InboundPacket, IrohTransport};
 use crate::wire::{HEADER_LEN, MeshHeader, PacketInfo, decrement_ttl, flow_hash};
 use crate::{AgentState, wire};
 use stellaris_types::AclDirection;
+
+/// Handle to the live TUN device for in-process address changes.
+#[derive(Clone)]
+pub struct DataplaneHandle {
+    tun_name: String,
+    prefix_len: u8,
+    current: IpAddr,
+}
+
+impl DataplaneHandle {
+    pub fn new(tun_name: String, prefix_len: u8, current: IpAddr) -> Self {
+        Self {
+            tun_name,
+            prefix_len,
+            current,
+        }
+    }
+
+    pub fn current(&self) -> IpAddr {
+        self.current
+    }
+
+    /// Move the TUN interface to `new_ip` in place. Existing sockets keep
+    /// running; in-flight flows see a brief outage.
+    pub fn reconfigure(&mut self, new_ip: IpAddr) -> anyhow::Result<()> {
+        if new_ip == self.current {
+            return Ok(());
+        }
+        if new_ip.is_ipv4() != self.current.is_ipv4() {
+            bail!("changing the address family of a live TUN is not supported");
+        }
+        let old = self.current;
+        if let Err(error) = self.set_address(new_ip) {
+            let _ = self.set_address(old);
+            return Err(error);
+        }
+        self.current = new_ip;
+        Ok(())
+    }
+
+    fn set_address(&self, ip: IpAddr) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let cidr = format!("{ip}/{}", self.prefix_len);
+            let v6 = ip.is_ipv6();
+            let flush: &[&str] = if v6 {
+                &[
+                    "-6",
+                    "addr",
+                    "flush",
+                    "dev",
+                    &self.tun_name,
+                    "scope",
+                    "global",
+                ]
+            } else {
+                &["addr", "flush", "dev", &self.tun_name, "scope", "global"]
+            };
+            run_ip(flush)?;
+            let add: &[&str] = if v6 {
+                &["-6", "addr", "add", &cidr, "dev", &self.tun_name, "nodad"]
+            } else {
+                &["addr", "add", &cidr, "dev", &self.tun_name]
+            };
+            run_ip(add)?;
+            run_ip(&["link", "set", &self.tun_name, "up"])?;
+            flush_route_cache();
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ip;
+            bail!("live overlay reconfiguration is implemented on Linux only")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_ip(args: &[&str]) -> anyhow::Result<()> {
+    let output = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .with_context(|| format!("run ip {args:?}"))?;
+    if !output.status.success() {
+        bail!(
+            "ip {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InboundAction {
@@ -72,6 +163,11 @@ pub async fn start(
         }
     };
     let dev = Arc::new(dev);
+    *state
+        .dataplane_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) =
+        Some(DataplaneHandle::new(tun_name.clone(), prefix_len, local_ip));
     info!(
         tun = %tun_name,
         local = %local_ip,

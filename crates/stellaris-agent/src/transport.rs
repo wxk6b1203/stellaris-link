@@ -619,6 +619,7 @@ bind = "127.0.0.1:0"
     }
 
     #[tokio::test]
+    #[ignore = "iroh-relay Server::shutdown does not sever established sessions; Phase 0 in RELAY-FAILOVER.md"]
     async fn endpoint_fails_over_to_the_second_relay_when_the_active_relay_dies() {
         let (relay1, url1) = start_relay().await;
         let (relay2, url2) = start_relay().await;

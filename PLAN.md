@@ -50,7 +50,9 @@
 - [x] openraft H0 确定性 ControllerModel/Command，作为 controller shadow 接入（`/v1/model` + durable command log）。
 - [x] openraft H1 单节点原型：storage/state machine/single voter；支持 raft-log/raft-state 落盘重启恢复。
 - [x] 2026-11-25 持久化重构：分段追加日志 + 状态快照/WAL（5.1k LSA 16.4s、重启 0.14s）。
-- [ ] relay 快速故障切换/多 relay：[RELAY-FAILOVER.md](RELAY-FAILOVER.md) Phase 0–3；multipath 先 spike。
+- [ ] relay 快速故障切换/多 relay：[RELAY-FAILOVER.md](RELAY-FAILOVER.md) Phase 0–3；multipath spike 已完成，Phase 2 选 C。
+- [x] controller `/metrics`/`/healthz`/`/readyz`（2026-11-26）。
+- [x] IPAM 地址热重配（`POST /v1/ipam/leases/{node}/reassign`，Linux netns 验证；[IPAM-RECONFIG.md](IPAM-RECONFIG.md)）。
 - [x] openraft H2 3 节点：进程内 leader 复制/failover + HTTP Raft RPC（共享 secret/snapshot）+ 落盘重启恢复。
 - [x] controller API Raft 写路径（`control.raft_dir`，LSA/join/revoke/ack + snapshot/model）。
 - [x] Raft snapshot 线性化读（`ensure_linearizable(ReadIndex)`）

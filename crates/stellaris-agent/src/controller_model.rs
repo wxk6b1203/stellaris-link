@@ -133,6 +133,19 @@ pub enum ControllerCommand {
         node: NodeId,
         now: u64,
     },
+    /// Move a member to a new overlay address without restarting its agent.
+    /// `ip = None` allocates the next free address (excluding the old one).
+    ReassignAddress {
+        node: NodeId,
+        #[serde(default)]
+        ip: Option<IpAddr>,
+        #[serde(default)]
+        pool: Option<String>,
+        #[serde(default)]
+        zone: Option<String>,
+        #[serde(default)]
+        now: u64,
+    },
     RenewLease {
         node: NodeId,
         now: u64,
@@ -439,6 +452,44 @@ impl ControllerModel {
                 self.release_lease(node, now);
                 had
             }
+            ControllerCommand::ReassignAddress {
+                node,
+                ip,
+                pool,
+                zone,
+                now,
+            } => {
+                let Some(member) = self.members.get(&node).cloned() else {
+                    return false;
+                };
+                let old = member.overlay_ip;
+                let (target, pool_id) = match ip {
+                    Some(ip) => match self.validate_reassign(node, ip, pool.as_deref(), now) {
+                        Ok(pool) => (ip, pool),
+                        Err(_) => return false,
+                    },
+                    None => match self.allocate_for_reassign(
+                        node,
+                        pool.as_deref(),
+                        zone.as_deref(),
+                        now,
+                        old,
+                    ) {
+                        Ok(allocation) => allocation,
+                        Err(_) => return false,
+                    },
+                };
+                if old == Some(target) {
+                    return false;
+                }
+                self.release_lease(node, now);
+                self.assign_lease(node, target, &pool_id, now, false);
+                if let Some(member) = self.members.get_mut(&node) {
+                    member.overlay_ip = Some(target);
+                }
+                self.bump_revision(node);
+                true
+            }
             ControllerCommand::RenewLease { node, now } => {
                 let Some(ip) = self.node_leases.get(&node).copied() else {
                     return false;
@@ -630,7 +681,7 @@ impl ControllerModel {
             affinity(a).cmp(&affinity(b)).then_with(|| a.id.cmp(&b.id))
         });
         for pool in pools {
-            if let Some(ip) = self.find_free(pool, node, now) {
+            if let Some(ip) = self.find_free(pool, node, now, None) {
                 let expires_at = if now == 0 {
                     0
                 } else {
@@ -642,8 +693,86 @@ impl ControllerModel {
         Err("no free address in configured IPAM pools".into())
     }
 
-    fn find_free(&self, pool: &AddressPool, node: NodeId, now: u64) -> Option<IpAddr> {
+    /// Validate an explicit reassignment target.
+    pub fn validate_reassign(
+        &self,
+        node: NodeId,
+        ip: IpAddr,
+        pool_hint: Option<&str>,
+        now: u64,
+    ) -> Result<String, String> {
+        let Some(pool) = self.pool_of(ip) else {
+            return Err("address is outside every configured pool".into());
+        };
+        if pool_hint.is_some_and(|hint| hint != pool.id) {
+            return Err("address is not in the requested pool".into());
+        }
+        if !pool.cidr.contains(&ip) {
+            return Err("address is outside the pool CIDR".into());
+        }
+        if let Some((start, end)) = pool.range {
+            let inside = match (start, end, ip) {
+                (IpAddr::V4(start), IpAddr::V4(end), IpAddr::V4(ip)) => {
+                    u32::from(start) <= u32::from(ip) && u32::from(ip) <= u32::from(end)
+                }
+                (IpAddr::V6(start), IpAddr::V6(end), IpAddr::V6(ip)) => {
+                    u128::from(start) <= u128::from(ip) && u128::from(ip) <= u128::from(end)
+                }
+                _ => false,
+            };
+            if !inside {
+                return Err("address is outside the pool range".into());
+            }
+        }
+        if pool.exclude.iter().any(|exclude| exclude.contains(&ip)) {
+            return Err("address is excluded".into());
+        }
+        if self.overlay_taken(ip, node) {
+            return Err("address is already in use".into());
+        }
+        if self.quarantine.get(&ip).is_some_and(|until| *until > now) {
+            return Err("address is quarantined".into());
+        }
+        Ok(pool.id.clone())
+    }
+
+    /// Allocate a reassignment target, excluding the member's current address.
+    pub fn allocate_for_reassign(
+        &self,
+        node: NodeId,
+        pool_hint: Option<&str>,
+        zone: Option<&str>,
+        now: u64,
+        exclude: Option<IpAddr>,
+    ) -> Result<(IpAddr, String), String> {
+        let mut pools: Vec<&AddressPool> = self
+            .pools
+            .values()
+            .filter(|pool| pool_hint.is_none_or(|hint| hint == pool.id))
+            .collect();
+        pools.sort_by(|a, b| {
+            let affinity = |pool: &AddressPool| (pool.zone.as_deref() != zone) as u8;
+            affinity(a).cmp(&affinity(b)).then_with(|| a.id.cmp(&b.id))
+        });
+        for pool in pools {
+            if let Some(ip) = self.find_free(pool, node, now, exclude) {
+                return Ok((ip, pool.id.clone()));
+            }
+        }
+        Err("no free address for reassignment".into())
+    }
+
+    fn find_free(
+        &self,
+        pool: &AddressPool,
+        node: NodeId,
+        now: u64,
+        exclude: Option<IpAddr>,
+    ) -> Option<IpAddr> {
         let free = |ip: IpAddr| -> bool {
+            if exclude == Some(ip) {
+                return false;
+            }
             if pool.exclude.iter().any(|exclude| exclude.contains(&ip)) {
                 return false;
             }
@@ -1230,5 +1359,67 @@ mod tests {
         }));
         assert!(model.pools.is_empty());
         assert!(model.leases.is_empty());
+    }
+
+    #[test]
+    fn reassign_address_moves_lease_and_quarantines_old() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::CreatePool {
+            pool: test_pool("p", "10.11.0.0/24", 60, 30),
+        });
+        let node = NodeId::new([7u8; 32]);
+        assert_eq!(
+            approve_auto(&mut model, node, 100),
+            Some("10.11.0.1".parse().unwrap())
+        );
+        assert!(model.apply(ControllerCommand::ReassignAddress {
+            node,
+            ip: Some("10.11.0.5".parse().unwrap()),
+            pool: None,
+            zone: None,
+            now: 110,
+        }));
+        assert_eq!(
+            model
+                .members
+                .get(&node)
+                .and_then(|member| member.overlay_ip),
+            Some("10.11.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            model.node_leases.get(&node),
+            Some(&"10.11.0.5".parse().unwrap())
+        );
+        assert!(!model.leases.contains_key(&"10.11.0.1".parse().unwrap()));
+        assert!(
+            model
+                .quarantine
+                .get(&"10.11.0.1".parse().unwrap())
+                .is_some_and(|until| *until == 140)
+        );
+        assert_eq!(model.member_revisions.get(&node), Some(&2));
+        // Auto reassignment picks a new address, never the old one or a
+        // quarantined address.
+        assert!(model.apply(ControllerCommand::ReassignAddress {
+            node,
+            ip: None,
+            pool: Some("p".into()),
+            zone: None,
+            now: 120,
+        }));
+        assert_eq!(
+            model
+                .members
+                .get(&node)
+                .and_then(|member| member.overlay_ip),
+            Some("10.11.0.2".parse().unwrap())
+        );
+        assert!(!model.apply(ControllerCommand::ReassignAddress {
+            node,
+            ip: Some("10.99.0.1".parse().unwrap()),
+            pool: None,
+            zone: None,
+            now: 120,
+        }));
     }
 }

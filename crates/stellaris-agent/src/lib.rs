@@ -50,6 +50,8 @@ pub struct AgentState {
     pub revisions: Arc<RwLock<HashMap<NodeId, u64>>>,
     /// Effective local overlay address (config or controller-allocated).
     pub local_overlay: Arc<RwLock<Option<std::net::IpAddr>>>,
+    /// Live TUN handle, set once the dataplane has created the device.
+    pub dataplane_handle: Arc<std::sync::Mutex<Option<crate::dataplane::DataplaneHandle>>>,
     pub policy: Arc<RwLock<policy::Policy>>,
     pub stats: Arc<stats::Stats>,
     pub reassembly: Arc<std::sync::Mutex<reassembly::Reassembler>>,
@@ -197,6 +199,7 @@ impl AgentState {
             credential: Arc::new(RwLock::new(credential)),
             revisions: Arc::new(RwLock::new(HashMap::new())),
             local_overlay: Arc::new(RwLock::new(local_overlay)),
+            dataplane_handle: Arc::new(std::sync::Mutex::new(None)),
             policy,
             stats: Arc::new(stats::Stats::default()),
             reassembly: Arc::new(std::sync::Mutex::new(reassembly::Reassembler::default())),
@@ -218,6 +221,22 @@ impl AgentState {
             .local_overlay
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(ip);
+    }
+
+    /// Apply a controller-issued overlay change in place when the dataplane is
+    /// already running; otherwise just update the state used to create the TUN.
+    pub fn reconfigure_overlay(&self, ip: std::net::IpAddr) -> anyhow::Result<()> {
+        {
+            let mut handle = self
+                .dataplane_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(handle) = handle.as_mut() {
+                handle.reconfigure(ip)?;
+            }
+        }
+        self.set_local_overlay(ip);
+        Ok(())
     }
 
     pub fn credential_path(&self) -> PathBuf {

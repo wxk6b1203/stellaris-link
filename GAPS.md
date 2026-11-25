@@ -225,7 +225,7 @@ PMTUD：
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
 - IPAM 已实现并通过 4 主机验证（地址池/租约/自动分配/撤销隔离）；DHCP 明确不做。见 [IPAM.md](IPAM.md)。
-- IPAM 地址热变更需重启 agent 才能切换 TUN 地址。
+- IPAM 地址热切换已实现（Linux；`POST /v1/ipam/leases/{node}/reassign`），旧地址隔离、在途 TCP 会断；见 [IPAM-RECONFIG.md](IPAM-RECONFIG.md)。
 - 非 Raft legacy controller 仍保留。
 - agent 客户端重启后的 snapshot 续传未验证（controller 侧 + 整集群滚动后的续传已在 TEST-RESULTS §3.10 验证）。
 - 动态 Raft membership 已实现（`/v1/raft/learner|membership`）；WAN 丢包/大 snapshot 已测单次，未做 soak。

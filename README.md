@@ -602,6 +602,7 @@ examples/               # 示例 TOML
 | [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
 | [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) | 入网、成员凭据、静态模式、撤销与授权（实现说明） |
 | [IPAM.md](IPAM.md) | 控制面 IPAM/地址池/租约的设计规划（明确不含 DHCP） |
+| [IPAM-RECONFIG.md](IPAM-RECONFIG.md) | IPAM 地址热重配的设计与限制 |
 | [RELAY-FAILOVER.md](RELAY-FAILOVER.md) | relay 故障切换/多 relay 的规划与 TODO（未实施） |
 | [MULTI-NETWORK.md](MULTI-NETWORK.md) | 多网络隔离与单进程多网络设计 |
 | [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md) | 真实局域网 mDNS 验证记录 |
@@ -723,6 +724,7 @@ POST       /v1/ipam/leases/{node}/renew|release
 POST       /v1/ipam/reservations
 DELETE     /v1/ipam/reservations/{node}
 POST       /v1/ipam/allocate           {node, pool?, zone?}
+POST       /v1/ipam/leases/{node}/reassign   {ip?, pool?, zone?}
 ```
 
 行为：最低空闲分配（IPv6 用 hash probe）、池内排除/保留/隔离、租约到期由 leader
@@ -760,8 +762,9 @@ curl -H "x-stellaris-secret: $SECRET" http://controller:5801/metrics
   relay-only 回退和弱网重绑定仍未验证。公网 peer 无法反向拨入 NAT 内网地址，连接
   由 NAT 侧发起。
 - **static 模式不支持动态成员**：discovery/LSA 不能引入不在 `[[peers]]` 里的节点；增删成员要改每台配置。多节点/需要撤销与自动地址时用 controller。
-- **IPAM 地址热变更不支持**：运行中 controller 改了某成员地址时 agent 只告警，需要重启
-  该 agent 才会切换 TUN 地址（首次自动分配和重启复用已支持）。
+- **IPAM 地址热切换**：`POST /v1/ipam/leases/{node}/reassign` 可在不重启 agent 的情况下
+  切换 TUN 地址（Linux，旧地址隔离、切换瞬间在途 TCP 会断）；静态 `overlay_ip` 不参与。
+  详见 [IPAM-RECONFIG.md](IPAM-RECONFIG.md)。
 - relay 建连、direct→relay 切换已测；relay 故障后会在旧连接关闭时经 `transport.relay_urls` 列表重连（实测约 60s，非秒级切换；多 relay 同时承载未实现）。生产建议自建 relay 并监控（见 AUDIT.md）。
 - 2026-11-24 完成静态审计（[AUDIT.md](AUDIT.md)）并修复 P0：LSA 签名、transit 强制、OS 路由防护、iroh 走 Raft、Raft RPC 必须配 `raft_secret` 且有超时、admin secret、routes/LSA TTL/epoch 入 Raft、动态 membership。2026-11-25 进一步把入网收敛为 controller 签名的成员凭据。仍没有第三方安全审计，MVP 仅用于开发/实验。
 - 2026-11-25 配置变更（不兼容）：删除 `network.auth.secret`、`network.auth.allowed_nodes`、`control.join_token(s)`、`control.require_join_signature`、`control.admission`、`control.request_admission`；新增 `control.credential_ttl_secs`。`network.auth.mode` 只剩 `none`（仅实验）和 `controller`，配 `controller` 时必须给 `control.controller_keys` 以及 `control.endpoint_id` 或 `control.url`。`POST /v1/join` 由 `POST /v1/enroll` 取代，`GET /v1/status` 不再有 `join_config_hash`。

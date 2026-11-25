@@ -4,7 +4,7 @@
 //! + `control.addrs` to use iroh instead. HA/openraft is still future work.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -545,6 +545,25 @@ impl ControllerState {
         }
     }
 
+    fn insert_grant(&self, node: NodeId, member: MemberRecord) {
+        self.grants
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                node,
+                ControllerMemberConfig {
+                    node_id: node.to_string(),
+                    overlay_ip: member.overlay_ip,
+                    prefixes: member
+                        .prefixes
+                        .iter()
+                        .filter_map(|prefix| prefix.parse().ok())
+                        .collect(),
+                    capabilities: member.capabilities.clone(),
+                },
+            );
+    }
+
     /// Keep the legacy in-memory `grants` map in sync with membership commands
     /// applied without Raft (HTTP-only controller / tests).
     fn mirror_member_command(&self, command: &ControllerCommand) {
@@ -552,23 +571,21 @@ impl ControllerState {
         match command {
             ControllerCommand::ApproveAdmission { node, member, .. }
             | ControllerCommand::UpsertMember { node, member } => {
-                self.grants
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        *node,
-                        ControllerMemberConfig {
-                            node_id: node.to_string(),
-                            overlay_ip: member.overlay_ip,
-                            prefixes: member
-                                .prefixes
-                                .iter()
-                                .filter_map(|prefix| prefix.parse().ok())
-                                .collect(),
-                            capabilities: member.capabilities.clone(),
-                        },
-                    );
+                self.insert_grant(*node, member.clone());
                 changed = true;
+            }
+            ControllerCommand::ReassignAddress { node, .. } => {
+                let member = self
+                    .model
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .members
+                    .get(node)
+                    .cloned();
+                if let Some(member) = member {
+                    self.insert_grant(*node, member);
+                    changed = true;
+                }
             }
             ControllerCommand::RevokeMember { node, .. }
             | ControllerCommand::DenyAdmission { node, .. } => {
@@ -1024,6 +1041,12 @@ impl ControllerState {
     fn members(&self) -> Vec<MemberView> {
         let db = self.link_state.read().unwrap_or_else(|e| e.into_inner());
         let grants = self.grants.read().unwrap_or_else(|e| e.into_inner());
+        let revisions: std::collections::BTreeMap<NodeId, u64> = self
+            .model
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .member_revisions
+            .clone();
         let mut out: Vec<MemberView> = db
             .all()
             .map(|lsa| {
@@ -1031,7 +1054,7 @@ impl ControllerState {
                 MemberView {
                     node_id: lsa.origin.to_string(),
                     zone: lsa.zone.clone(),
-                    overlay_ip: lsa.overlay_ip,
+                    overlay_ip: grant.and_then(|grant| grant.overlay_ip).or(lsa.overlay_ip),
                     addrs: lsa.addrs.clone(),
                     prefixes: lsa.prefixes.iter().map(|p| p.prefix.to_string()).collect(),
                     allowed_prefixes: grant
@@ -1042,7 +1065,7 @@ impl ControllerState {
                     capabilities: grant.map(|g| g.capabilities.clone()).unwrap_or_default(),
                     links: lsa.links.iter().map(|l| l.to.to_string()).collect(),
                     last_seq: lsa.seq,
-                    revision: 1,
+                    revision: revisions.get(&lsa.origin).copied().unwrap_or(1),
                 }
             })
             .collect();
@@ -1061,7 +1084,7 @@ impl ControllerState {
                 capabilities: grant.capabilities.clone(),
                 links: Vec::new(),
                 last_seq: 0,
-                revision: 1,
+                revision: revisions.get(node).copied().unwrap_or(1),
             });
         }
         out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -1541,6 +1564,7 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/ipam/leases", get(list_leases))
         .route("/v1/ipam/leases/{node}/renew", post(renew_lease))
         .route("/v1/ipam/leases/{node}/release", post(release_lease))
+        .route("/v1/ipam/leases/{node}/reassign", post(reassign_address))
         .route("/v1/ipam/reservations", post(reserve_address))
         .route("/v1/ipam/reservations/{node}", delete(remove_reservation))
         .route("/v1/ipam/allocate", post(allocate_address))
@@ -1849,6 +1873,87 @@ struct AllocateRequest {
     pool: Option<String>,
     #[serde(default)]
     zone: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReassignRequest {
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+}
+
+async fn reassign_address(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+    Json(req): Json<ReassignRequest>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match node.parse() {
+        Ok(node) => node,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
+    };
+    let ip = match req.ip.as_deref() {
+        Some(ip) => match ip.parse::<IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid ip: {e}")).into_response(),
+        },
+        None => None,
+    };
+    let model = state.model_current().await;
+    let Some(member) = model.members.get(&node) else {
+        return (StatusCode::NOT_FOUND, "member not found").into_response();
+    };
+    let old = member.overlay_ip;
+    let now = crate::credential::now_secs();
+    let (target, pool_id) = match ip {
+        Some(ip) => match model.validate_reassign(node, ip, req.pool.as_deref(), now) {
+            Ok(pool) => (ip, pool),
+            Err(error) => return (StatusCode::CONFLICT, error).into_response(),
+        },
+        None => match model.allocate_for_reassign(
+            node,
+            req.pool.as_deref(),
+            req.zone.as_deref(),
+            now,
+            old,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => return (StatusCode::CONFLICT, error).into_response(),
+        },
+    };
+    if let Err((code, message)) = state
+        .commit_command(ControllerCommand::ReassignAddress {
+            node,
+            ip: Some(target),
+            pool: Some(pool_id),
+            zone: req.zone,
+            now,
+        })
+        .await
+    {
+        return controller_error(&state, code, message).await;
+    }
+    let updated = state.model_current().await;
+    let new = updated
+        .members
+        .get(&node)
+        .and_then(|member| member.overlay_ip);
+    if new != Some(target) {
+        return (StatusCode::CONFLICT, "reassignment was not applied").into_response();
+    }
+    Json(json!({
+        "node": node.to_string(),
+        "old": old.map(|ip| ip.to_string()),
+        "new": new.map(|ip| ip.to_string()),
+        "revision": updated.member_revisions.get(&node).copied().unwrap_or(0),
+    }))
+    .into_response()
 }
 
 async fn allocate_address(
@@ -4712,5 +4817,98 @@ lease_secs = 600"#,
         ] {
             assert!(text.contains(needle), "missing {needle}:\n{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn ipam_reassign_moves_the_member_and_rejects_out_of_pool() {
+        let dir = temp_state_dir();
+        let config = ipam_config(
+            &dir,
+            r#"[[control.ipam.pools]]
+id = "p"
+cidr = "10.20.0.0/24"
+lease_secs = 600
+quarantine_secs = 30"#,
+            r#"[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101""#,
+        );
+        let state = ControllerState::from_config(&config).unwrap();
+        let node = NodeId::new([1u8; 32]);
+        let app = router(state);
+        let body = json!({"ip": "10.20.0.9"}).to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/ipam/leases/{node}/reassign"))
+                    .header("x-stellaris-secret", "admin-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&raw)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(body["old"], "10.20.0.1");
+        assert_eq!(body["new"], "10.20.0.9");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/model")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let model = json(response).await;
+        assert_eq!(
+            model["members"][node.to_string()]["overlay_ip"],
+            "10.20.0.9"
+        );
+        // Out-of-pool targets are rejected and leave the member unchanged.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/ipam/leases/{node}/reassign"))
+                    .header("x-stellaris-secret", "admin-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"ip": "10.99.0.1"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/model")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let model = json(response).await;
+        assert_eq!(
+            model["members"][node.to_string()]["overlay_ip"],
+            "10.20.0.9"
+        );
     }
 }
