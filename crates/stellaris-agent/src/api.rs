@@ -182,6 +182,22 @@ async fn status(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     authorize_read(&state, &headers)?;
+    let credential = state.credential().map(|signed| {
+        json!({
+            "issuer": signed.issuer.to_string(),
+            "revision": signed.credential.revision,
+            "issued_at": signed.credential.issued_at,
+            "not_after": signed.credential.not_after,
+            "overlay_ip": signed.credential.overlay_ip.map(|ip| ip.to_string()),
+            "prefixes": signed.credential.prefixes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "capabilities": signed.credential.capabilities,
+        })
+    });
+    let control_mode = if state.config.network.auth.mode == stellaris_types::AuthMode::Controller {
+        "controller"
+    } else {
+        "none"
+    };
     Ok(Json(json!({
         "node_id": state.node_id.to_string(),
         "node_name": state.config.node.name,
@@ -194,7 +210,8 @@ async fn status(
         "network_name": state.config.network.name,
         "cidr": state.config.network.cidr.to_string(),
         "role": "member",
-        "control_mode": "none",
+        "control_mode": control_mode,
+        "credential": credential,
         "rib_mode": state.config.routing.rib_mode,
         "generation": state.routes.generation(),
         "uptime_secs": state.started_at.elapsed().as_secs(),
@@ -272,6 +289,20 @@ stellaris_reassembly_entries {}\n",
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len(),
+    );
+    let revision = state
+        .credential()
+        .map(|signed| signed.credential.revision)
+        .unwrap_or(0);
+    let expires_at = state
+        .credential()
+        .map(|signed| signed.credential.not_after)
+        .unwrap_or(0);
+    let body = format!(
+        "{body}# TYPE stellaris_credential_revision gauge\n\
+stellaris_credential_revision {revision}\n\
+# TYPE stellaris_credential_expires_at_seconds gauge\n\
+stellaris_credential_expires_at_seconds {expires_at}\n"
     );
     Ok((
         [(

@@ -19,7 +19,8 @@ use stellaris_types::{NetworkId, NodeId};
 
 use crate::credential::{CredentialError, SignedCredential, VerifiedCredential};
 
-const MAX_FRAME: usize = 4096;
+/// Credentials carry prefix lists, so allow room for a large member.
+const MAX_FRAME: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct Grant {
@@ -44,6 +45,11 @@ impl Grant {
 pub fn inbound_source_allowed(state: &crate::AgentState, peer: NodeId, src: IpAddr) -> bool {
     let grants = state.grants.read().unwrap_or_else(|e| e.into_inner());
     if grants.is_empty() {
+        // In controller mode no authenticated peer has been seen yet, so
+        // fail closed instead of falling back to static peers.
+        if state.config.network.auth.mode == stellaris_types::AuthMode::Controller {
+            return false;
+        }
         return state.peers.get(&peer).is_some_and(|p| {
             src == p.overlay_ip || p.advertised.iter().any(|prefix| prefix.contains(&src))
         });
@@ -91,8 +97,12 @@ pub fn lsa_authorized(state: &crate::AgentState, lsa: &stellaris_linkstate::Lsa)
         }
         return true;
     }
-    // No membership state yet: static peers grant their configured prefixes;
-    // unknown/dynamic peers may only advertise their own overlay /32.
+    // No membership state yet: controller mode fails closed; otherwise static
+    // peers grant their configured prefixes and unknown/dynamic peers may only
+    // advertise their own overlay /32.
+    if state.config.network.auth.mode == stellaris_types::AuthMode::Controller {
+        return false;
+    }
     let Some(peer) = state.peers.get(&lsa.origin) else {
         return lsa.prefixes.iter().all(|p| {
             lsa.overlay_ip
@@ -376,6 +386,61 @@ overlay_ip = "10.7.0.2"
             &state,
             b,
             "10.7.0.1".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn controller_mode_without_grants_fails_closed() {
+        use stellaris_linkstate::{Lsa, Prefix};
+        use stellaris_types::Config;
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-failclosed-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+url = "http://127.0.0.1:1"
+controller_keys = ["0202020202020202020202020202020202020202020202020202020202020202"]
+
+[[peers]]
+name = "b"
+endpoint_id = "{}"
+overlay_ip = "10.7.0.2"
+"#,
+            dir.display(),
+            hex::encode([2u8; 32])
+        );
+        let state = crate::AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        let b = NodeId::new([2u8; 32]);
+        let lsa = Lsa {
+            origin: b,
+            seq: 1,
+            zone: None,
+            links: Vec::new(),
+            prefixes: vec![Prefix {
+                prefix: "10.7.0.2/32".parse().unwrap(),
+                metric: 0,
+            }],
+            overlay_ip: Some("10.7.0.2".parse().unwrap()),
+            addrs: Vec::new(),
+        };
+        assert!(!lsa_authorized(&state, &lsa));
+        assert!(!inbound_source_allowed(
+            &state,
+            b,
+            "10.7.0.2".parse().unwrap()
         ));
     }
 }

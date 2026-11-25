@@ -646,7 +646,6 @@ mode = "controller"
 url = "http://controller:5801"              # 或 endpoint_id = "<controller-endpoint>"
 secret = "member-secret"
 controller_keys = ["<controller-node-id>"]  # 必填：所有 controller 的签名 key
-credential_ttl_secs = 3600
 ```
 
 未预注册的节点会自动发签名 enroll，进入 Raft 复制的待审队列：

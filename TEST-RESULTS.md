@@ -439,7 +439,12 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **172 passed**（agent 128 + types 19 + 其余 25） |
+| 全量测试 | `cargo test --workspace` | **173 passed**（agent 129 + types 19 + 其余 25） |
+| Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
+| Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
+| 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
+| 凭据 demo | `scripts/demo-credential-enroll.sh`（本机） | ✅ 预注册节点直接取证、未知节点审批后取证、双方 iroh 握手 |
+| 跨网络凭据拒绝 | `scripts/demo-multi-network-isolation.sh`（本机） | ✅ 不同 network 的凭据在握手时报 `credential network mismatch` |
 | 静态检查 | `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` | ✅ |
 
 ### 3.14 仍未验证

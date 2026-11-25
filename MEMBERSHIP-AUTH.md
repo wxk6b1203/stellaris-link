@@ -157,7 +157,6 @@ mode = "controller"             # 唯一的生产模式
 endpoint_id = "<controller endpoint>"   # 或 url = "https://controller:5801"
 secret = "member-secret"
 controller_keys = ["<controller node id>"]
-credential_ttl_secs = 3600
 ```
 
 `mode = "none"` 仅用于隔离实验：没有任何成员认证，discovery 需要
