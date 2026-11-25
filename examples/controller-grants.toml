@@ -36,8 +36,9 @@ overlay_ip = "10.7.0.2"
 prefixes = []
 capabilities = ["member"]
 
-# One-time join token (HTTP /v1/join). Consumed on first successful join.
-[[control.join_tokens]]
-token = "change-me-one-time"
-prefixes = ["192.168.60.0/24"]
-capabilities = ["member", "gateway"]
+# Nodes not listed above enroll through POST /v1/enroll (signed by the node
+# key) and wait in the Raft admission queue until an administrator approves:
+#   curl -H "x-stellaris-secret: <admin secret>" http://controller:5801/v1/admissions
+#   curl -X POST .../v1/admissions/<node>/approve -d '{"prefixes":[],"capabilities":["member"]}'
+# Grant changes after enrollment use POST /v1/members/<node>/grants.
+credential_ttl_secs = 3600
