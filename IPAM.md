@@ -21,9 +21,7 @@
 
 ### 非目标（本阶段）
 
-- 不做 overlay 成员之间的 DHCP 报文协议。成员地址由控制面下发，比 DHCP 更简单、
-  可认证、可审计。
-- 不做给"节点身后 LAN 主机"分配地址的 DHCP 服务器（见 §9，Phase 3）。
+- **不考虑 DHCP**（overlay 成员与 LAN 主机都不做，理由见 §9）。
 - 不做 NAT / 公网地址池 / 端口映射。
 - 不做跨网络地址共享（地址池属于单个 network）。
 
@@ -315,32 +313,22 @@ ipam = "auto"          # 新增；默认 "static"
 
 ---
 
-## 9. DHCP 边界
+## 9. 为什么不实现 DHCP（明确排除）
 
-### Phase 1/2（本文）：overlay 成员地址
+overlay 成员的地址由 controller 分配并随凭据下发，DHCP 在这个模型里没有位置：
 
-成员地址由 controller 分配并随凭据下发。**不实现 DHCP 报文**：
+- 成员是 L3 overlay 端点，没有链路层广播域；DHCP 的发现/租约协商没有对象。
+- DHCP 本身不认证；凭据是签名能力。引入 DHCP 会多出一个未认证的地址权威源，
+  与"只有 controller 能分配地址"冲突。
+- 地址必须进 Raft、可审计、与 node key 绑定，DHCP 报文不适合做权威源。
+- 续租、过期、撤销已经由 lease + 凭据 revision 覆盖，不需要 DHCP lease 语义。
 
-- 成员是 L3 overlay 端点，没有"链路层广播域"；
-- DHCP 无认证，而凭据是签名能力；
-- 分配结果需要进 Raft、可审计——DHCP 报文不适合做权威源。
+因此本项目**不实现 DHCPv4/DHCPv6 服务器或客户端**，也不会提供"给节点身后 LAN
+主机分配地址"的 DHCP 功能。若某个部署确实需要为下游主机发地址，请在该节点上
+独立运行 dnsmasq/Kea 等 DHCP 服务，与 Stellaris overlay IPAM 无关。
 
-### Phase 3：给节点身后 LAN 主机分配地址（独立功能）
-
-适用场景：节点作为 subnet gateway，需要给挂在其下 LAN 的主机发地址。
-
-设计要点：
-
-- 每个节点可声明 `dhcp.enabled` + 绑定接口 + 关联池（池可以复用 IPAM 的 pool 模型）；
-- 节点本地运行 DHCPv4 服务器（UDP/67），地址从 controller 的池租用；
-- 支持 DHCP relay（跨网段）或本地池；
-- 选项：router（节点自身）、DNS、lease time；
-- IPv6 优先用 SLAAC + RA，DHCPv6 只在需要 DNS/前缀委派时启用；
-- 冲突检测：ICMP/ARP 探测后再分配；
-- 实现选择：优先**集成 dnsmasq/Kea**（通过模板 + 租约文件），而不是自己实现 DHCP 协议；
-- 与 overlay IPAM 共用 pool/lease 模型，但 lease 的 `client` 是 MAC/DUID 而不是 NodeId。
-
-工作量：Phase 3 约 3–5 天（含 netns 测试）。
+> 如果"DHCP"指的是"由控制面动态下发 overlay 地址"，那就是本文的 IPAM；
+> 它已经覆盖这个需求，不需要 DHCP 协议。
 
 ---
 
@@ -444,7 +432,6 @@ stellaris_ipam_quarantined                         1
 | P3 | agent `ipam=auto` + 缓存凭据地址 + TUN 延迟/重配 | dataplane 重构、状态机 | 2 天 |
 | P4 | metrics/audit、文档、示例 | 运维可见性 | 0.5 天 |
 | P5 | 本地 + 4 主机实测 | TEST-RESULTS | 1 天 |
-| P6 | LAN DHCP（可选，独立） | Phase 3 设计 | 3–5 天 |
 
 总计 P1–P5 约 **6.5 天**；可与 static 模式并行（互不依赖）。
 

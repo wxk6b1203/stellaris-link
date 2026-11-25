@@ -600,7 +600,7 @@ examples/               # 示例 TOML
 | [ADVANCED-ROUTING.md](ADVANCED-ROUTING.md) | 静态路由、AZ 分段、subnet gateway 设计 |
 | [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
 | [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) | 入网、成员凭据、静态模式、撤销与授权（实现说明） |
-| [IPAM.md](IPAM.md) | 控制面 IPAM/地址池/租约/DHCP 边界的设计规划 |
+| [IPAM.md](IPAM.md) | 控制面 IPAM/地址池/租约的设计规划（明确不含 DHCP） |
 | [MULTI-NETWORK.md](MULTI-NETWORK.md) | 多网络隔离与单进程多网络设计 |
 | [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md) | 真实局域网 mDNS 验证记录 |
 | [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 设计与实现记录 |
