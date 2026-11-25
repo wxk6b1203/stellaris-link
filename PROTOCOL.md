@@ -126,7 +126,9 @@ signature = Ed25519(node_key, SHA256(transcript))
 - `HelloAck.signature` 用 controller key 签同一 transcript + nonce_echo，agent 校验。
 - 失败：返回 `Error{code=UNAUTHENTICATED|EPOCH_MISMATCH|NOT_MEMBER}`，关闭连接。
 
-> **当前实现（2026-11-25）**：上面的 Hello 仍是设计目标。实际握手是在 iroh 连接上的一条
+> **当前实现（2026-11-25）**：`network.auth.mode = "static"` 时不做额外握手，只检查
+> `conn.remote_id()` 在 `[[peers]]` 白名单里（iroh 已完成 key 认证）。
+> `mode = "controller"` 时，实际握手是在 iroh 连接上的一条
 > bi-stream 里各发一帧 JSON `SignedCredential`（见 §10.1），由对端验证
 > `network`、`node == conn.remote_id()`、`issuer ∈ controller_keys`、Ed25519 签名、
 > `not_after`、`revision`。没有共享秘密，没有 nonce。

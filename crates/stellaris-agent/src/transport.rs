@@ -1,6 +1,6 @@
 //! iroh transport: one endpoint, static peers, unreliable datagrams.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -40,6 +40,8 @@ pub struct IrohTransport {
     config: Arc<Config>,
     state: crate::AgentState,
     controller_keys: Vec<NodeId>,
+    /// Endpoint ids allowed to connect in `AuthMode::Static`.
+    static_keys: HashSet<NodeId>,
     network: NetworkId,
     peers: PeerRegistry,
     inbound_tx: mpsc::Sender<InboundPacket>,
@@ -108,11 +110,17 @@ impl IrohTransport {
             .iter()
             .filter_map(|key| key.parse().ok())
             .collect();
+        let static_keys: HashSet<NodeId> = config
+            .peers
+            .iter()
+            .filter_map(|peer| peer.endpoint_id.parse().ok())
+            .collect();
         let transport = Arc::new(Self {
             endpoint: endpoint.clone(),
             config: config.clone(),
             state,
             controller_keys,
+            static_keys,
             network,
             peers: peers.clone(),
             inbound_tx: inbound_tx.clone(),
@@ -154,6 +162,13 @@ impl IrohTransport {
                     };
                     let remote = conn.remote_id();
                     let node = NodeId::new(*remote.as_bytes());
+                    if accept_config.network.auth.mode == AuthMode::Static
+                        && !transport.static_keys.contains(&node)
+                    {
+                        warn!(peer = %node.short(), "peer key is not in the static allowlist");
+                        conn.close(2u8.into(), b"not allowlisted");
+                        continue;
+                    }
                     if accept_config.network.auth.mode == AuthMode::Controller {
                         let credential = transport.state.credential();
                         let auth = tokio::time::timeout(
@@ -229,6 +244,12 @@ impl IrohTransport {
             }
         };
         if !force && self.peers.get(&node).is_some() {
+            return false;
+        }
+        // Static mode is a closed allowlist: discovery/LSA must not introduce
+        // dynamic peers.
+        if self.config.network.auth.mode == AuthMode::Static && !self.static_keys.contains(&node) {
+            debug!(peer = %node.short(), "ignoring dynamic peer outside the static allowlist");
             return false;
         }
         self.peers.upsert(crate::PeerState {
@@ -995,6 +1016,96 @@ cidr = "10.8.0.0/16"
         // A node with no credential cannot join the data plane.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(!c.peers.get(&b_id).is_some_and(|p| p.connected));
+        drop(a);
+        drop(b);
+        drop(c);
+        drop(server);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn static_config(config: &mut Config, peers: Vec<PeerConfig>) {
+        config.network.auth.mode = AuthMode::Static;
+        config.peers = peers;
+    }
+
+    #[tokio::test]
+    async fn static_mode_only_accepts_allowlisted_keys() {
+        let (server, relay_url) = start_relay().await;
+        let base = std::env::temp_dir().join(format!("stellaris-static-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let a_id = node_for([1u8; 32]);
+        let b_id = node_for([2u8; 32]);
+        let c_id = node_for([3u8; 32]);
+        let peer = |name: &str, id: NodeId, overlay: &str| PeerConfig {
+            name: name.into(),
+            endpoint_id: id.to_string(),
+            overlay_ip: overlay.parse().unwrap(),
+            addrs: vec![],
+            relay_url: Some(relay_url.clone()),
+            advertised: vec![],
+            zone: None,
+        };
+        let mut config_a = config("a", &base.join("a"), &relay_url, "10.7.0.1");
+        static_config(&mut config_a, vec![peer("b", b_id, "10.7.0.2")]);
+        let mut config_b = config("b", &base.join("b"), &relay_url, "10.7.0.2");
+        static_config(&mut config_b, vec![peer("a", a_id, "10.7.0.1")]);
+        let mut config_c = config("c", &base.join("c"), &relay_url, "10.7.0.3");
+        static_config(&mut config_c, vec![peer("b", b_id, "10.7.0.2")]);
+        let state_a = crate::AgentState::build(config_a.clone()).unwrap();
+        let state_b = crate::AgentState::build(config_b.clone()).unwrap();
+        let state_c = crate::AgentState::build(config_c.clone()).unwrap();
+        let network = state_a.network;
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let (tx_b, _rx_b) = mpsc::channel(64);
+        let (tx_c, _rx_c) = mpsc::channel(64);
+        let a = IrohTransport::start(
+            state_a.clone(),
+            state_a.config.clone(),
+            network,
+            [1u8; 32],
+            PeerRegistry::from_config(&config_a).unwrap(),
+            tx_a,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = IrohTransport::start(
+            state_b.clone(),
+            state_b.config.clone(),
+            network,
+            [2u8; 32],
+            PeerRegistry::from_config(&config_b).unwrap(),
+            tx_b,
+            None,
+        )
+        .await
+        .unwrap();
+        let c = IrohTransport::start(
+            state_c.clone(),
+            state_c.config.clone(),
+            network,
+            [3u8; 32],
+            PeerRegistry::from_config(&config_c).unwrap(),
+            tx_c,
+            None,
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if a.peers.get(&b_id).is_some_and(|p| p.connected)
+                && b.peers.get(&a_id).is_some_and(|p| p.connected)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(a.peers.get(&b_id).is_some_and(|p| p.connected));
+        assert!(b.peers.get(&a_id).is_some_and(|p| p.connected));
+        // c is not in b's allowlist, so the inbound connection is rejected.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(!c.peers.get(&b_id).is_some_and(|p| p.connected));
+        // Dynamic add (discovery/LSA) is refused outside the allowlist.
+        assert!(!b.add_peer(peer("c", c_id, "10.7.0.3"), false));
         drop(a);
         drop(b);
         drop(c);

@@ -387,6 +387,10 @@ pub enum AuthMode {
     /// No membership authentication (development only).
     #[default]
     None,
+    /// WireGuard-style static allowlist: only NodeIds listed in `[[peers]]`
+    /// may connect. The iroh handshake already authenticates the node key, so
+    /// no extra credential or shared secret is needed.
+    Static,
     /// Controller-signed membership credential presented during the iroh
     /// handshake; peers verify it against `control.controller_keys`.
     Controller,
@@ -854,6 +858,14 @@ impl Config {
                     member.node_id
                 )));
             }
+        }
+        if self.network.auth.mode == AuthMode::Static
+            && self.node.role != "controller"
+            && self.peers.is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "network.auth.mode = static requires at least one [[peers]] entry".into(),
+            ));
         }
         if self.network.auth.mode == AuthMode::Controller {
             if self.control.controller_keys.is_empty() {
@@ -1481,5 +1493,32 @@ cidr = "10.7.0.0/16"
 controller_threshold = 2
 "#;
         assert!(Config::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn static_mode_requires_peers_and_allows_discovery() {
+        let base = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[network.auth]
+mode = "static"
+"#;
+        let error = Config::from_toml(base).unwrap_err().to_string();
+        assert!(error.contains("static"), "{error}");
+        let with_peer = format!(
+            r#"{base}
+[[peers]]
+name = "b"
+endpoint_id = "{}"
+overlay_ip = "10.7.0.2"
+[transport]
+mdns = true
+"#,
+            hex::encode([2u8; 32])
+        );
+        assert!(Config::from_toml(&with_peer).is_ok());
     }
 }

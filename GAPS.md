@@ -224,6 +224,7 @@ PMTUD：
 - **大 snapshot 跨 WAN**：5.57 MiB 模型走 2MiB 分块传输；限速中断后部分数据（2097152 字节）在重启后保留，重启并恢复链路后续传安装完成，日志追平 leader（generation 5402）。持续 2mbit 慢链路下 60s TTL 是否够用未验证。
 
 - 单 member 入口 URL；没有 client 侧多 controller endpoint 自动 failover（依赖 LB/DNS）。
+- IPAM（地址池/CIDR CRUD/租约/自动分配）未实现，仅完成设计规划：[IPAM.md](IPAM.md)。
 - 非 Raft legacy controller 仍保留。
 - agent 客户端重启后的 snapshot 续传未验证（controller 侧 + 整集群滚动后的续传已在 TEST-RESULTS §3.10 验证）。
 - 动态 Raft membership 已实现（`/v1/raft/learner|membership`）；WAN 丢包/大 snapshot 已测单次，未做 soak。

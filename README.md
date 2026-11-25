@@ -20,7 +20,7 @@
 - **传输**：iroh 1.5（QUIC）静态 peer；direct/relay 路径与 RTT 可见；固定 UDP 端口，便于 LAN/实验环境直连。
 - **数据面**：TUN（Linux/macOS）+ 16 字节 MeshHeader；IPv4 + IPv6 overlay；TTL/转发/anti-spoof；subnet gateway；NAT44/NAT66 public exit；fragment 解析/ACL；TCP MSS clamp、peer path MTU、ICMPv4/v6 PTB；初始 MTU 1100 + 自适应；需要 root/CAP_NET_ADMIN。
 - **API/控制面**：非 loopback `api.bind` 必须配置 `api.token`；`api.read_token` 只允许读操作，写操作仍需要 admin token；`api.previous_tokens` / `control.previous_secrets` 支持轮换窗口；controller 可配置 `control.leader_id`，legacy 路径非 leader 拒绝写入（Raft 路径由 quorum/leader hint 处理）；非 loopback `control.bind`/controller iroh 必须配置 `control.secret`。
-- **入网安全**：唯一凭据是 controller 用 Ed25519 签名的 `MembershipCredential`（network/node/overlay/prefixes/capabilities/revision/not_after），peer 在 iroh 握手时用 `control.controller_keys` 验签；没有共享秘密、没有 join token。`POST /v1/enroll` 是唯一签发入口（预注册即签发，否则进 Raft 待审队列由管理员 `approve/deny`）；`POST /v1/members/{node}/grants` 独立更新授权；`POST /v1/revoke` 撤销后 member ≤10s 断连并丢弃 grant；数据面 source grant（转发他人源地址需要 `transit` capability）、LSA 前缀 grant 与凭据同源；`control.admin_secret` 与 member secret 分权。
+- **入网安全**：无控制面的小规模部署可用 `network.auth.mode = "static"`（WireGuard 式：只接受 `[[peers]]` 里的 node key，iroh 握手本身已完成 key 认证）；生产多节点用 controller 签发的 `MembershipCredential`（network/node/overlay/prefixes/capabilities/revision/not_after），peer 在 iroh 握手时用 `control.controller_keys` 验签；没有共享秘密、没有 join token。`POST /v1/enroll` 是唯一签发入口（预注册即签发，否则进 Raft 待审队列由管理员 `approve/deny`）；`POST /v1/members/{node}/grants` 独立更新授权；`POST /v1/revoke` 撤销后 member ≤10s 断连并丢弃 grant；数据面 source grant（转发他人源地址需要 `transit` capability）、LSA 前缀 grant 与凭据同源；`control.admin_secret` 与 member secret 分权。
 - **RoutePolicy**：配置化 policy engine（Accept/Deny/SetLocalPref/SetMetric/SetAdminDistance/SetWeight），在 RIB→FIB 前执行；`Match.zone` 已实现 AZ 匹配。
 - **测试**：FIB/路由/持久化/报文解析/数据面决策/ACL/QoS/API 鉴权/controller 签名/SPF 单元测试；`demo-two-node.sh` 双节点 iroh；`docker-two-node-tun.sh` 双容器 TUN；`docker-subnet-gateway.sh` a→b→c 1000B ping；`demo-linkstate.sh`/`demo-distributed-linkstate.sh` 自动路由与 `TEST_FAILOVER=1` 撤路；`demo-iroh-controller.sh` iroh control；`demo-controller-discovery.sh` controller 自动发现成员；`test-real-3host-ha.sh` / `test-real-3host-overlay.sh` / `test-real-3host-ipv6.sh` / `test-real-3host-roaming.sh` 真实物理三主机 HA、IPv4/IPv6、roaming。
 
@@ -599,7 +599,8 @@ examples/               # 示例 TOML
 | [TEST-RESULTS.md](TEST-RESULTS.md) | 真实环境测试原始结果 |
 | [ADVANCED-ROUTING.md](ADVANCED-ROUTING.md) | 静态路由、AZ 分段、subnet gateway 设计 |
 | [PRIORITIES.md](PRIORITIES.md) | 当前缺口、优先级与下一阶段路线 |
-| [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) | 入网、成员凭据、撤销与授权（实现说明） |
+| [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) | 入网、成员凭据、静态模式、撤销与授权（实现说明） |
+| [IPAM.md](IPAM.md) | 控制面 IPAM/地址池/租约/DHCP 边界的设计规划 |
 | [MULTI-NETWORK.md](MULTI-NETWORK.md) | 多网络隔离与单进程多网络设计 |
 | [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md) | 真实局域网 mDNS 验证记录 |
 | [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 设计与实现记录 |
@@ -678,7 +679,9 @@ curl -X POST -H "x-stellaris-secret: admin-secret" \
 - 初始 bootstrap 仍需要 controller URL 或静态 peer；之后可由 controller manifest/LSA `overlay_ip/addrs` 自动发现/连接。
 - agent 的路由写 API 只接受 `scope=local`；network scope 目前只能通过 controller 配置/静态路由（`api.rs:365-369` 会拒绝 network scope）。
 - ACL/QoS 支持 API 动态更新 + token-bucket + per-priority/per-class queue depth/bytes + DSCP；内置静态 Web UI（`crates/stellaris-agent/static/index.html`）只覆盖 peers/routes/status/policy。anti-spoof 允许 peer 自身 overlay IP + 它广告的前缀；subnet gateway 的 NAT66 目前仅 Linux（macOS 待做）。
-- **控制帧没有逐帧签名**：iroh 连接在 controller 模式下由 membership credential 双向认证（绑定 node key），LSA 另有 Ed25519 签名；但控制帧本身没有逐帧签名，仍不要把 MVP 直接暴露在不可信网络。
+- **控制帧没有逐帧签名**：iroh 连接在 controller 模式下由 membership credential 双向认证（绑定 node key），static 模式由 peers 白名单认证；LSA 另有 Ed25519 签名；但控制帧本身没有逐帧签名，仍不要把 MVP 直接暴露在不可信网络。
+- **static 模式不支持动态成员**：discovery/LSA 不能引入不在 `[[peers]]` 里的节点；增删成员要改每台配置。多节点/需要撤销与自动地址时用 controller。
+- **IPAM 尚未实现**：overlay IP 仍要手工写；地址池/CIDR CRUD/租约/自动分配的设计见 [IPAM.md](IPAM.md)。
 - relay 建连、direct→relay 切换已测；relay 故障后会在旧连接关闭时经 `transport.relay_urls` 列表重连（实测约 60s，非秒级切换；多 relay 同时承载未实现）。生产建议自建 relay 并监控（见 AUDIT.md）。
 - 2026-11-24 完成静态审计（[AUDIT.md](AUDIT.md)）并修复 P0：LSA 签名、transit 强制、OS 路由防护、iroh 走 Raft、Raft RPC 必须配 `raft_secret` 且有超时、admin secret、routes/LSA TTL/epoch 入 Raft、动态 membership。2026-11-25 进一步把入网收敛为 controller 签名的成员凭据。仍没有第三方安全审计，MVP 仅用于开发/实验。
 - 2026-11-25 配置变更（不兼容）：删除 `network.auth.secret`、`network.auth.allowed_nodes`、`control.join_token(s)`、`control.require_join_signature`、`control.admission`、`control.request_admission`；新增 `control.credential_ttl_secs`。`network.auth.mode` 只剩 `none`（仅实验）和 `controller`，配 `controller` 时必须给 `control.controller_keys` 以及 `control.endpoint_id` 或 `control.url`。`POST /v1/join` 由 `POST /v1/enroll` 取代，`GET /v1/status` 不再有 `join_config_hash`。

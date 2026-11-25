@@ -66,6 +66,9 @@ name = "node-b"
 endpoint_id = "$B_ID"
 overlay_ip = "10.7.0.2"
 addrs = ["127.0.0.1:$IROH_B"]
+
+[network.auth]
+mode = "static"
 TOML
 cat >> "$DEMO/b.toml" <<TOML
 
@@ -74,6 +77,9 @@ name = "node-a"
 endpoint_id = "$A_ID"
 overlay_ip = "10.7.0.1"
 addrs = ["127.0.0.1:$IROH_A"]
+
+[network.auth]
+mode = "static"
 TOML
 
 "$BIN" --config "$DEMO/a.toml" > "$DEMO/a.log" 2>&1 &

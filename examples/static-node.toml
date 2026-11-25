@@ -1,0 +1,31 @@
+# Static (WireGuard-style) membership: no controller, no shared secret.
+# The iroh handshake authenticates the peer's node key; this file only lists
+# which keys may connect and which overlay addresses/prefixes they own.
+# Every node needs the other nodes' [[peers]] entries (full mesh for 2-5 nodes).
+[node]
+name = "static-a"
+state_dir = "./state/static-a"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "static"
+
+[[peers]]
+name = "static-b"
+endpoint_id = "0000000000000000000000000000000000000000000000000000000000000000"
+overlay_ip = "10.7.0.2"
+addrs = ["192.0.2.11:41002"]
+# Prefixes this peer may carry. For multi-hop transit, the receiving side must
+# list the forwarded source addresses here (WireGuard AllowedIPs semantics).
+advertised = ["192.168.50.0/24"]
+
+[transport]
+listen_port = 41001
+advertise = ["192.0.2.10:41001"]
+
+[api]
+bind = "127.0.0.1:7777"

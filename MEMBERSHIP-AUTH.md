@@ -11,6 +11,18 @@
 
 ---
 
+## 0.1 三种认证模式
+
+| `network.auth.mode` | 用途 | 认证方式 | 动态成员 |
+|---|---|---|---|
+| `none` | 隔离实验 | 无 | ❌ |
+| `static` | 无控制面小网（2–10 台） | 只接受 `[[peers]]` 里的 node key；iroh 握手已完成 key 认证 | ❌（discovery 只能提供候选，未知 key 被拒） |
+| `controller` | 生产/多节点 | controller 签名凭据（本文 §2–§5） | ✅ |
+
+`static` 是 WireGuard 式模型：身份 = Ed25519 公钥（iroh endpoint id），授权 =
+peer 的 `overlay_ip` + `advertised`，撤销 = 从配置删除。没有共享秘密，也没有
+过期/自动轮换；需要这些时用 controller 或离线签发凭据。
+
 ## 0. 三个问题，三层解决
 
 | 问题 | 答案 | 落点 |
@@ -158,6 +170,19 @@ mode = "controller"             # 唯一的生产模式
 endpoint_id = "<controller endpoint>"   # 或 url = "https://controller:5801"
 secret = "member-secret"
 controller_keys = ["<controller node id>"]
+```
+
+`static` 模式示例（无需 controller）：
+
+```toml
+[network.auth]
+mode = "static"
+
+[[peers]]
+name = "b"
+endpoint_id = "<b node id>"
+overlay_ip = "10.7.0.2"
+advertised = ["192.168.50.0/24"]
 ```
 
 `mode = "none"` 仅用于隔离实验：没有任何成员认证，discovery 需要
