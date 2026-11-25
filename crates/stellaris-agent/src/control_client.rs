@@ -471,6 +471,12 @@ fn apply_members(
         .collect();
     for node in stale {
         tracing::warn!(peer = %node.short(), "member is no longer authorized; revoking");
+        // Fence the credential the peer already holds: a revoked node keeps a
+        // cryptographically valid credential until it expires, so raise the
+        // local revision floor. Re-approval bumps the controller revision past
+        // this value and is accepted again.
+        let floor = state.revision(node).saturating_add(1);
+        state.observe_revision(node, floor);
         match transport {
             Some(transport) => transport.close_peer(node),
             None => state.drop_grant(node),
@@ -968,5 +974,7 @@ prefixes = ["192.168.50.0/24"]
         assert!(state.grants.read().unwrap().contains_key(&node));
         apply_members(&state, &[], None);
         assert!(!state.grants.read().unwrap().contains_key(&node));
+        // The revoked node's still-valid credential is fenced locally.
+        assert_eq!(state.revision(node), 6);
     }
 }

@@ -121,7 +121,8 @@ HTTP enroll 请求由节点私钥签名（`stellaris-enroll-v1|network|node|over
 1. `POST /v1/revoke`、`deny`，或从 `control.members` 删除；
 2. model 移除成员、递增该节点的 `member_revisions`、写入 `revoked` tombstone；
 3. member 在下一个快照（≤10s）发现该节点不在 members 里：
-   主动 `close` 连接（QUIC close code 3）并删除本地 grant；
+   主动 `close` 连接（QUIC close code 3）、删除本地 grant，并把该节点的本地
+   revision 下限抬到 `旧值 + 1`——即使撤销前签出的凭据还没过期，重连也会被拒；
 4. 该节点后续 enroll 返回 403（tombstone），除非管理员重新 approve；
 5. 即使对方重放撤销前的旧凭据，`revision` 也更低，会被拒绝；
 6. `not_after` 兜底：controller 不可达时，最迟一个 TTL 后凭据自然失效。
