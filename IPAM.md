@@ -14,7 +14,8 @@
    Raft 状态机内，三副本强一致。
 2. membership 与地址解耦：入网审批决定"能不能加入"，IPAM 决定"分到哪个地址"；
    改地址不需要重新入网。
-3. 支持 IPv4 与 IPv6（overlay 主机地址 `/32`、`/128`），一个网络可配置多个池。
+3. 支持 IPv4 与 IPv6（overlay 主机地址 `/32`、`/128`），一个网络可配置多个池；
+   Phase 1 的池必须落在 `network.cidr` 内（多网段需要 §16 的数据面扩展）。
 4. 兼容现有静态配置：没配 IPAM 时行为完全不变。
 5. 提供可运维的 CRUD 与租约查询/续租/释放 API，以及 metrics。
 6. agent 支持 `ipam = "auto"`：从凭据拿到地址后自动配置 TUN，重启复用上次地址。
@@ -75,6 +76,9 @@ pub struct AddressPool {
     /// 分配策略：v4 默认 LowestFree，v6 默认 HashProbe。
     #[serde(default)]
     pub strategy: AllocStrategy,
+    /// 可选 AZ/站点亲和：节点 zone 匹配时优先从这个池分配。
+    #[serde(default)]
+    pub zone: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -337,7 +341,8 @@ overlay 成员的地址由 controller 分配并随凭据下发，DHCP 在这个�
 - 没有池、没有 `ipam = "auto"`：行为与现在完全一致；`node.overlay_ip` 仍是必填。
 - 有池但节点仍写静态 `overlay_ip`：controller 校验"在池内且未被占用"，否则拒绝 enroll。
 - 配置升级：
-  - `network.cidr` 保留（用于 TUN 路由/anti-spoof 边界），池可以与它不同（多网段）；
+  - `network.cidr` 保留（用于 TUN 掩码/on-link 过滤/NAT 源网段）；Phase 1 要求所有池
+    都在它内部。跨网段（多个 CIDR）需要 §16 的数据面改动，不能只靠 IPAM；
   - 新增 `control.ipam.enabled`（默认 false）避免误启用；
   - 新增 `node.ipam = "auto" | "static"`。
 - 旧 controller / 旧 agent 混跑：`ipam` 字段 `#[serde(default)]`，旧端忽略；但
@@ -462,7 +467,70 @@ stellaris_ipam_quarantined                         1
 - `ApproveAdmission` 的 `member.overlay_ip` 仍是显式字段：自动分配由 leader 填好再写，
   避免在 `apply` 里做可能失败的分配。
 
-## 16. 待定问题
+## 16. 多地址、多网段与多 AZ
+
+### 16.1 一个节点多个 IP？
+
+核心模型是"一个节点一个 primary overlay 地址"，凭据里只有 `overlay_ip`。不建议
+把多地址做成 first-class：
+
+- 数据面、MeshHeader、LSA、anti-spoof 都以单个 `overlay_ip` 为主键；
+- 真正的多地址需要同时改凭据、LSA、TUN 地址、源地址选择、路由和 anti-spoof，
+  收益（VIP/anycast）可以用更轻的方式实现。
+
+推荐做法：
+
+- **额外地址/VIP** 用成员的 `prefixes` 表达（IPAM 可分配，也可静态 grant）；
+  接收方向：LSA 宣告该前缀，路由指向该节点；发送方向：该节点本地把 VIP 配到
+  接口/策略路由，凭据的 prefixes 允许它作为源地址。不需要改协议。
+- **双栈** 用两个 network（一个 v4、一个 v6，进程支持多个 `--config`），
+  而不是一个 network 里两个地址；这样凭据、网络隔离、TUN 都保持单地址假设。
+
+### 16.2 一个 network 多个网段？
+
+IPAM 的数据模型支持多个池（不同 CIDR），但**数据面目前只认一个 `network.cidr`**：
+
+| 依赖点 | 现在 | 多网段需要 |
+|---|---|---|
+| TUN 掩码 | `network.cidr.prefix_len()` | 每个池一个 TUN 地址/掩码，或用 host route |
+| on-link 过滤 | 路由 reconciler 排除 `network.cidr` 内的前缀 | 按"所有 overlay 池"判断 |
+| NAT 源网段 | `network.cidr` | 多个源网段 |
+| 配置校验 | overlay/peer 必须在 `network.cidr` 内 | 允许属于任一池 |
+
+因此：
+
+- **Phase 1**：多池可以，但都在同一个 `network.cidr` 内（例如 /16 里分多个 range）；
+- **真正多网段**：扩展 `network.cidrs: Vec<IpNet>`（TUN 多地址、过滤、NAT、校验），
+  与 IPAM 解耦，单独一个 PR；IPAM 的池可以指向不同 CIDR；
+- **隔离优先用多 network**：不同 `network.id`、独立 controller/凭据/TUN，
+  已经支持（进程可跑多个 config），比同网络多网段更安全清晰。
+
+### 16.3 两个 AZ
+
+推荐**一个 network 跨 AZ**，用现有 zone 机制，而不是两个 network：
+
+- `node.zone` + `routing.cross_zone_penalty` / `prefer_same_zone` 已实现；
+- LSA/SPF 自动跨 AZ 选路，ECMP 可用；controller 3 节点跨 AZ 已验证；
+- IPAM 池可加 `zone` 字段：节点 enroll 时带 zone，分配优先同 zone 池，
+  降低跨 AZ 地址带来的运维歧义（地址本身仍是虚拟的，不改变语义）；
+- 不需要 BGP/OSPF：LSA 就是路由协议；AZ 只是路径代价与地址池亲和。
+
+### 16.4 需要别的协议吗？
+
+不需要：
+
+| 需求 | 现有机制 |
+|---|---|
+| 成员地址下发 | controller API + 签名凭据（本文 IPAM） |
+| 路由 | 签名 LSA 洪泛 + 本地 SPF |
+| 认证 | controller 凭据 / static peers 白名单 |
+| 租约/过期 | IPAM lease + 凭据 revision |
+| 多 AZ | zone 标签 + 路径代价 |
+
+只有这些场景会引入新协议，且都**不在当前范围**：接外部网络跑 BGP、给 LAN 主机
+发地址跑 DHCP、二层扩展跑 VXLAN/EVPN。
+
+## 17. 待定问题
 
 1. 地址池是否允许 `0.0.0.0/0` 这类超大 v4 池？建议拒绝（> /16）或强制给 range。
 2. 地址变更时是否保持旧地址一段时间双栈并存？建议不保留（凭据 revision 立即生效）。
