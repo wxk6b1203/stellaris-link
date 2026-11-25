@@ -439,7 +439,7 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **173 passed**（agent 129 + types 19 + 其余 25） |
+| 全量测试 | `cargo test --workspace` | **175 passed**（agent 130 + types 20 + 其余 25） |
 | Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
 | Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
 | 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
@@ -447,7 +447,20 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | 跨网络凭据拒绝 | `scripts/demo-multi-network-isolation.sh`（本机） | ✅ 不同 network 的凭据在握手时报 `credential network mismatch` |
 | 静态检查 | `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` | ✅ |
 
-### 3.14 仍未验证
+### 3.14 2026-11-25 static 模式（4 台真实主机）
+
+`network.auth.mode = "static"`（WireGuard 式 peers 白名单）的跨地域实测：
+
+| 项 | 环境/方式 | 结果 |
+|---|---|---|
+| 4 节点全互联 | 深圳 47.112.180.223 / 47.112.175.202 + 乌兰察布 8.161.224.235 / 8.161.224.111；TUN `10.77.0.1-4`，每个节点 `[[peers]]` 列其余 3 台 | ✅ 12 个方向的 peer 全部 connected；12 个方向 `ping` 2/2 通过 |
+| 未知 key 拒绝 | 停掉 n1 后，用它的 UDP 端口（47101，云安全组唯一放行的端口）启动一个全新 identity 的 rogue，peers 指向 n2 | ✅ n2 日志出现 `peer key is not in the static allowlist`；`/v1/peers` 中没有 rogue；rogue 无法加入 |
+| 动态 peer 拒绝 | `transport::tests::static_mode_only_accepts_allowlisted_keys` | ✅ 未列出的 key 在 QUIC 后立即被 close；`add_peer`（discovery/LSA 路径）也拒绝 |
+| 单元/配置 | `config::tests::static_mode_requires_peers_and_allows_discovery` | ✅ static 必须至少一个 peer；discovery 在该模式下允许 |
+
+> 云环境注意：第一次用随机 UDP 端口（47190）启动 rogue 时 QUIC 握手无法完成——安全组只放行各节点的固定端口；改用 n1 的 47101 后测试通过。脚本 `scripts/test-real-static-mesh.sh` 已按此实现。
+
+### 3.15 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot
@@ -633,3 +646,4 @@ peer path MTU: 1414
 - macOS/Windows NAT
 - 大规模/长时间 soak、磁盘慢 IO 注入
 - 多 controller 用各自 key 签发凭据的跨地域实测（本地只验证单 controller）
+- static 模式的大规模（>10 节点）与动态增删（当前每个变更都要改配置）

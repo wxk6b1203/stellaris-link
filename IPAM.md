@@ -1,6 +1,6 @@
 # IPAM 设计规划（控制面地址分配）
 
-> 状态：**设计稿，尚未实现**（2026-11-25）。本文只做规划，不改实现。
+> 状态：**设计稿 v1 完成，待实施**（2026-11-25）。本文只做规划，未改实现。
 > 关联：[MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md)、[OPENRAFT-HA.md](OPENRAFT-HA.md)、
 > [PROTOCOL.md](PROTOCOL.md)、[README.md](README.md)。
 
@@ -450,7 +450,32 @@ stellaris_ipam_quarantined                         1
 
 ---
 
-## 15. 待定问题
+## 15. 代码改动清单（实施时按此拆 PR）
+
+| 文件 | 改动 |
+|---|---|
+| `crates/stellaris-types/src/config.rs` | 新增 `node.ipam`（static/auto）、`control.ipam`（enabled/默认池/租期）；校验 auto 必须 controller 模式、不得与 `node.overlay_ip` 同时出现 |
+| `crates/stellaris-agent/src/controller_model.rs` | `AddressPool`/`Lease`/`Reservation`；`pools`/`leases`/`node_leases`/`reservations`/`quarantine` 字段；`CreatePool`/`UpdatePool`/`DeletePool`/`ReserveAddress`/`ReleaseAddress`/`RenewLease`/`ExpireLeases` 命令；`apply` 分配算法；`snapshot_bytes` 覆盖新字段；单测 |
+| `crates/stellaris-agent/src/controller.rs` | `/v1/ipam/*` 路由与 handler；enroll/approve 集成（无 overlay 时分配）；housekeeping 任务提交 `ExpireLeases`；`/v1/model` 输出 pools/leases；admin 鉴权 |
+| `crates/stellaris-agent/src/control_client.rs` | enroll 请求携带 `overlay_ip: None` + auto 标志；`install_credential` 时把 overlay 写入 `state.local_overlay`；续签失败/池耗尽日志与退避 |
+| `crates/stellaris-agent/src/lib.rs` | `AgentState.local_overlay: Arc<RwLock<Option<IpAddr>>>`、`local_overlay()`/`set_local_overlay()`；启动时优先用缓存凭据 |
+| `crates/stellaris-agent/src/dataplane.rs` | `local_ip()` 改为读 `state.local_overlay()`；TUN 创建延迟到有地址时；新增 `reconfigure_tun(ip)`（Linux `ip addr replace`，macOS `ifconfig`）；路由 reconciler 使用新 overlay |
+| `crates/stellaris-agent/src/link_state.rs` / `wire.rs` | 自报 `overlay_ip` 从 `local_overlay()` 读取，地址变更后重新发布 LSA |
+| `crates/stellaris-agent/src/api.rs` | `/v1/status` 增加 ipam/lease 信息；`/metrics` 增加 §11 的指标 |
+| `crates/stellaris-agent/src/controller_raft.rs` | 无需改动（新命令走 serde 枚举；注意旧快照反序列化默认值） |
+| `scripts/test-real-ipam.sh` | 4 主机：一个 controller + 3 成员自动分配、mesh ping、撤销后地址隔离、controller 重启 |
+| 文档 | README 配置、MEMBERSHIP 交叉引用、PROTOCOL 的 enroll/lease 字段、TEST-RESULTS |
+
+兼容性注意事项：
+
+- `ControllerCommand` 新增变体会进入 `commands.jsonl` 重放；旧版本无法回放新命令，
+  升级后不支持回滚到旧二进制（与现有命令的兼容策略一致）。
+- 快照里新增字段全部 `#[serde(default)]`，旧 agent 忽略；但旧 agent 不认 auto，
+  必须同时升级。
+- `ApproveAdmission` 的 `member.overlay_ip` 仍是显式字段：自动分配由 leader 填好再写，
+  避免在 `apply` 里做可能失败的分配。
+
+## 16. 待定问题
 
 1. 地址池是否允许 `0.0.0.0/0` 这类超大 v4 池？建议拒绝（> /16）或强制给 range。
 2. 地址变更时是否保持旧地址一段时间双栈并存？建议不保留（凭据 revision 立即生效）。
