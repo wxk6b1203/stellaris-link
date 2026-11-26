@@ -234,7 +234,9 @@ P0 证据速查：
 
 ### 7.3 仍开放的 P1/P2 边界
 
-- **relay failover 的恢复时延**：修复为“旧连接关闭后经配置 relay 列表重连”，实测约 60s（QUIC idle timeout + 2s 重连间隔），不是秒级切换；多 relay 同时承载仍未实现。
+- **relay failover 的恢复时延**：2026-11-26 已改为双 endpoint/双 link 热备
+  （active 故障立即 fallback，link-state 心跳 4s 清理死链）；不再是旧的 ~60s
+  重连。真 multipath/带宽聚合仍未实现（依赖 iroh 上游）。
 - **iroh >4MiB 端到端**：上限已提高，但没有用 >4MiB 模型跑 iroh 快照（WAN 大快照验证走 HTTP）。
 - **relay 自动 failover**：见上，需要传输层改动。
 - **持续慢链路 TTL**：60s transfer TTL 在持续 2mbit 链路下的行为仍未验证。

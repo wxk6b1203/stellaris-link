@@ -605,6 +605,7 @@ stellaris credential issue --controller-key controller.key \
 | `controller status` | ✅ admin secret 读取 status（同时兼容 member secret） |
 | `controller members list` | ✅ `/v1/model` 对 admin 开放 |
 | `controller ipam pools list/create` | ✅ 本机 controller 创建 `10.88.1.0/24` 池成功 |
+| 公网 controller | ✅ 深圳 `120.77.233.189:5801` 上 status/pools list/create 从本机 CLI 成功 |
 | `credential verify` | ✅ 有效凭据通过；过期凭据返回非零并输出 `valid=false` |
 | 单测 | ✅ CLI 10 个（issue/verify/覆盖/controller 参数） |
 

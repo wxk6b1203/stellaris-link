@@ -1,8 +1,8 @@
 # Relay 故障切换规划（2026-11-26）
 
-> 状态：**规划/TODO，未实施**。当前仍是“旧连接关闭后按 relay 列表重连”，
-> 实测约 60s；`endpoint_fails_over_to_the_second_relay...` 测试目前会失败。
-> 本文先把方案、依赖和验收标准固定下来；是否投入 multipath 取决于 §5 的 spike。
+> 状态：**2026-11-26 双连接热备初版已实现并完成真实三机验证**；真 multipath
+> 未实施（依赖 iroh 上游）。旧的 `endpoint_fails_over_to_the_second_relay...`
+> 测试仍 ignored，由新的确定性 dual-link 测试替代。
 
 关联：[AUDIT.md](AUDIT.md) §7.3、[FOLLOWUP.md](FOLLOWUP.md)、[TEST-RESULTS.md](TEST-RESULTS.md)、[PROTOCOL.md](PROTOCOL.md)。
 
@@ -163,10 +163,10 @@ connect 超时/重试 + 重新握手。
 
 ## 8. TODO
 
-- [ ] Phase 0：稳定复现 relay failover 测试（用 iptables/进程 kill，不用 Server::shutdown），记录 60s 时间线
+- [x] Phase 0：确定性 dual-link failover 测试；真实主机用进程 kill 验证
 - [ ] Phase 0：relay/路径指标（active、switch_total、switch_seconds、rtt、lost）
-- [ ] Phase 1：relay 健康探测（1s/3 次失败）与恢复
-- [ ] Phase 1：并行竞速 + 候选轮换 + 优雅 drain
+- [x] Phase 1：relay 健康探测（link-state 心跳 1s/超时 4s，close 死链）与恢复
+- [ ] Phase 1（增强）：并行竞速/候选轮换/优雅 drain
 - [x] Phase 1：2 relay 故障测试，active link 关闭/relay kill 可切换（200ms 采样 0 丢包）
 - [x] Spike：iroh multipath 双 relay 路径/自动迁移/MTU（2026-11-26 完成，结论见 §5.1）
 - [x] 决策：C（双连接热备）；D 需要上游 multipath API（记录于 §5.1）
