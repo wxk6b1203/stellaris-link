@@ -34,7 +34,7 @@
 ```text
 cargo fmt --check                                          ✅
 cargo clippy --all-targets -- -D warnings                  ✅
-cargo test                                                 202 passed（2026-11-26，历史段落中的 152 为当时数据）
+cargo test                                                 207 passed（2026-11-27，历史段落中的 152 为当时数据）
 ```
 
 覆盖：

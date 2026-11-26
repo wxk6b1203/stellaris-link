@@ -349,6 +349,27 @@ fn load_credential(state_dir: &std::path::Path) -> Option<credential::SignedCred
     }
 }
 
+/// Controller-auth nodes need either a live control endpoint or a pre-issued
+/// credential before they can bring up transport. API-only mode is still
+/// allowed for inspection/repair.
+fn controller_bootstrap_error(
+    config: &Config,
+    control_configured: bool,
+    has_credential: bool,
+    want_transport: bool,
+) -> Option<&'static str> {
+    if !want_transport
+        || config.network.auth.mode != stellaris_types::AuthMode::Controller
+        || control_configured
+        || has_credential
+    {
+        return None;
+    }
+    Some(
+        "controller auth needs control.url/endpoint_id or a cached credential.json; place an offline-issued credential in the state dir, or disable the dataplane for API-only mode",
+    )
+}
+
 pub async fn run(state: AgentState) -> anyhow::Result<()> {
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(1024);
     let (control_tx, control_rx) = if state.config.routing.link_state {
@@ -359,19 +380,19 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     };
     let control_configured =
         state.config.control.url.is_some() || state.config.control.endpoint_id.is_some();
-    if !control_configured
-        && state.config.network.auth.mode == stellaris_types::AuthMode::Controller
-        && state.credential().is_none()
-    {
-        tracing::warn!(
-            "controller auth without control.url/endpoint_id and no cached credential; place an offline-issued credential.json in the state dir"
-        );
-    }
     let want_transport = state.config.dataplane.enabled
         || !state.config.peers.is_empty()
         || control_configured
         || state.config.transport.discovery_port.is_some()
         || state.config.transport.mdns;
+    if let Some(error) = controller_bootstrap_error(
+        &state.config,
+        control_configured,
+        state.credential().is_some(),
+        want_transport,
+    ) {
+        anyhow::bail!("{error}");
+    }
     if want_transport {
         let transport = transport::IrohTransport::start(
             state.clone(),
@@ -519,6 +540,29 @@ via = "c"
             .lookup("192.168.50.1".parse().unwrap())
             .unwrap();
         assert_eq!(failover.next_hops[0].node, NodeId::new([3u8; 32]));
+    }
+
+    #[test]
+    fn controller_bootstrap_requires_url_or_credential() {
+        let toml = r#"
+[node]
+name = "offline"
+[network]
+name = "offline-demo"
+cidr = "10.7.0.0/16"
+[network.auth]
+mode = "controller"
+[control]
+controller_keys = ["0000000000000000000000000000000000000000000000000000000000000000"]
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        assert!(
+            controller_bootstrap_error(&config, false, false, true).is_some(),
+            "dataplane startup needs a bootstrap source"
+        );
+        assert!(controller_bootstrap_error(&config, false, false, false).is_none());
+        assert!(controller_bootstrap_error(&config, false, true, true).is_none());
+        assert!(controller_bootstrap_error(&config, true, false, true).is_none());
     }
 
     #[test]

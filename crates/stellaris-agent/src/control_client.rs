@@ -499,6 +499,11 @@ fn apply_members(
     for member in members {
         if let Ok(node) = member.node_id.parse::<NodeId>() {
             known.insert(node);
+            if let Some(transport) = transport {
+                // A member that is present again (or whose revision changed)
+                // must be allowed to reconnect after a prior revoke.
+                transport.allow_peer(node);
+            }
             let previous = state.revision(node);
             state.observe_revision(node, member.revision);
             if node != state.node_id && member.revision > previous {

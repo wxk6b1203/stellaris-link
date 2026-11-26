@@ -1140,6 +1140,20 @@ impl Config {
                 "transport.relay_urls is only valid with relay_mode = custom or auto".into(),
             ));
         }
+        let mut seen_relays = HashSet::new();
+        for raw in &self.transport.relay_urls {
+            let normalized = raw.trim().trim_end_matches('/');
+            if normalized.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "transport.relay_urls must not contain empty entries".into(),
+                ));
+            }
+            if !seen_relays.insert(normalized) {
+                return Err(ConfigError::Invalid(format!(
+                    "transport.relay_urls contains a duplicate relay URL: {raw}"
+                )));
+            }
+        }
         if !self.transport.listen {
             return Err(ConfigError::Invalid(
                 "transport.listen=false is not supported (the transport always listens)".into(),
@@ -1489,6 +1503,22 @@ cidr = "10.7.0.0/16"
         assert!(Config::from_toml(&custom).is_ok());
         let disabled = format!("{base}relay_mode = \"disabled\"\n");
         assert!(Config::from_toml(&disabled).is_ok());
+    }
+
+    #[test]
+    fn duplicate_relay_urls_are_rejected() {
+        let toml = r#"
+[node]
+name = "a"
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+[transport]
+relay_mode = "custom"
+relay_urls = ["https://relay.example.com", "https://relay.example.com/"]
+"#;
+        let error = Config::from_toml(toml).unwrap_err().to_string();
+        assert!(error.contains("duplicate relay URL"), "{error}");
     }
 
     #[test]

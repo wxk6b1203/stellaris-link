@@ -84,8 +84,20 @@ pub struct IrohTransport {
     inbound_tx: mpsc::Sender<InboundPacket>,
     control_tx: Option<mpsc::Sender<ControlEvent>>,
     conns: Arc<RwLock<HashMap<NodeId, PeerLinks>>>,
+    /// Peers that were explicitly revoked; connect/accept loops stay idle
+    /// (without reconnect churn) until the controller re-authorizes them.
+    blocked: Arc<RwLock<HashSet<NodeId>>>,
     /// Configured relays tried when reconnecting to a peer, in order.
     relay_fallbacks: Vec<RelayUrl>,
+}
+
+fn standby_listen_port(port: Option<u16>) -> Option<u16> {
+    match port {
+        // 0 means "OS-assigned"; keep it ephemeral instead of trying port 1.
+        Some(0) => Some(0),
+        Some(port) => port.checked_add(1),
+        None => None,
+    }
 }
 
 async fn build_endpoint(
@@ -145,13 +157,13 @@ impl IrohTransport {
             stellaris_types::RelayModeConfig::N0 => false,
             stellaris_types::RelayModeConfig::Auto => config.transport.disable_relay,
         };
-        let relay_urls: Vec<RelayUrl> = config
-            .transport
-            .relay_urls
-            .iter()
-            .map(|s| s.parse())
-            .collect::<Result<_, _>>()
-            .context("parse relay_urls")?;
+        let mut relay_urls: Vec<RelayUrl> = Vec::new();
+        for raw in &config.transport.relay_urls {
+            let url: RelayUrl = raw.parse().context("parse relay_urls")?;
+            if !relay_urls.contains(&url) {
+                relay_urls.push(url);
+            }
+        }
         // Two endpoints with the same identity are needed to pin one QUIC
         // connection to each relay; a single endpoint may use either relay for
         // both connections.
@@ -165,10 +177,7 @@ impl IrohTransport {
         )
         .await?;
         let standby_endpoint = if dual {
-            let port = config
-                .transport
-                .listen_port
-                .and_then(|port| port.checked_add(1));
+            let port = standby_listen_port(config.transport.listen_port);
             Some(build_endpoint(&config, &secret, Some(&relay_urls[1]), false, port).await?)
         } else {
             None
@@ -205,6 +214,7 @@ impl IrohTransport {
             inbound_tx: inbound_tx.clone(),
             control_tx: control_tx.clone(),
             conns: Arc::new(RwLock::new(HashMap::new())),
+            blocked: Arc::new(RwLock::new(HashSet::new())),
             relay_fallbacks: config
                 .transport
                 .relay_urls
@@ -240,6 +250,11 @@ impl IrohTransport {
                     };
                     let remote = conn.remote_id();
                     let node = NodeId::new(*remote.as_bytes());
+                    if transport.is_blocked(node) {
+                        debug!(peer = %node.short(), "rejecting blocked inbound connection");
+                        conn.close(3u8.into(), b"revoked");
+                        continue;
+                    }
                     if accept_config.network.auth.mode == AuthMode::Static
                         && !transport.static_keys.contains(&node)
                     {
@@ -346,6 +361,13 @@ impl IrohTransport {
             debug!(peer = %node.short(), "ignoring dynamic peer outside the static allowlist");
             return false;
         }
+        if self.is_blocked(node) && !force {
+            debug!(peer = %node.short(), "ignoring blocked peer");
+            return false;
+        }
+        if force {
+            self.allow_peer(node);
+        }
         self.peers.upsert(crate::PeerState {
             node_id: node,
             name: peer.name.clone(),
@@ -398,12 +420,31 @@ impl IrohTransport {
         true
     }
 
+    fn is_blocked(&self, node: NodeId) -> bool {
+        self.blocked
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&node)
+    }
+
+    /// Allow a controller-authorized peer to reconnect after a previous revoke.
+    pub fn allow_peer(&self, node: NodeId) {
+        self.blocked
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node);
+    }
+
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
     }
 
     /// Force-close every link to a peer (used when the controller revokes it).
     pub fn close_peer(&self, node: NodeId) {
+        self.blocked
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(node);
         let links = self
             .conns
             .write()
@@ -766,12 +807,20 @@ async fn connect_loop(
     }
     let addr = EndpointAddr::from_parts(remote, addrs);
     loop {
+        if transport.is_blocked(node) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
         if transport.has_role(node, role) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
         match endpoint.connect(addr.clone(), DATA_ALPN).await {
             Ok(conn) => {
+                if transport.is_blocked(node) {
+                    conn.close(3u8.into(), b"revoked");
+                    continue;
+                }
                 if transport.config.network.auth.mode == AuthMode::Controller {
                     let credential = transport.state.credential();
                     let auth = tokio::time::timeout(
@@ -800,6 +849,10 @@ async fn connect_loop(
                             continue;
                         }
                     }
+                }
+                if transport.is_blocked(node) {
+                    conn.close(3u8.into(), b"revoked");
+                    continue;
                 }
                 if !transport.insert_conn(node, conn.clone(), role, relay.clone()) {
                     debug!(peer = %peer.name, ?role, "link role already filled; closing");
@@ -1551,6 +1604,14 @@ cidr = "10.8.0.0/16"
         drop(r2);
     }
 
+    #[test]
+    fn standby_port_zero_stays_ephemeral() {
+        assert_eq!(standby_listen_port(Some(0)), Some(0));
+        assert_eq!(standby_listen_port(Some(5901)), Some(5902));
+        assert_eq!(standby_listen_port(None), None);
+        assert_eq!(standby_listen_port(Some(u16::MAX)), None);
+    }
+
     #[tokio::test]
     async fn dual_relay_links_fail_over_when_the_active_connection_closes() {
         let (relay1, url1) = start_relay().await;
@@ -1688,6 +1749,35 @@ cidr = "10.8.0.0/16"
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(switched.is_some(), "standby link should take over");
+
+        // A revoked peer must not churn while blocked, but must be able to
+        // reconnect when the controller authorizes it again.
+        a.close_peer(b_id);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            a.conns
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&b_id)
+                .is_none(),
+            "revoked peer should have no live links"
+        );
+        a.allow_peer(b_id);
+        let mut restored = 0;
+        for _ in 0..100 {
+            restored = a
+                .conns
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&b_id)
+                .map(|peer| peer.links.len())
+                .unwrap_or(0);
+            if restored >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(restored, 2, "re-authorized peer should reconnect");
         a.endpoint.close().await;
         b.endpoint.close().await;
         relay1.shutdown().await.unwrap();

@@ -34,9 +34,12 @@ pub struct VerifyArgs {
     /// Node id the credential must be bound to.
     #[arg(long)]
     pub node: String,
-    /// Trusted issuer NodeId (default: the credential's issuer).
-    #[arg(long)]
+    /// Trusted issuer NodeId. Required unless --allow-untrusted-issuer.
+    #[arg(long, conflicts_with = "allow_untrusted_issuer")]
     pub issuer: Option<String>,
+    /// Only check signature/claims; do not assert that the issuer is trusted.
+    #[arg(long)]
+    pub allow_untrusted_issuer: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -109,16 +112,25 @@ fn verify(args: VerifyArgs) -> anyhow::Result<()> {
         .node
         .parse()
         .with_context(|| format!("invalid node id {:?}", args.node))?;
-    let trusted = match &args.issuer {
-        Some(issuer) => issuer
-            .parse::<NodeId>()
-            .with_context(|| format!("invalid issuer {issuer:?}"))?,
-        None => signed.issuer,
+    let expected_issuer = match (&args.issuer, args.allow_untrusted_issuer) {
+        (Some(issuer), false) => Some(
+            issuer
+                .parse::<NodeId>()
+                .with_context(|| format!("invalid issuer {issuer:?}"))?,
+        ),
+        (None, true) => None,
+        (None, false) => bail!(
+            "pass --issuer <trusted-controller-node-id> to verify issuer trust, or --allow-untrusted-issuer for an integrity-only check"
+        ),
+        (Some(_), true) => bail!("--issuer and --allow-untrusted-issuer are mutually exclusive"),
     };
+    let issuer_key = expected_issuer.unwrap_or(signed.issuer);
+    let trusted = expected_issuer.is_some();
     let now = credential_now();
     let summary = |valid: bool, error: Option<String>| {
         serde_json::json!({
             "valid": valid,
+            "trusted": trusted && valid,
             "error": error,
             "issuer": signed.issuer.to_string(),
             "network": signed.credential.network,
@@ -132,8 +144,13 @@ fn verify(args: VerifyArgs) -> anyhow::Result<()> {
             "now": now,
         })
     };
-    match signed.verify(&network, node, &[trusted], 0, now) {
+    match signed.verify(&network, node, &[issuer_key], 0, now) {
         Ok(_) => {
+            if expected_issuer.is_none() {
+                eprintln!(
+                    "warning: issuer trust was not checked; pass --issuer for a trusted verification"
+                );
+            }
             println!("{}", serde_json::to_string_pretty(&summary(true, None))?);
             Ok(())
         }
@@ -379,6 +396,36 @@ mod tests {
     }
 
     #[test]
+    fn verify_requires_trusted_issuer_or_explicit_opt_out() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-cli-verify-trust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("identity.key"), [7u8; 32]).unwrap();
+        let mut args = test_args(&dir);
+        args.issued_at = credential_now();
+        let network = args.network.clone();
+        let node = args.node.clone();
+        let path = args.out.clone();
+        issue(args).unwrap();
+        let signed: SignedCredential =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let run = |issuer: Option<String>, allow: bool| {
+            verify(VerifyArgs {
+                file: path.clone(),
+                network: network.clone(),
+                node: node.clone(),
+                issuer,
+                allow_untrusted_issuer: allow,
+            })
+        };
+        assert!(run(None, false).is_err(), "issuer trust must be explicit");
+        assert!(run(Some(NodeId::new([1u8; 32]).to_string()), false).is_err());
+        assert!(run(Some(signed.issuer.to_string()), false).is_ok());
+        assert!(run(None, true).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn verifies_a_file_and_reports_expiry() {
         let dir = std::env::temp_dir().join(format!("stellaris-cli-verify-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -390,11 +437,14 @@ mod tests {
         let node = args.node.clone();
         let path = args.out.clone();
         issue(args).unwrap();
+        let signed: SignedCredential =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         verify(VerifyArgs {
             file: path.clone(),
             network: network.clone(),
             node: node.clone(),
-            issuer: None,
+            issuer: Some(signed.issuer.to_string()),
+            allow_untrusted_issuer: false,
         })
         .unwrap();
 
@@ -408,7 +458,8 @@ mod tests {
                 file: dir.join("expired.json").display().to_string(),
                 network,
                 node,
-                issuer: None,
+                issuer: Some(signed.issuer.to_string()),
+                allow_untrusted_issuer: false,
             })
             .is_err()
         );

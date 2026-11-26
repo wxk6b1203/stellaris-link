@@ -1,5 +1,7 @@
 //! Controller administration over the control HTTP API.
 
+use std::time::Duration;
+
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use reqwest::{Method, Response};
@@ -166,7 +168,10 @@ struct Client {
 impl Client {
     fn new(conn: &ControllerConn) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base: conn.url.trim_end_matches('/').to_string(),
             admin: conn.admin_secret.clone(),
         }

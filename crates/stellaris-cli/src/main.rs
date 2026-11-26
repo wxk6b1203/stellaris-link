@@ -378,6 +378,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_credential_verify_trust_flags() {
+        let cli = parse(&[
+            "stellaris",
+            "credential",
+            "verify",
+            "--file",
+            "/tmp/credential.json",
+            "--network",
+            "00000000-0000-0000-0000-000000000001",
+            "--node",
+            "0202020202020202020202020202020202020202020202020202020202020202",
+            "--allow-untrusted-issuer",
+        ]);
+        match cli.cmd {
+            Command::Credential {
+                cmd: credential_cmd::CredentialCmd::Verify(args),
+            } => {
+                assert!(args.issuer.is_none());
+                assert!(args.allow_untrusted_issuer);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_offline_credential_issue() {
         let cli = parse(&[
             "stellaris",

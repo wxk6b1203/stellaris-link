@@ -1927,6 +1927,13 @@ async fn reassign_address(
             Err(error) => return (StatusCode::CONFLICT, error).into_response(),
         },
     };
+    if old == Some(target) {
+        return (
+            StatusCode::CONFLICT,
+            "address is already assigned to this member",
+        )
+            .into_response();
+    }
     if let Err((code, message)) = state
         .commit_command(ControllerCommand::ReassignAddress {
             node,
@@ -2032,7 +2039,11 @@ async fn readyz(State(state): State<ControllerState>) -> Response {
     let ready = state
         .raft
         .as_ref()
-        .map(|raft| raft.metrics().borrow_watched().running_state.is_ok())
+        .map(|raft| {
+            let watch = raft.metrics();
+            let metrics = watch.borrow_watched();
+            metrics.running_state.is_ok() && metrics.current_leader.is_some()
+        })
         .unwrap_or(true);
     if ready {
         (StatusCode::OK, "ready").into_response()
@@ -4862,6 +4873,21 @@ node_id = "0101010101010101010101010101010101010101010101010101010101010101""#,
         let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(body["old"], "10.20.0.1");
         assert_eq!(body["new"], "10.20.0.9");
+        // Reassigning the current address is a no-op and must not report OK.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/ipam/leases/{node}/reassign"))
+                    .header("x-stellaris-secret", "admin-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"ip": "10.20.0.9"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let response = app
             .clone()
             .oneshot(

@@ -152,10 +152,14 @@ controller_keys = ["<controller-node-id>"]   # 用于验证所有 peer 的凭据
 
   ```bash
   stellaris credential verify --file state/credential.json \
-    --network <network-uuid> --node <node-id> [--issuer <controller-node-id>]
+    --network <network-uuid> --node <node-id> --issuer <controller-node-id>
   ```
 
-  输出 `{valid, issuer, overlay_ip, revision, not_after, now}`；过期/篡改返回非零。
+  输出 `{valid, trusted, issuer, overlay_ip, revision, not_after, now}`；过期/篡改返回非零。
+  `--issuer` 是 controller 的 NodeId（本地信任锚），不是购买的 X.509 证书；
+  **自签/自建 controller 完全支持**，信任锚就是配置的 controller 公钥，不需要 CA。
+  若只想检查签名/声明而不声明信任，显式使用 `--allow-untrusted-issuer`
+  （输出 `trusted=false`）。
 - 续期/轮换就是重新执行 `credential issue`，**revision 必须大于旧值**，然后替换
   `credential.json` 并重启成员。离线模式没有自动撤销；需要撤销时用 controller 的
   `stellaris controller ... members revoke <node>`。

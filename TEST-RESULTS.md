@@ -439,7 +439,7 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **202 passed**（agent 142 + cli 10 + types 28 + 其余 22；relay/spike 测试 ignored） |
+| 全量测试 | `cargo test --workspace` | **207 passed**（agent 144 + cli 12 + types 29 + 其余 22；relay/spike 测试 ignored） |
 | Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
 | Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
 | 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
@@ -607,7 +607,8 @@ stellaris credential issue --controller-key controller.key \
 | `controller ipam pools list/create` | ✅ 本机 controller 创建 `10.88.1.0/24` 池成功 |
 | 公网 controller | ✅ 深圳 `120.77.233.189:5801` 上 status/pools list/create 从本机 CLI 成功 |
 | `credential verify` | ✅ 有效凭据通过；过期凭据返回非零并输出 `valid=false` |
-| 单测 | ✅ CLI 10 个（issue/verify/覆盖/controller 参数） |
+| issuer 信任 | ✅ 缺省无 `--issuer` 报错；错误 issuer 被拒；`--allow-untrusted-issuer` 仅做完整性检查并输出 `trusted=false` |
+| 单测 | ✅ CLI 12 个（issue/verify/信任/覆盖/controller 参数） |
 
 ### 3.23 2026-11-26 NAT 成员 + IPAM 热重配（真实主机）
 
@@ -622,7 +623,19 @@ stellaris credential issue --controller-key controller.key \
 | 数据面 | ✅ 不重启 agent，TUN 变为 .9；cloud→.9 0% loss；cloud→旧 .2 100% loss |
 | 脚本 | 手工编排；controller/agent 使用当前 release 二进制 |
 
-### 3.24 仍未验证
+### 3.24 2026-11-27 复核修复
+
+| 项 | 结果 |
+|---|---|
+| `credential verify` 信任语义 | ✅ 无 `--issuer` 报错；错误 issuer 拒绝；`--allow-untrusted-issuer` 仅完整性检查并输出 `trusted=false` |
+| controller 认证启动 | ✅ 无 URL/无 credential 且需要 transport 时启动失败；API-only 模式仍允许 |
+| 撤销后重连 | ✅ `close_peer` 进入 blocked 状态，连接不再重建；`allow_peer`/controller 重新授权后恢复两条 link |
+| 同地址 reassign | ✅ 返回 409，不再假成功 |
+| 双 relay 边界 | ✅ `listen_port=0` 不再尝试端口 1；重复 relay URL 在配置校验/启动时去重 |
+| 编排健康 | ✅ `/readyz` 要求 Raft 有 leader；controller CLI 增加 30s HTTP 超时 |
+| 回归 | ✅ 207 passed（agent 144 + cli 12 + types 29 + 其余 22）；clippy 干净 |
+
+### 3.25 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot

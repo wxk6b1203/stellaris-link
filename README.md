@@ -193,7 +193,8 @@ url = "http://10.0.0.1:7800"
 secret = "change-me"
 ```
 
-controller 集群内部通过 `raft_peers` + mTLS 复制。旧 `control.urls` active-active fanout 已移除；配置中出现会直接报错。无 controller 的离线部署可省略 `control.url`，改用离线签发的 `credential.json`。
+controller 集群内部通过 `raft_peers` + mTLS 复制。旧 `control.urls` active-active fanout 已移除；配置中出现会直接报错。无 controller 的离线部署可省略 `control.url`，改用离线签发的 `credential.json`；
+`mode = "controller"` 且两者都没有时，启用 transport 的启动会直接失败（API-only 模式除外）。
 
 选举超时是正式配置项，默认值按**跨地域**部署取值（深圳/上海/成都三地滚动重启验证通过的值）：
 
@@ -774,8 +775,11 @@ stellaris controller ... ipam reservations add <node> --ip 10.7.0.50 --note vip
 输出统一为 JSON，便于脚本/管道。`/v1/model` 和 `/v1/status` 现在同时接受 admin
 与 member secret，方便运维只持有一把 admin secret。
 
-离线凭据可用 `stellaris credential verify --file ... --network ... --node ...`
-在无 controller 的环境校验签名/网络绑定/过期；重新签发时递增 `--revision`。
+离线凭据可用 `stellaris credential verify --file ... --network ... --node ...
+--issuer <controller-node-id>` 在无 controller 的环境校验签名/网络绑定/过期；
+`--issuer` 是**本地信任的 controller NodeId**（不是购买的 X.509 证书）；只想做
+完整性检查时显式加 `--allow-untrusted-issuer`。这里也支持自签身份/自建 controller：
+信任锚就是配置的 controller 公钥，不需要 CA 或购买证书。重新签发时递增 `--revision`。
 
 ## 已知限制
 
