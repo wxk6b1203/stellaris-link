@@ -753,6 +753,30 @@ last_applied。示例：
 curl -H "x-stellaris-secret: $SECRET" http://controller:5801/metrics
 ```
 
+### 16. 控制器运维 CLI
+
+`stellaris` 通过 control HTTP 管理 controller（`--url`/`STELLARIS_CONTROLLER`，
+`--admin-secret`/`STELLARIS_ADMIN_SECRET`）：
+
+```bash
+stellaris controller --url http://ctrl:5801 --admin-secret "$ADMIN" status
+stellaris controller --url http://ctrl:5801 --admin-secret "$ADMIN" admissions list
+stellaris controller ... admissions approve <node> --prefix 192.168.50.0/24 --capability member
+stellaris controller ... members list
+stellaris controller ... members revoke <node>
+stellaris controller ... ipam pools list
+stellaris controller ... ipam pools create --id p --cidr 10.7.0.0/16 --range 10.7.0.10-10.7.0.200 --lease-secs 3600
+stellaris controller ... ipam leases list
+stellaris controller ... ipam leases reassign <node> --ip 10.7.0.9
+stellaris controller ... ipam reservations add <node> --ip 10.7.0.50 --note vip
+```
+
+输出统一为 JSON，便于脚本/管道。`/v1/model` 和 `/v1/status` 现在同时接受 admin
+与 member secret，方便运维只持有一把 admin secret。
+
+离线凭据可用 `stellaris credential verify --file ... --network ... --node ...`
+在无 controller 的环境校验签名/网络绑定/过期；重新签发时递增 `--revision`。
+
 ## 已知限制
 
 - controller 已完成 openraft quorum/leader election/mTLS/snapshot/failover；在线 member 入口仍是单 URL（可指向 LB/任一 controller），离线签发模式不需要 URL。旧 fanout 已移除。
@@ -769,7 +793,7 @@ curl -H "x-stellaris-secret: $SECRET" http://controller:5801/metrics
 - **IPAM 地址热切换**：`POST /v1/ipam/leases/{node}/reassign` 可在不重启 agent 的情况下
   切换 TUN 地址（Linux，旧地址隔离、切换瞬间在途 TCP 会断）；静态 `overlay_ip` 不参与。
   详见 [IPAM-RECONFIG.md](IPAM-RECONFIG.md)。
-- relay 建连、direct→relay 切换已测；relay 故障后会在旧连接关闭时经 `transport.relay_urls` 列表重连（实测约 60s，非秒级切换；多 relay 同时承载未实现）。生产建议自建 relay 并监控（见 AUDIT.md）。
+- relay 双连接热备初版：`relay_urls` ≥2 时每 peer 两条 relay link（一主一备），active 故障可立即切换，heartbeat 4s 清理死链；仍是 active/standby，不做带宽聚合，真 multipath 未实现。生产建议自建 relay 并监控（见 [RELAY-FAILOVER.md](RELAY-FAILOVER.md)）。
 - 2026-11-24 完成静态审计（[AUDIT.md](AUDIT.md)）并修复 P0：LSA 签名、transit 强制、OS 路由防护、iroh 走 Raft、Raft RPC 必须配 `raft_secret` 且有超时、admin secret、routes/LSA TTL/epoch 入 Raft、动态 membership。2026-11-25 进一步把入网收敛为 controller 签名的成员凭据。仍没有第三方安全审计，MVP 仅用于开发/实验。
 - 2026-11-25 配置变更（不兼容）：删除 `network.auth.secret`、`network.auth.allowed_nodes`、`control.join_token(s)`、`control.require_join_signature`、`control.admission`、`control.request_admission`；新增 `control.credential_ttl_secs`。`network.auth.mode` 只剩 `none`（仅实验）和 `controller`，配 `controller` 时必须给 `control.controller_keys`；`control.endpoint_id`/`control.url` 在线模式必填，离线签发可省略。`POST /v1/join` 由 `POST /v1/enroll` 取代，`GET /v1/status` 不再有 `join_config_hash`。
 - 之前新增的配置仍然有效：`control.admin_secret`、`control.lsa_ttl_secs`、`dataplane.allow_default_route`、`dataplane.replace_existing_routes`、`transport.disable_discovery`（测试用：强制 relay-only）、`transport.allow_unauthenticated_discovery`（仅隔离实验）、`transport.relay_mode`（auto/n0/custom/disabled，`custom` 必须带 `relay_urls`）、`acl.deny_action`；`transport.listen=false`、`routing.rib_mode!=full`、`set_path_hint` 会直接报错。子网网关/exit 转发需要给对应成员 grant `capabilities = ["transit"]`。MeshHeader 的 `network_hash` 是 SHA-256 前 32 位，混合版本节点必须一起升级。

@@ -167,9 +167,38 @@ connect 超时/重试 + 重新握手。
 - [ ] Phase 0：relay/路径指标（active、switch_total、switch_seconds、rtt、lost）
 - [ ] Phase 1：relay 健康探测（1s/3 次失败）与恢复
 - [ ] Phase 1：并行竞速 + 候选轮换 + 优雅 drain
-- [ ] Phase 1：本地 2 relay 故障测试，验收 p95 < 5s
+- [x] Phase 1：2 relay 故障测试，active link 关闭/relay kill 可切换（200ms 采样 0 丢包）
 - [x] Spike：iroh multipath 双 relay 路径/自动迁移/MTU（2026-11-26 完成，结论见 §5.1）
 - [x] 决策：C（双连接热备）；D 需要上游 multipath API（记录于 §5.1）
-- [ ] Phase 2：实现选中的方案，验收 p95 < 1s/丢包 ≤ 个位数
+- [x] Phase 2（初版）：双 endpoint + 双 link 热备；本地/真实主机 failover 验证（2026-11-26）
+- [ ] Phase 2（增强）：heartbeat 降到亚秒级、relay 舰队与容量监控
 - [ ] Phase 3：3+ relay 舰队、controller 下发、监控/容量
 - [ ] 真实 NAT 主机 + relay 故障回归，更新 TEST-RESULTS
+
+---
+
+## 9. 实现状态（2026-11-26，双连接热备初版）
+
+已实现：
+
+- `transport.relay_urls` 至少 2 个时，创建**两个 iroh endpoint**（同一 NodeId/secret，
+  分别只绑定一个 relay），从而强制每条 QUIC 连接走不同 relay；只用一个 endpoint 时
+  iroh 可能让两条连接选到同一个 relay。
+- 每个 peer 两条 link（Primary/Standby）：数值较小的 NodeId 负责主动拨号，另一侧只
+  接受，避免双方互拨产生重复连接后被角色去重逻辑互相关闭。
+- 数据只走 active link；发送失败时立即尝试另一条并切换 active。
+- 每条 link 独立 `link_state` 控制流/心跳；心跳 1s、超时 4s，超时通过
+  `Transport::close_link` 关闭不健康 link，连接管理器立即提升另一条。
+- grant 只在最后一条 link 关闭时 drop；revoke 关闭全部 link。
+- `PeerState.path_addr` 现在会显示 relay URL（例如 `http://host:5891/`），便于观测。
+
+验收/已知限制：
+
+- 本地确定性测试 `dual_relay_links_fail_over_when_the_active_connection_closes`：
+  两条 relay link 建立，关闭 active 后 standby 接管；通过。
+- 真实三机（深圳 relay 主机 + 两台 agent，阻断 direct IPv4/IPv6）：
+  两个 link 分别走 5890/5891；kill 当前 relay 后 active 切到另一 relay，
+  200ms 采样下 ping 无丢失（send fallback 立即切换），heartbeat 随后清理死链。
+- **检测不是亚秒级**：控制面 heartbeat 4s 超时；数据面发送失败可立即切换。
+- 仍是 active/standby，不做带宽聚合；真 multipath 仍需上游支持。
+- 需要为 standby endpoint 预留 `listen_port + 1`；端口范围要规划。

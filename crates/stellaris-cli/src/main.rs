@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use reqwest::{Client, Method, Response};
 use serde_json::{Value, json};
 
+mod controller_cmd;
 mod credential_cmd;
 
 #[derive(Debug, Parser)]
@@ -32,10 +33,17 @@ enum Command {
         #[command(subcommand)]
         cmd: RouteCmd,
     },
-    /// Membership credential commands (offline issuance).
+    /// Membership credential commands (offline issuance/verification).
     Credential {
         #[command(subcommand)]
         cmd: credential_cmd::CredentialCmd,
+    },
+    /// Controller administration (status/admissions/members/IPAM).
+    Controller {
+        #[command(flatten)]
+        conn: controller_cmd::ControllerConn,
+        #[command(subcommand)]
+        cmd: controller_cmd::ControllerCmd,
     },
 }
 
@@ -173,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Credential { cmd } => credential_cmd::run(cmd)?,
+        Command::Controller { conn, cmd } => controller_cmd::run(conn, cmd).await?,
         Command::Route { cmd } => match cmd {
             RouteCmd::List { view } => {
                 let v = api
@@ -396,6 +405,42 @@ mod tests {
                 assert_eq!(args.overlay_ip, Some("10.7.0.2".parse().unwrap()));
                 assert_eq!(args.prefixes.len(), 1);
                 assert_eq!(args.ttl_secs, 600);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_controller_admin_commands() {
+        let cli = parse(&[
+            "stellaris",
+            "controller",
+            "--url",
+            "http://127.0.0.1:5801",
+            "--admin-secret",
+            "admin",
+            "ipam",
+            "leases",
+            "reassign",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "--ip",
+            "10.7.0.9",
+        ]);
+        match cli.cmd {
+            Command::Controller {
+                conn,
+                cmd:
+                    controller_cmd::ControllerCmd::Ipam {
+                        cmd:
+                            controller_cmd::IpamCmd::Leases {
+                                cmd: controller_cmd::LeaseCmd::Reassign { node, ip, .. },
+                            },
+                    },
+            } => {
+                assert_eq!(conn.url, "http://127.0.0.1:5801");
+                assert_eq!(conn.admin_secret.as_deref(), Some("admin"));
+                assert!(node.starts_with("0101"));
+                assert_eq!(ip.as_deref(), Some("10.7.0.9"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

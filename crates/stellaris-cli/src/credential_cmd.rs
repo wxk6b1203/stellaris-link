@@ -19,6 +19,24 @@ use stellaris_types::{NetworkId, NodeId};
 pub enum CredentialCmd {
     /// Issue a controller-signed credential offline.
     Issue(IssueArgs),
+    /// Verify a credential file without contacting a controller.
+    Verify(VerifyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    /// Credential JSON file, or `-` for stdin.
+    #[arg(long, default_value = "-")]
+    pub file: String,
+    /// Network UUID the credential must be valid for.
+    #[arg(long)]
+    pub network: String,
+    /// Node id the credential must be bound to.
+    #[arg(long)]
+    pub node: String,
+    /// Trusted issuer NodeId (default: the credential's issuer).
+    #[arg(long)]
+    pub issuer: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -69,7 +87,71 @@ pub struct IssueArgs {
 pub fn run(cmd: CredentialCmd) -> anyhow::Result<()> {
     match cmd {
         CredentialCmd::Issue(args) => issue(args),
+        CredentialCmd::Verify(args) => verify(args),
     }
+}
+
+fn verify(args: VerifyArgs) -> anyhow::Result<()> {
+    let bytes = if args.file == "-" {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut bytes)?;
+        bytes
+    } else {
+        std::fs::read(&args.file).with_context(|| format!("read credential {}", args.file))?
+    };
+    let signed: SignedCredential = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse credential {}", args.file))?;
+    let network: NetworkId = args
+        .network
+        .parse()
+        .with_context(|| format!("invalid network id {:?}", args.network))?;
+    let node: NodeId = args
+        .node
+        .parse()
+        .with_context(|| format!("invalid node id {:?}", args.node))?;
+    let trusted = match &args.issuer {
+        Some(issuer) => issuer
+            .parse::<NodeId>()
+            .with_context(|| format!("invalid issuer {issuer:?}"))?,
+        None => signed.issuer,
+    };
+    let now = credential_now();
+    let summary = |valid: bool, error: Option<String>| {
+        serde_json::json!({
+            "valid": valid,
+            "error": error,
+            "issuer": signed.issuer.to_string(),
+            "network": signed.credential.network,
+            "node": signed.credential.node.to_string(),
+            "overlay_ip": signed.credential.overlay_ip.map(|ip| ip.to_string()),
+            "prefixes": signed.credential.prefixes.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            "capabilities": signed.credential.capabilities,
+            "revision": signed.credential.revision,
+            "issued_at": signed.credential.issued_at,
+            "not_after": signed.credential.not_after,
+            "now": now,
+        })
+    };
+    match signed.verify(&network, node, &[trusted], 0, now) {
+        Ok(_) => {
+            println!("{}", serde_json::to_string_pretty(&summary(true, None))?);
+            Ok(())
+        }
+        Err(error) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary(false, Some(error.to_string())))?
+            );
+            bail!("credential invalid: {error}");
+        }
+    }
+}
+
+fn credential_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn issue(args: IssueArgs) -> anyhow::Result<()> {
@@ -89,10 +171,7 @@ fn issue(args: IssueArgs) -> anyhow::Result<()> {
         .with_context(|| format!("invalid node id {:?}", args.node))?;
     let (secret, key_path) = controller_secret(&args)?;
     let issued_at = if args.issued_at == 0 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before the Unix epoch")?
-            .as_secs()
+        credential_now()
     } else {
         args.issued_at
     };
@@ -296,6 +375,43 @@ mod tests {
                 .to_bytes(),
         );
         assert_eq!(signed.issuer, expected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verifies_a_file_and_reports_expiry() {
+        let dir = std::env::temp_dir().join(format!("stellaris-cli-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("identity.key"), [7u8; 32]).unwrap();
+        let mut args = test_args(&dir);
+        args.issued_at = credential_now();
+        args.ttl_secs = 600;
+        let network = args.network.clone();
+        let node = args.node.clone();
+        let path = args.out.clone();
+        issue(args).unwrap();
+        verify(VerifyArgs {
+            file: path.clone(),
+            network: network.clone(),
+            node: node.clone(),
+            issuer: None,
+        })
+        .unwrap();
+
+        let mut expired = test_args(&dir);
+        expired.issued_at = credential_now().saturating_sub(1000);
+        expired.ttl_secs = 60;
+        expired.out = dir.join("expired.json").display().to_string();
+        issue(expired).unwrap();
+        assert!(
+            verify(VerifyArgs {
+                file: dir.join("expired.json").display().to_string(),
+                network,
+                node,
+                issuer: None,
+            })
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -117,7 +117,7 @@
 
 1. 真实 3 controller 滚动重启 snapshot 续传测试
 2. 传输层 multipath（需要新设计）
-3. 应用层 fragment reassembly
+3. ~~应用层 fragment reassembly~~（已完成）
 4. Docker/CI 回归
 
 ---
@@ -130,7 +130,7 @@ routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、snapshot/manifest f
 动态 membership 接口、配置 no-op、route TTL、QoS 校验、CLI/API/discovery 测试。
 
 下一步（按优先级）：
-1. relay 切换时延/多 relay：方案与 TODO 见 [RELAY-FAILOVER.md](RELAY-FAILOVER.md)。先做 Phase 0/1（检测+并行竞速），multipath 需 spike 后再决策。
+1. relay 双连接热备已完成初版（双 endpoint/双 link/heartbeat，真实三机验证）。剩余：亚秒级检测、relay 舰队、真 multipath（见 [RELAY-FAILOVER.md](RELAY-FAILOVER.md) §9）。
 2. 持续慢链路下 60s transfer TTL / 大快照续传。
 3. ~~大状态写入/追赶性能~~（2026-11-25 完成）：改为 8 MiB 分段追加日志 + `raft-state.json` 周期快照 + `raft-state.wal`；5.1k LSA 从 5m50s 降到 16.4s，重启 0.14s。
 4. 真 multipath、真实互联网 PTB（需要小 MTU 链路/可控路由器）、macOS NAT/Windows、磁盘满/慢 IO 注入。

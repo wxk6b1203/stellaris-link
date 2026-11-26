@@ -2002,7 +2002,7 @@ async fn allocate_address(
 }
 
 async fn status(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
-    if !state.authorized(&headers) {
+    if !state.admin_authorized(&headers) && !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let model = state.model_current().await;
@@ -2153,14 +2153,14 @@ async fn snapshot(
 }
 
 async fn model(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
-    if !state.authorized(&headers) {
+    if !state.admin_authorized(&headers) && !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(state.model_current().await).into_response()
 }
 
 async fn manifest(State(state): State<ControllerState>, headers: HeaderMap) -> Response {
-    if !state.authorized(&headers) {
+    if !state.admin_authorized(&headers) && !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     // Only the leader may sign a manifest: a stale follower would otherwise

@@ -439,7 +439,7 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **199 passed**（agent 141 + cli 8 + types 28 + 其余 22；relay failover 测试因 harness 问题 ignored） |
+| 全量测试 | `cargo test --workspace` | **202 passed**（agent 142 + cli 10 + types 28 + 其余 22；relay/spike 测试 ignored） |
 | Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
 | Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
 | 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
@@ -581,13 +581,45 @@ stellaris credential issue --controller-key controller.key \
 > 限制：离线模式无自动续签/撤销；过期后重新签发并重启；多节点需在 `[[peers]]` 写
 > `addrs`（没有 controller 时没有自动 discovery）。
 
-### 3.21 仍未验证
+### 3.21 2026-11-26 relay 双连接热备（真实三机）
+
+拓扑：深圳 `120.77.233.189` 跑两个 `iroh-relay`（5890/5891）；另两台深圳主机
+`47.107.226.187`/`47.112.100.19` 各一个 agent，IPv4/IPv6 direct 被 iptables 阻断，
+只允许 relay。agent 配置 `relay_urls=[R1,R2]`、`routing.link_state=true`。
+
+| 项 | 结果 |
+|---|---|
+| 双 link | ✅ 每台 agent 两条连接，分别 established 在 5890/5891 |
+| overlay | ✅ `10.99.0.1 ↔ 10.99.0.2` ping 1–2ms |
+| active relay | ✅ `/v1/peers` 的 `path_addr` 显示当前 relay URL（如 5891） |
+| kill active relay | ✅ 数据切到 5890；200ms 采样 ping 0 丢失；heartbeat 后续关闭死链 |
+| 单测 | ✅ `dual_relay_links_fail_over_when_the_active_connection_closes` |
+
+> 说明：send fallback 可立即切；heartbeat 超时 4s 负责清理死链。仍是 active/standby，
+> 不做带宽聚合。standby endpoint 需要 `listen_port+1`。
+
+### 3.22 2026-11-26 控制器运维 CLI / 离线凭据校验
+
+| 项 | 结果 |
+|---|---|
+| `controller status` | ✅ admin secret 读取 status（同时兼容 member secret） |
+| `controller members list` | ✅ `/v1/model` 对 admin 开放 |
+| `controller ipam pools list/create` | ✅ 本机 controller 创建 `10.88.1.0/24` 池成功 |
+| `credential verify` | ✅ 有效凭据通过；过期凭据返回非零并输出 `valid=false` |
+| 单测 | ✅ CLI 10 个（issue/verify/覆盖/controller 参数） |
+
+### 3.23 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot
 - 长时间 soak / 性能
 - 磁盘慢 IO / fsync 失败注入
-- 动态 Raft membership
+- relay 亚秒级检测 / 真 multipath（当前为 active/standby）
+- NAT↔NAT / 对称 NAT / relay-only 回退 / 弱网重绑定
+- 真实互联网 PTB / MTU<1500
+- macOS NAT、Windows
+- 多 controller 各自 key 的跨地域实测、CI 实跑
+- IPAM 热重配真实多主机与 TCP 行为（当前仅 Linux netns）
 
 ---
 

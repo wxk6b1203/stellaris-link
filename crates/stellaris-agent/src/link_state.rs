@@ -20,8 +20,8 @@ use crate::AgentState;
 use crate::transport::{ControlEvent, IrohTransport};
 
 const MAX_FRAME: usize = 1 << 20;
-const HEARTBEAT: Duration = Duration::from_secs(2);
-const PEER_TIMEOUT: Duration = Duration::from_secs(7);
+const HEARTBEAT: Duration = Duration::from_secs(1);
+const PEER_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -47,7 +47,7 @@ pub struct Service {
     /// Last accepted signature per origin, kept so peers can be re-synced.
     signatures: RwLock<HashMap<NodeId, String>>,
     tx: broadcast::Sender<(Lsa, String)>,
-    connections: RwLock<HashMap<NodeId, u32>>,
+    connections: RwLock<HashMap<NodeId, HashSet<usize>>>,
     seq: AtomicU64,
 }
 
@@ -92,15 +92,20 @@ pub async fn run(
 
     while let Some(event) = conn_rx.recv().await {
         match event {
-            ControlEvent::Up { node, conn } => {
+            ControlEvent::Up {
+                node,
+                conn,
+                stable_id,
+            } => {
                 let first = {
                     let mut connections = service
                         .connections
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
-                    let count = connections.entry(node).or_insert(0);
-                    *count += 1;
-                    *count == 1
+                    let links = connections.entry(node).or_default();
+                    let first = links.is_empty();
+                    links.insert(stable_id);
+                    first
                 };
                 if first {
                     service.publish_local();
@@ -110,11 +115,11 @@ pub async fn run(
                     if let Err(e) = peer_task(service.clone(), node, conn).await {
                         debug!(error = %e, "link-state peer task ended");
                     }
-                    service.on_down(node);
+                    service.on_down(node, stable_id);
                 });
             }
-            ControlEvent::Down { node } => {
-                service.on_down(node);
+            ControlEvent::Down { node, stable_id } => {
+                service.on_down(node, stable_id);
             }
         }
     }
@@ -182,12 +187,12 @@ impl Service {
         }
     }
 
-    fn on_down(&self, node: NodeId) {
+    fn on_down(&self, node: NodeId, stable_id: usize) {
         let removed = {
             let mut connections = self.connections.write().unwrap_or_else(|e| e.into_inner());
-            if let Some(count) = connections.get_mut(&node) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
+            if let Some(links) = connections.get_mut(&node) {
+                links.remove(&stable_id);
+                if links.is_empty() {
                     connections.remove(&node);
                     true
                 } else {
@@ -251,6 +256,7 @@ async fn peer_task(
     node: NodeId,
     conn: iroh::endpoint::Connection,
 ) -> anyhow::Result<()> {
+    let stable_id = conn.stable_id();
     info!(peer = %node.short(), "link-state control connection");
     let mut events = service.tx.subscribe();
     let (mut send, _recv) = conn.open_bi().await.context("open LSA stream")?;
@@ -295,7 +301,8 @@ async fn peer_task(
             _ = heartbeat.tick() => {
                 if last_pong.lock().await.elapsed() > PEER_TIMEOUT {
                     warn!(peer = %node.short(), "link-state peer heartbeat timeout");
-                    service.on_down(node);
+                    service.transport.close_link(node, stable_id);
+                    service.on_down(node, stable_id);
                     // Never close the shared transport connection here: it also
                     // carries dataplane datagrams. Just stop this control peer task.
                     break;
@@ -303,7 +310,8 @@ async fn peer_task(
                 ping_seq = ping_seq.wrapping_add(1);
                 let mut guard = send.lock().await;
                 if write_frame(&mut guard, &ControlFrame::Ping { seq: ping_seq }).await.is_err() {
-                    service.on_down(node);
+                    service.transport.close_link(node, stable_id);
+                    service.on_down(node, stable_id);
                     break;
                 }
             }
@@ -311,7 +319,8 @@ async fn peer_task(
                 Ok((lsa, signature)) => {
                     let mut guard = send.lock().await;
                     if write_frame(&mut guard, &ControlFrame::Lsa { lsa, signature }).await.is_err() {
-                        service.on_down(node);
+                        service.transport.close_link(node, stable_id);
+                        service.on_down(node, stable_id);
                         break;
                     }
                 }

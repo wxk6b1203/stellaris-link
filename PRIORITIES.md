@@ -1,5 +1,10 @@
 # 优先级评估与下一步路线
 
+> **2026-11-26 更新**：本文主体是 2026-11-23 的历史评估。当前已完成入网凭据、
+> controller 持久化、IPAM/热重配、metrics、离线凭据 CLI、relay 双连接热备；
+> 具体状态以 [TEST-RESULTS.md](TEST-RESULTS.md)、[RELAY-FAILOVER.md](RELAY-FAILOVER.md)、
+> [GAPS.md](GAPS.md) 为准。下方涉及 PSK/旧 join/分片重组未做的描述属于当时背景。
+
 > 版本：2026-11-23
 > 关联：[OPENRAFT-HA.md](OPENRAFT-HA.md)、[PLAN.md](PLAN.md)、[README.md](README.md)
 > 目的：在继续加功能前，先判断什么最该做、什么可以等。
@@ -13,7 +18,7 @@
 - controller 已迁移到 openraft：3 节点、HTTP Raft、mTLS、snapshot、leader failover、partition recovery、crash recovery、join config 一致性。
 - 真实 LAN 使用 macvlan 3 controller + mTLS 验证。
 - 数据面已覆盖 IPv4/IPv6、NAT44/66、public exit、MSS/MTU、ICMP PTB、fragment ACL、relay failover、per-class queue。
-- 真实物理三主机 controller/overlay/IPv6/roaming 已完成；剩余为完整 PMTUD 状态机、分片重组、强制 multipath、磁盘满故障。
+- 真实物理三主机 controller/overlay/IPv6/roaming 已完成；剩余为完整 PMTUD 状态机、relay 真 multipath、磁盘满/慢 IO、跨平台。
 
 ---
 

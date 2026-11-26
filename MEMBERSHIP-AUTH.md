@@ -148,6 +148,17 @@ controller_keys = ["<controller-node-id>"]   # 用于验证所有 peer 的凭据
   否则对端会按 replay fencing 拒绝。
 - `--network` 要匹配成员的 network id；若配置只写 `network.name`，id 是 UUIDv5，
   建议离线部署显式写 `network.id`。
+- 校验现有凭据（不需要 controller）：
+
+  ```bash
+  stellaris credential verify --file state/credential.json \
+    --network <network-uuid> --node <node-id> [--issuer <controller-node-id>]
+  ```
+
+  输出 `{valid, issuer, overlay_ip, revision, not_after, now}`；过期/篡改返回非零。
+- 续期/轮换就是重新执行 `credential issue`，**revision 必须大于旧值**，然后替换
+  `credential.json` 并重启成员。离线模式没有自动撤销；需要撤销时用 controller 的
+  `stellaris controller ... members revoke <node>`。
 - `ipam = "auto"` 仍需要 controller（地址分配是控制面行为）；离线模式使用静态
   `overlay_ip`。
 - 没有 controller 就没有自动 discovery；多节点离线部署要在每台 `[[peers]]` 里写

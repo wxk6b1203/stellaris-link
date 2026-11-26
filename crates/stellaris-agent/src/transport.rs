@@ -29,14 +29,51 @@ pub enum ControlEvent {
     Up {
         node: NodeId,
         conn: iroh::endpoint::Connection,
+        stable_id: usize,
     },
     Down {
         node: NodeId,
+        stable_id: usize,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkRole {
+    Primary,
+    Standby,
+}
+
+struct LinkState {
+    conn: iroh::endpoint::Connection,
+    stable_id: usize,
+    role: LinkRole,
+    relay: Option<RelayUrl>,
+}
+
+#[derive(Default)]
+struct PeerLinks {
+    links: Vec<LinkState>,
+    /// Index into `links` of the connection used for application datagrams.
+    active: Option<usize>,
+}
+
+impl PeerLinks {
+    fn active_conn(&self) -> Option<iroh::endpoint::Connection> {
+        self.active
+            .and_then(|index| self.links.get(index))
+            .map(|link| link.conn.clone())
+    }
+
+    fn active_stable_id(&self) -> Option<usize> {
+        self.active
+            .and_then(|index| self.links.get(index))
+            .map(|link| link.stable_id)
+    }
 }
 
 pub struct IrohTransport {
     endpoint: Endpoint,
+    standby_endpoint: Option<Endpoint>,
     config: Arc<Config>,
     state: crate::AgentState,
     controller_keys: Vec<NodeId>,
@@ -46,10 +83,49 @@ pub struct IrohTransport {
     peers: PeerRegistry,
     inbound_tx: mpsc::Sender<InboundPacket>,
     control_tx: Option<mpsc::Sender<ControlEvent>>,
-    conns: Arc<RwLock<HashMap<NodeId, iroh::endpoint::Connection>>>,
-    conn_ids: Arc<RwLock<HashMap<NodeId, usize>>>,
+    conns: Arc<RwLock<HashMap<NodeId, PeerLinks>>>,
     /// Configured relays tried when reconnecting to a peer, in order.
     relay_fallbacks: Vec<RelayUrl>,
+}
+
+async fn build_endpoint(
+    config: &Config,
+    secret: &SecretKey,
+    relay: Option<&RelayUrl>,
+    relay_disabled: bool,
+    port: Option<u16>,
+) -> anyhow::Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(secret.clone())
+        .alpns(vec![DATA_ALPN.to_vec()]);
+    if let Some(port) = port {
+        let ip = config
+            .transport
+            .bind_ip
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let addr = std::net::SocketAddr::new(ip, port);
+        builder = builder
+            .bind_addr(addr)
+            .with_context(|| format!("bind_addr {addr}"))?;
+    }
+    if config.transport.disable_discovery {
+        builder = builder.clear_address_lookup();
+    }
+    if relay_disabled {
+        builder = builder.relay_mode(RelayMode::Disabled);
+    } else if let Some(relay) = relay {
+        builder = builder.relay_mode(RelayMode::custom(vec![relay.clone()]));
+    } else if !config.transport.relay_urls.is_empty() {
+        let urls: Vec<RelayUrl> = config
+            .transport
+            .relay_urls
+            .iter()
+            .map(|s| s.parse())
+            .collect::<Result<_, _>>()
+            .context("parse relay_urls")?;
+        builder = builder.relay_mode(RelayMode::custom(urls));
+    }
+    builder.bind().await.context("bind iroh endpoint")
 }
 
 impl IrohTransport {
@@ -63,43 +139,45 @@ impl IrohTransport {
         control_tx: Option<mpsc::Sender<ControlEvent>>,
     ) -> anyhow::Result<Arc<Self>> {
         let secret = SecretKey::from_bytes(&secret);
-        let mut builder = Endpoint::builder(presets::N0)
-            .secret_key(secret)
-            .alpns(vec![DATA_ALPN.to_vec()]);
-        if let Some(port) = config.transport.listen_port {
-            let ip = config
-                .transport
-                .bind_ip
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-            let addr = std::net::SocketAddr::new(ip, port);
-            builder = builder
-                .bind_addr(addr)
-                .with_context(|| format!("bind_addr {addr}"))?;
-        }
-        if config.transport.disable_discovery {
-            builder = builder.clear_address_lookup();
-        }
         let relay_disabled = match config.transport.relay_mode {
             stellaris_types::RelayModeConfig::Disabled => true,
             stellaris_types::RelayModeConfig::Custom => false,
             stellaris_types::RelayModeConfig::N0 => false,
             stellaris_types::RelayModeConfig::Auto => config.transport.disable_relay,
         };
-        if relay_disabled {
-            builder = builder.relay_mode(RelayMode::Disabled);
-        } else if !config.transport.relay_urls.is_empty() {
-            let urls: Vec<RelayUrl> = config
+        let relay_urls: Vec<RelayUrl> = config
+            .transport
+            .relay_urls
+            .iter()
+            .map(|s| s.parse())
+            .collect::<Result<_, _>>()
+            .context("parse relay_urls")?;
+        // Two endpoints with the same identity are needed to pin one QUIC
+        // connection to each relay; a single endpoint may use either relay for
+        // both connections.
+        let dual = !relay_disabled && relay_urls.len() >= 2;
+        let endpoint = build_endpoint(
+            &config,
+            &secret,
+            if dual { Some(&relay_urls[0]) } else { None },
+            relay_disabled,
+            config.transport.listen_port,
+        )
+        .await?;
+        let standby_endpoint = if dual {
+            let port = config
                 .transport
-                .relay_urls
-                .iter()
-                .map(|s| s.parse())
-                .collect::<Result<_, _>>()
-                .context("parse relay_urls")?;
-            builder = builder.relay_mode(RelayMode::custom(urls));
-        }
-        let endpoint = builder.bind().await.context("bind iroh endpoint")?;
+                .listen_port
+                .and_then(|port| port.checked_add(1));
+            Some(build_endpoint(&config, &secret, Some(&relay_urls[1]), false, port).await?)
+        } else {
+            None
+        };
         if !relay_disabled {
             endpoint.online().await;
+            if let Some(standby) = &standby_endpoint {
+                standby.online().await;
+            }
         }
         let me = endpoint.id();
         info!(endpoint = %me, addr = ?endpoint.addr(), "iroh endpoint ready");
@@ -117,6 +195,7 @@ impl IrohTransport {
             .collect();
         let transport = Arc::new(Self {
             endpoint: endpoint.clone(),
+            standby_endpoint: standby_endpoint.clone(),
             config: config.clone(),
             state,
             controller_keys,
@@ -126,7 +205,6 @@ impl IrohTransport {
             inbound_tx: inbound_tx.clone(),
             control_tx: control_tx.clone(),
             conns: Arc::new(RwLock::new(HashMap::new())),
-            conn_ids: Arc::new(RwLock::new(HashMap::new())),
             relay_fallbacks: config
                 .transport
                 .relay_urls
@@ -135,15 +213,15 @@ impl IrohTransport {
                 .collect(),
         });
 
-        // Accept loop: authenticated iroh connection -> peer reader.
-        {
+        // Accept loop per endpoint: authenticated iroh connection -> peer reader.
+        for accept_endpoint in std::iter::once(endpoint.clone()).chain(standby_endpoint.clone()) {
             let transport = transport.clone();
             let accept_tx = inbound_tx.clone();
             let control_tx = control_tx.clone();
             let accept_config = config.clone();
             tokio::spawn(async move {
                 loop {
-                    let Some(incoming) = transport.endpoint.accept().await else {
+                    let Some(incoming) = accept_endpoint.accept().await else {
                         break;
                     };
                     let accepting = match incoming.accept() {
@@ -196,13 +274,24 @@ impl IrohTransport {
                             }
                         }
                     }
-                    info!(peer = %node.short(), "inbound iroh connection");
-                    transport.insert_conn(node, conn.clone());
+                    let Some(role) = transport.next_inbound_role(node) else {
+                        debug!(peer = %node.short(), "duplicate inbound link; closing");
+                        conn.close(5u8.into(), b"duplicate link");
+                        continue;
+                    };
+                    let relay = selected_relay(&conn);
+                    if !transport.insert_conn(node, conn.clone(), role, relay.clone()) {
+                        debug!(peer = %node.short(), "link role already filled; closing");
+                        conn.close(5u8.into(), b"duplicate link");
+                        continue;
+                    }
+                    info!(peer = %node.short(), ?role, ?relay, "inbound iroh connection");
                     if let Some(tx) = &control_tx {
                         let _ = tx
                             .send(ControlEvent::Up {
                                 node,
                                 conn: conn.clone(),
+                                stable_id: conn.stable_id(),
                             })
                             .await;
                     }
@@ -210,16 +299,21 @@ impl IrohTransport {
                     transport
                         .peers
                         .mark(&node, true, path, rtt, mtu, addr, path_count);
-                    spawn_path_watch(conn.clone(), node, transport.peers.clone());
                     let tx = accept_tx.clone();
                     let peers = transport.peers.clone();
                     let network_hash = network_hash(transport.network);
                     let down_tx = control_tx.clone();
+                    let transport_for_close = transport.clone();
+                    let stable_id = conn.stable_id();
                     tokio::spawn(async move {
                         read_loop(conn, node, network_hash, tx).await;
-                        peers.mark(&node, false, None, None, None, None, 0);
+                        let (empty, _) = transport_for_close.remove_conn(node, stable_id);
+                        if empty {
+                            peers.mark(&node, false, None, None, None, None, 0);
+                            transport_for_close.state.drop_grant(node);
+                        }
                         if let Some(tx) = &down_tx {
-                            let _ = tx.send(ControlEvent::Down { node }).await;
+                            let _ = tx.send(ControlEvent::Down { node, stable_id }).await;
                         }
                     });
                 }
@@ -267,12 +361,40 @@ impl IrohTransport {
             mtu: None,
             path_changes: 0,
         });
-        let transport = self.clone();
+        // Only the numerically smaller NodeId dials; the other side accepts.
+        // Both sides dialing would create two connections per role and the
+        // duplicate-role cleanup would tear down the peer's live connection.
+        let local = NodeId::new(*self.endpoint.id().as_bytes());
+        if local >= node {
+            debug!(peer = %node.short(), "peer will dial us");
+            return true;
+        }
         let tx = self.inbound_tx.clone();
         let control_tx = self.control_tx.clone();
-        tokio::spawn(async move {
-            connect_loop(transport, peer, tx, control_tx).await;
-        });
+        let plan = if self.standby_endpoint.is_some() && self.relay_fallbacks.len() >= 2 {
+            vec![
+                (LinkRole::Primary, Some(self.relay_fallbacks[0].clone())),
+                (LinkRole::Standby, Some(self.relay_fallbacks[1].clone())),
+            ]
+        } else {
+            link_plan(&peer, &self.relay_fallbacks)
+        };
+        for (role, relay) in plan {
+            let endpoint = match role {
+                LinkRole::Primary => self.endpoint.clone(),
+                LinkRole::Standby => match &self.standby_endpoint {
+                    Some(endpoint) => endpoint.clone(),
+                    None => continue,
+                },
+            };
+            let transport = self.clone();
+            let peer = peer.clone();
+            let tx = tx.clone();
+            let control_tx = control_tx.clone();
+            tokio::spawn(async move {
+                connect_loop(transport, peer, role, relay, endpoint, tx, control_tx).await;
+            });
+        }
         true
     }
 
@@ -280,74 +402,261 @@ impl IrohTransport {
         self.endpoint.id()
     }
 
-    /// Force-close a peer connection (used when the controller revokes it).
+    /// Force-close every link to a peer (used when the controller revokes it).
     pub fn close_peer(&self, node: NodeId) {
-        let conn = self
+        let links = self
             .conns
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&node);
-        if let Some(conn) = conn {
-            conn.close(3u8.into(), b"revoked");
-            warn!(peer = %node.short(), "closed revoked peer connection");
+        if let Some(links) = links {
+            for link in links.links {
+                link.conn.close(3u8.into(), b"revoked");
+            }
+            warn!(peer = %node.short(), "closed revoked peer connections");
         }
         self.state.drop_grant(node);
     }
 
-    /// Minimum application datagram size across active connections, if any.
-    pub fn max_datagram_size(&self) -> Option<usize> {
-        let guard = self.conns.read().unwrap_or_else(|e| e.into_inner());
-        guard.values().filter_map(|c| c.max_datagram_size()).min()
-    }
-
-    pub async fn send(&self, node: NodeId, packet: Bytes) -> anyhow::Result<()> {
-        let conn = {
-            let guard = self.conns.read().unwrap_or_else(|e| e.into_inner());
-            guard.get(&node).cloned()
-        };
-        let Some(conn) = conn else {
-            bail!("peer {} not connected", node.short());
-        };
-        if let Some(max) = conn.max_datagram_size()
-            && packet.len() > max
-        {
-            bail!("datagram too large: {} > {}", packet.len(), max);
-        }
-        conn.send_datagram(packet).context("send_datagram")?;
-        Ok(())
-    }
-
-    fn insert_conn(&self, node: NodeId, conn: iroh::endpoint::Connection) {
-        let stable_id = conn.stable_id();
-        info!(peer = %node.short(), stable_id, "connection installed");
-        self.conns
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(node, conn);
-        self.conn_ids
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(node, stable_id);
-    }
-
-    fn remove_conn_if(&self, node: NodeId, stable_id: usize) {
-        let current = self
-            .conn_ids
+    /// Close one link (used by the link-state heartbeat when a relay path is
+    /// silent). The connection manager promotes the other link immediately.
+    pub fn close_link(&self, node: NodeId, stable_id: usize) {
+        let conn = self
+            .conns
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&node)
-            .copied();
-        info!(peer = %node.short(), stable_id, current, "connection close observed");
-        if current == Some(stable_id) {
-            self.conns
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&node);
-            self.conn_ids
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&node);
+            .and_then(|links| {
+                links
+                    .links
+                    .iter()
+                    .find(|link| link.stable_id == stable_id)
+                    .map(|link| link.conn.clone())
+            });
+        if let Some(conn) = conn {
+            warn!(peer = %node.short(), stable_id, "closing unhealthy relay link");
+            conn.close(4u8.into(), b"heartbeat timeout");
         }
+    }
+
+    /// Minimum application datagram size across the active links.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        let guard = self.conns.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .values()
+            .filter_map(|peer| peer.active_conn())
+            .filter_map(|conn| conn.max_datagram_size())
+            .min()
+    }
+
+    pub async fn send(&self, node: NodeId, packet: Bytes) -> anyhow::Result<()> {
+        let links = {
+            let guard = self.conns.read().unwrap_or_else(|e| e.into_inner());
+            guard.get(&node).map(|peer| {
+                let active = peer.active_conn();
+                let mut ordered = Vec::with_capacity(peer.links.len());
+                if let Some(conn) = active {
+                    ordered.push(conn);
+                }
+                for link in &peer.links {
+                    if peer.active_stable_id() != Some(link.stable_id) {
+                        ordered.push(link.conn.clone());
+                    }
+                }
+                ordered
+            })
+        };
+        let Some(links) = links else {
+            bail!("peer {} not connected", node.short());
+        };
+        if links.is_empty() {
+            bail!("peer {} not connected", node.short());
+        }
+        for conn in links {
+            if let Some(max) = conn.max_datagram_size()
+                && packet.len() > max
+            {
+                bail!("datagram too large: {} > {}", packet.len(), max);
+            }
+            if conn.send_datagram(packet.clone()).is_ok() {
+                if self.set_active(node, conn.stable_id()) {
+                    let (path, rtt, mtu, addr, path_count) = path_status(&conn);
+                    self.peers
+                        .mark(&node, true, path, rtt, mtu, addr, path_count);
+                }
+                return Ok(());
+            }
+        }
+        bail!("all links to peer {} failed", node.short())
+    }
+
+    fn next_inbound_role(&self, node: NodeId) -> Option<LinkRole> {
+        let guard = self.conns.read().unwrap_or_else(|e| e.into_inner());
+        let Some(links) = guard.get(&node) else {
+            return Some(LinkRole::Primary);
+        };
+        if links.links.len() >= 2 {
+            return None;
+        }
+        if links
+            .links
+            .iter()
+            .any(|link| link.role == LinkRole::Primary)
+        {
+            Some(LinkRole::Standby)
+        } else {
+            Some(LinkRole::Primary)
+        }
+    }
+
+    fn insert_conn(
+        &self,
+        node: NodeId,
+        conn: iroh::endpoint::Connection,
+        role: LinkRole,
+        relay: Option<RelayUrl>,
+    ) -> bool {
+        let stable_id = conn.stable_id();
+        let mut guard = self.conns.write().unwrap_or_else(|e| e.into_inner());
+        let links = guard.entry(node).or_default();
+        let duplicate_role = links.links.iter().any(|link| link.role == role);
+        let duplicate_relay = relay.is_some() && links.links.iter().any(|link| link.relay == relay);
+        if links.links.iter().any(|link| link.stable_id == stable_id)
+            || duplicate_role
+            || duplicate_relay
+            || links.links.len() >= 2
+        {
+            return false;
+        }
+        let index = links.links.len();
+        links.links.push(LinkState {
+            conn: conn.clone(),
+            stable_id,
+            role,
+            relay,
+        });
+        if links.active.is_none() {
+            links.active = Some(index);
+        }
+        let active = links.active == Some(index);
+        drop(guard);
+        info!(
+            peer = %node.short(),
+            stable_id,
+            ?role,
+            active,
+            "connection installed"
+        );
+        if active {
+            let (path, rtt, mtu, addr, path_count) = path_status(&conn);
+            self.peers
+                .mark(&node, true, path, rtt, mtu, addr, path_count);
+        }
+        true
+    }
+
+    /// Remove one link. Returns `(no_links_left, was_active)`.
+    fn remove_conn(&self, node: NodeId, stable_id: usize) -> (bool, bool) {
+        let mut guard = self.conns.write().unwrap_or_else(|e| e.into_inner());
+        let Some(links) = guard.get_mut(&node) else {
+            return (true, false);
+        };
+        let active_before = links.active_stable_id();
+        let was_active = active_before == Some(stable_id);
+        links.links.retain(|link| link.stable_id != stable_id);
+        if links.links.is_empty() {
+            guard.remove(&node);
+            return (true, was_active);
+        }
+        if was_active {
+            // Prefer a primary link, then any live link; the caller will
+            // reconnect the missing standby/primary in the background.
+            links.active = links
+                .links
+                .iter()
+                .position(|link| link.role == LinkRole::Primary)
+                .or(Some(0));
+        }
+        let new_active = links.active_conn();
+        drop(guard);
+        if let Some(conn) = new_active {
+            let (path, rtt, mtu, addr, path_count) = path_status(&conn);
+            self.peers
+                .mark(&node, true, path, rtt, mtu, addr, path_count);
+        }
+        warn!(peer = %node.short(), stable_id, was_active, "connection close observed");
+        (false, was_active)
+    }
+
+    fn set_active(&self, node: NodeId, stable_id: usize) -> bool {
+        let mut guard = self.conns.write().unwrap_or_else(|e| e.into_inner());
+        let Some(links) = guard.get_mut(&node) else {
+            return false;
+        };
+        let Some(index) = links
+            .links
+            .iter()
+            .position(|link| link.stable_id == stable_id)
+        else {
+            return false;
+        };
+        if links.active == Some(index) {
+            return false;
+        }
+        links.active = Some(index);
+        true
+    }
+
+    #[allow(dead_code)]
+    fn active_stable(&self, node: NodeId) -> Option<usize> {
+        self.conns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .and_then(PeerLinks::active_stable_id)
+    }
+
+    fn has_role(&self, node: NodeId, role: LinkRole) -> bool {
+        self.conns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .is_some_and(|links| links.links.iter().any(|link| link.role == role))
+    }
+}
+
+fn selected_relay(conn: &iroh::endpoint::Connection) -> Option<RelayUrl> {
+    conn.paths().iter().find_map(|path| {
+        if path.is_selected()
+            && let iroh::TransportAddr::Relay(url) = path.remote_addr()
+        {
+            Some(url.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn link_plan(peer: &PeerConfig, fallbacks: &[RelayUrl]) -> Vec<(LinkRole, Option<RelayUrl>)> {
+    let mut relays = Vec::new();
+    if let Some(raw) = &peer.relay_url
+        && let Ok(url) = raw.parse::<RelayUrl>()
+        && !relays.contains(&url)
+    {
+        relays.push(url);
+    }
+    for relay in fallbacks {
+        if !relays.contains(relay) {
+            relays.push(relay.clone());
+        }
+    }
+    match relays.as_slice() {
+        [primary, standby, ..] => vec![
+            (LinkRole::Primary, Some(primary.clone())),
+            (LinkRole::Standby, Some(standby.clone())),
+        ],
+        [primary] => vec![(LinkRole::Primary, Some(primary.clone()))],
+        [] => vec![(LinkRole::Primary, None)],
     }
 }
 
@@ -408,6 +717,7 @@ fn path_status(
                     .map(|n| n.min(u16::MAX as usize) as u16),
                 match path.remote_addr() {
                     iroh::TransportAddr::Ip(addr) => Some(addr.to_string()),
+                    iroh::TransportAddr::Relay(url) => Some(url.to_string()),
                     _ => None,
                 },
                 path_count,
@@ -417,22 +727,12 @@ fn path_status(
     (None, None, None, None, 0)
 }
 
-fn spawn_path_watch(conn: iroh::endpoint::Connection, node: NodeId, peers: PeerRegistry) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if conn.paths().is_empty() {
-                break;
-            }
-            let (path, rtt, mtu, addr, path_count) = path_status(&conn);
-            peers.mark(&node, true, path, rtt, mtu, addr, path_count);
-        }
-    });
-}
-
 async fn connect_loop(
     transport: Arc<IrohTransport>,
     peer: PeerConfig,
+    role: LinkRole,
+    relay: Option<RelayUrl>,
+    endpoint: Endpoint,
     inbound_tx: mpsc::Sender<InboundPacket>,
     control_tx: Option<mpsc::Sender<ControlEvent>>,
 ) {
@@ -451,26 +751,26 @@ async fn connect_loop(
         }
     };
     let mut addrs = Vec::new();
-    for addr in &peer.addrs {
-        addrs.push(TransportAddr::Ip(*addr));
-    }
-    if let Some(relay) = &peer.relay_url {
-        match relay.parse::<RelayUrl>() {
-            Ok(url) => addrs.push(TransportAddr::Relay(url)),
-            Err(e) => warn!(peer = %peer.name, error = %e, "invalid relay_url"),
+    if let Some(relay) = &relay {
+        addrs.push(TransportAddr::Relay(relay.clone()));
+    } else {
+        for addr in &peer.addrs {
+            addrs.push(TransportAddr::Ip(*addr));
         }
-    }
-    // Fall back to every configured relay so a dead home relay does not pin
-    // reconnects to the same dead endpoint.
-    for relay in &transport.relay_fallbacks {
-        let candidate = TransportAddr::Relay(relay.clone());
-        if !addrs.contains(&candidate) {
-            addrs.push(candidate);
+        for candidate in &transport.relay_fallbacks {
+            let candidate = TransportAddr::Relay(candidate.clone());
+            if !addrs.contains(&candidate) {
+                addrs.push(candidate);
+            }
         }
     }
     let addr = EndpointAddr::from_parts(remote, addrs);
     loop {
-        match transport.endpoint.connect(addr.clone(), DATA_ALPN).await {
+        if transport.has_role(node, role) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        match endpoint.connect(addr.clone(), DATA_ALPN).await {
             Ok(conn) => {
                 if transport.config.network.auth.mode == AuthMode::Controller {
                     let credential = transport.state.credential();
@@ -501,13 +801,20 @@ async fn connect_loop(
                         }
                     }
                 }
-                info!(peer = %peer.name, "outbound iroh connected");
-                transport.insert_conn(node, conn.clone());
+                if !transport.insert_conn(node, conn.clone(), role, relay.clone()) {
+                    debug!(peer = %peer.name, ?role, "link role already filled; closing");
+                    conn.close(5u8.into(), b"duplicate link");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+                let stable_id = conn.stable_id();
+                info!(peer = %peer.name, ?role, "outbound iroh connected");
                 if let Some(tx) = &control_tx {
                     let _ = tx
                         .send(ControlEvent::Up {
                             node,
                             conn: conn.clone(),
+                            stable_id,
                         })
                         .await;
                 }
@@ -515,33 +822,27 @@ async fn connect_loop(
                 transport
                     .peers
                     .mark(&node, true, path, rtt, mtu, addr, path_count);
-                spawn_path_watch(conn.clone(), node, transport.peers.clone());
                 let tx = inbound_tx.clone();
-                let peers = transport.peers.clone();
                 let network_hash = network_hash(transport.network);
-                let conn2 = conn.clone();
-                let down_tx = control_tx.clone();
+                let read_conn = conn.clone();
                 tokio::spawn(async move {
-                    read_loop(conn2, node, network_hash, tx).await;
-                    peers.mark(&node, false, None, None, None, None, 0);
-                    if let Some(tx) = &down_tx {
-                        let _ = tx.send(ControlEvent::Down { node }).await;
-                    }
+                    read_loop(read_conn, node, network_hash, tx).await;
                 });
-                let stable_id = conn.stable_id();
                 conn.closed().await;
-                transport.remove_conn_if(node, stable_id);
-                transport.state.drop_grant(node);
-                transport
-                    .peers
-                    .mark(&node, false, None, None, None, None, 0);
-                if let Some(tx) = &control_tx {
-                    let _ = tx.send(ControlEvent::Down { node }).await;
+                let (empty, _) = transport.remove_conn(node, stable_id);
+                if empty {
+                    transport
+                        .peers
+                        .mark(&node, false, None, None, None, None, 0);
+                    transport.state.drop_grant(node);
                 }
-                warn!(peer = %peer.name, "connection closed; reconnecting");
+                if let Some(tx) = &control_tx {
+                    let _ = tx.send(ControlEvent::Down { node, stable_id }).await;
+                }
+                warn!(peer = %peer.name, ?role, "connection closed; reconnecting");
             }
             Err(e) => {
-                debug!(peer = %peer.name, error = %e, "connect failed");
+                debug!(peer = %peer.name, ?role, error = %e, "connect failed");
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -874,9 +1175,13 @@ cidr = "10.8.0.0/16"
         };
         a.add_peer(peer("b", b_id, "10.7.0.2"), true);
         b.add_peer(peer("a", a_id, "10.7.0.1"), true);
-        for _ in 0..100 {
-            if a.peers.get(&b_id).is_some_and(|p| p.connected)
-                && b.peers.get(&a_id).is_some_and(|p| p.connected)
+        for _ in 0..200 {
+            if a.peers
+                .get(&b_id)
+                .is_some_and(|p| p.connected && p.path.is_some())
+                && b.peers
+                    .get(&a_id)
+                    .is_some_and(|p| p.connected && p.path.is_some())
             {
                 break;
             }
@@ -1244,5 +1549,149 @@ cidr = "10.8.0.0/16"
         b.close().await;
         drop(r1);
         drop(r2);
+    }
+
+    #[tokio::test]
+    async fn dual_relay_links_fail_over_when_the_active_connection_closes() {
+        let (relay1, url1) = start_relay().await;
+        let (relay2, url2) = start_relay().await;
+        let base =
+            std::env::temp_dir().join(format!("stellaris-dual-relay-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let network = NetworkId::new();
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let (tx_b, _rx_b) = mpsc::channel(64);
+        let config_a = config_multi(
+            "a",
+            &base.join("a"),
+            &[url1.clone(), url2.clone()],
+            "10.8.0.1",
+        );
+        let config_b = config_multi(
+            "b",
+            &base.join("b"),
+            &[url1.clone(), url2.clone()],
+            "10.8.0.2",
+        );
+        let state_a = crate::AgentState::build(config_a.clone()).unwrap();
+        let state_b = crate::AgentState::build(config_b.clone()).unwrap();
+        let a = IrohTransport::start(
+            state_a,
+            Arc::new(config_a),
+            network,
+            [11u8; 32],
+            PeerRegistry::from_config(
+                &Config::from_toml(&format!(
+                    r#"
+[node]
+name = "a"
+state_dir = "{}"
+[network]
+name = "relay-use"
+cidr = "10.8.0.0/16"
+"#,
+                    base.join("a").display()
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+            tx_a,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = IrohTransport::start(
+            state_b,
+            Arc::new(config_b),
+            network,
+            [12u8; 32],
+            PeerRegistry::from_config(
+                &Config::from_toml(&format!(
+                    r#"
+[node]
+name = "b"
+state_dir = "{}"
+[network]
+name = "relay-use"
+cidr = "10.8.0.0/16"
+"#,
+                    base.join("b").display()
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+            tx_b,
+            None,
+        )
+        .await
+        .unwrap();
+        let a_id = NodeId::new(*a.endpoint_id().as_bytes());
+        let b_id = NodeId::new(*b.endpoint_id().as_bytes());
+        a.add_peer(
+            PeerConfig {
+                name: "b".into(),
+                endpoint_id: b_id.to_string(),
+                overlay_ip: "10.8.0.2".parse().unwrap(),
+                addrs: vec![],
+                relay_url: Some(url1.clone()),
+                advertised: vec![],
+                zone: None,
+            },
+            true,
+        );
+        b.add_peer(
+            PeerConfig {
+                name: "a".into(),
+                endpoint_id: a_id.to_string(),
+                overlay_ip: "10.8.0.1".parse().unwrap(),
+                addrs: vec![],
+                relay_url: Some(url1.clone()),
+                advertised: vec![],
+                zone: None,
+            },
+            true,
+        );
+        let mut links = 0;
+        for _ in 0..100 {
+            links = a
+                .conns
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&b_id)
+                .map(|peer| peer.links.len())
+                .unwrap_or(0);
+            if links >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(links, 2, "both relay links should be established");
+        a.send(b_id, Bytes::from_static(b"primary")).await.unwrap();
+        let old_active = a.active_stable(b_id).expect("active link");
+        let old_conn = a
+            .conns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&b_id)
+            .and_then(|peer| peer.active_conn())
+            .expect("active connection");
+        old_conn.close(0u8.into(), b"test failover");
+        let mut switched = None;
+        for _ in 0..100 {
+            if let Some(active) = a.active_stable(b_id)
+                && active != old_active
+                && a.send(b_id, Bytes::from_static(b"standby")).await.is_ok()
+            {
+                switched = Some(active);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(switched.is_some(), "standby link should take over");
+        a.endpoint.close().await;
+        b.endpoint.close().await;
+        relay1.shutdown().await.unwrap();
+        relay2.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(base);
     }
 }
