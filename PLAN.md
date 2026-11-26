@@ -53,7 +53,9 @@
 - [x] relay 双连接热备（双 endpoint + 双 link + heartbeat/close，2026-11-26 初版；见 RELAY-FAILOVER.md）。
 - [x] 控制器运维 CLI（status/admissions/members/IPAM）与离线凭据 verify/续签（2026-11-26）。
 - [x] controller `/metrics`/`/healthz`/`/readyz`（2026-11-26）。
-- [x] relay 双连接热备真实三机验证（2026-11-26，IPAM/relay 初版）。
+- [x] relay 双连接热备真实三机验证（2026-11-26）。
+- [x] NAT 成员 + IPAM 热重配真实主机验证（2026-11-26）。
+- [x] controller CLI 公网 controller 验证（2026-11-26）。
 - [x] 离线签发凭据 CLI：`stellaris credential issue`，无 controller 成员的离线认证（2026-11-26）。
 - [x] IPAM 地址热重配（`POST /v1/ipam/leases/{node}/reassign`，Linux netns 验证；[IPAM-RECONFIG.md](IPAM-RECONFIG.md)）。
 - [x] openraft H2 3 节点：进程内 leader 复制/failover + HTTP Raft RPC（共享 secret/snapshot）+ 落盘重启恢复。

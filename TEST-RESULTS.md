@@ -609,7 +609,20 @@ stellaris credential issue --controller-key controller.key \
 | `credential verify` | ✅ 有效凭据通过；过期凭据返回非零并输出 `valid=false` |
 | 单测 | ✅ CLI 10 个（issue/verify/覆盖/controller 参数） |
 
-### 3.23 仍未验证
+### 3.23 2026-11-26 NAT 成员 + IPAM 热重配（真实主机）
+
+拓扑：controller 深圳 `120.77.233.189:5801`；cloud agent 深圳 `47.107.226.187`
+（公网，`10.66.0.1`）；NAT agent 本机 `10.0.10.42`（家庭宽带，`10.66.0.2`）。
+
+| 项 | 结果 |
+|---|---|
+| NAT 自动入网 | ✅ 出站到公网 controller，approve 后自动分配 `10.66.0.2` |
+| NAT direct 穿透 | ✅ peer connected，path=direct，双向 ping 0% loss，RTT ~10ms |
+| 热重配 | ✅ `POST /v1/ipam/leases/{node}/reassign` 把 NAT 成员从 .2 切到 .9 |
+| 数据面 | ✅ 不重启 agent，TUN 变为 .9；cloud→.9 0% loss；cloud→旧 .2 100% loss |
+| 脚本 | 手工编排；controller/agent 使用当前 release 二进制 |
+
+### 3.24 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot
