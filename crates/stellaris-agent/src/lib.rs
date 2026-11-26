@@ -6,7 +6,7 @@ pub mod control_wire;
 pub mod controller;
 pub mod controller_model;
 pub mod controller_raft;
-pub mod credential;
+pub use stellaris_types::credential;
 pub mod dataplane;
 pub mod discovery;
 pub mod gateway;
@@ -179,6 +179,18 @@ impl AgentState {
             credential.credential.network == network.to_string()
                 && credential.credential.node == identity.node_id
         });
+        if let Some(credential) = &credential
+            && config.network.auth.mode == stellaris_types::AuthMode::Controller
+            && config.node.ipam == stellaris_types::IpamMode::Static
+            && let Some(overlay) = credential.credential.overlay_ip
+            && config.node.overlay_ip.is_some()
+            && config.node.overlay_ip != Some(overlay)
+        {
+            anyhow::bail!(
+                "credential overlay {overlay} does not match node.overlay_ip {}; reissue the credential or fix the config",
+                config.node.overlay_ip.expect("checked")
+            );
+        }
         let cached_overlay = if config.node.ipam == stellaris_types::IpamMode::Auto {
             credential
                 .as_ref()
@@ -347,6 +359,14 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     };
     let control_configured =
         state.config.control.url.is_some() || state.config.control.endpoint_id.is_some();
+    if !control_configured
+        && state.config.network.auth.mode == stellaris_types::AuthMode::Controller
+        && state.credential().is_none()
+    {
+        tracing::warn!(
+            "controller auth without control.url/endpoint_id and no cached credential; place an offline-issued credential.json in the state dir"
+        );
+    }
     let want_transport = state.config.dataplane.enabled
         || !state.config.peers.is_empty()
         || control_configured
@@ -499,5 +519,69 @@ via = "c"
             .lookup("192.168.50.1".parse().unwrap())
             .unwrap();
         assert_eq!(failover.next_hops[0].node, NodeId::new([3u8; 32]));
+    }
+
+    #[test]
+    fn offline_controller_credential_loads_without_controller_url() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-offline-cred-{}", uuid::Uuid::now_v7()));
+        let state_dir = dir.join("node");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let identity = identity::load_or_create(&state_dir).unwrap();
+        let network = NetworkId::new();
+        let secret = [7u8; 32];
+        let issuer = NodeId::new(
+            ed25519_dalek::SigningKey::from_bytes(&secret)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let now = credential::now_secs();
+        let signed = credential::SignedCredential::sign(
+            &secret,
+            credential::MembershipCredential {
+                network: network.to_string(),
+                node: identity.node_id,
+                overlay_ip: Some("10.7.0.2".parse().unwrap()),
+                prefixes: vec![],
+                capabilities: vec!["member".into()],
+                revision: 1,
+                issued_at: now,
+                not_after: now + 3600,
+            },
+        );
+        std::fs::write(
+            state_dir.join("credential.json"),
+            serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "offline"
+state_dir = "{}"
+overlay_ip = "10.7.0.2"
+
+[network]
+id = "{}"
+name = "offline-demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+controller_keys = ["{}"]
+"#,
+            state_dir.display(),
+            network,
+            issuer
+        );
+        let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        assert_eq!(state.local_overlay(), Some("10.7.0.2".parse().unwrap()));
+        assert!(state.credential().is_some());
+
+        let mismatched = toml.replace("overlay_ip = \"10.7.0.2\"", "overlay_ip = \"10.7.0.9\"");
+        assert!(AgentState::build(Config::from_toml(&mismatched).unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

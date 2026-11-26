@@ -1,6 +1,7 @@
 //! Shared data types for Stellaris Linking.
 
 pub mod config;
+pub mod credential;
 pub mod error;
 pub mod id;
 pub mod ipam;

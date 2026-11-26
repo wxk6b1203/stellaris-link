@@ -439,7 +439,7 @@ relay 故障重连（本轮修复）：用 `clear_address_lookup` 强制 relay-o
 | HTTP enroll 端到端 | `control_client::tests::http_enrollment_installs_a_credential` | ✅ 真 HTTP server + 真 agent 请求，`credential.json` 落盘且 issuer/prefix 正确 |
 | 撤销丢 grant | `control_client::tests::revoked_members_lose_their_grants_and_revisions_advance` | ✅ 快照移除成员后 grant 删除、revision 前进 |
 | iroh 凭据握手 | `transport::tests::controller_credentials_gate_connections_and_install_grants` | ✅ 两个带凭据端点互相连上并安装 grant；无凭据的第三个节点被拒绝 |
-| 全量测试 | `cargo test --workspace` | **193 passed**（agent 146 + types 22 + 其余 25；relay failover 测试因 harness 问题 ignored） |
+| 全量测试 | `cargo test --workspace` | **199 passed**（agent 141 + cli 8 + types 28 + 其余 22；relay failover 测试因 harness 问题 ignored） |
 | Raft 预注册成员 | `scripts/test-controller-raft-3node.sh`（本机） | ✅ LSA/snapshot/failover/crash-recovery；修复了 Raft 状态机未从 config 播种成员的问题 |
 | Raft TLS 预注册成员 | `scripts/test-controller-raft-tls-3node.sh`（本机） | ✅ TLS 三节点 LSA/snapshot |
 | 审批入网全链路 | `scripts/test-controller-state-ha.sh`（本机） | ✅ agent 签名 enroll → 待审 → admin approve → 三副本可见；LSA TTL/epoch 通过 |
@@ -557,7 +557,31 @@ UDP 映射超时 <3 分钟、IPv6-only 路径、弱网/丢包下的 NAT 重绑�
 | 重启 A | ✅ 仍用 .10（凭据落盘） |
 | 限制 | Linux `ip` 路径；切换瞬间在途 TCP 会断；静态 overlay 不参与 |
 
-### 3.20 仍未验证
+### 3.20 2026-11-26 离线签发凭据 CLI
+
+本机 macOS，无 controller、无 TUN：
+
+```bash
+stellaris credential issue --controller-key controller.key \
+  --network 11111111-1111-1111-1111-111111111111 \
+  --node <node-id> --overlay-ip 10.66.0.1 --ttl-secs 3600 \
+  --out state/credential.json
+```
+
+| 项 | 结果 |
+|---|---|
+| 签发 | ✅ 输出 issuer/node/network/overlay/not_after；文件 0600 |
+| 自校验 | ✅ 生成的凭据通过 `SignedCredential::verify`（签名/网络/node/过期） |
+| 覆盖保护 | ✅ 已有文件不带 `--force` 拒绝 |
+| 成员配置 | ✅ `network.auth.mode = "controller"` + `controller_keys`，省略 `control.url` 可通过校验 |
+| 离线握手 | ✅ 两个 agent 各放一份离线凭据，无 controller，`/v1/peers` 显示 `connected=true, path=direct` |
+| 一致性保护 | ✅ 凭据 overlay 与 `node.overlay_ip` 不一致时启动失败 |
+| 单测 | `stellaris-cli` 8 个（含 issue/覆盖/参数/state-dir），agent `offline_controller_credential_loads...` |
+
+> 限制：离线模式无自动续签/撤销；过期后重新签发并重启；多节点需在 `[[peers]]` 写
+> `addrs`（没有 controller 时没有自动 discovery）。
+
+### 3.21 仍未验证
 
 - 持续慢链路（2mbit 级）下 60s transfer TTL 是否足够
 - 丢包/抖动下的滚动重启与 >4MiB snapshot

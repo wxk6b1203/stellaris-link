@@ -15,10 +15,10 @@
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::{NetworkId, NodeId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use stellaris_types::{NetworkId, NodeId};
 
 /// Domain separator for credential signatures.
 const DOMAIN: &[u8] = b"stellaris-credential-v1|";

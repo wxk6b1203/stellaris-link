@@ -1,0 +1,33 @@
+# Member using an offline-issued controller credential.
+# Issue with:
+#   stellaris credential issue --controller-state <controller-state-dir> \
+#     --network <network-uuid> --node <this-node-id> --overlay-ip 10.7.0.2 \
+#     --ttl-secs 2592000 --out ./state/offline/credential.json
+[node]
+name = "offline-member"
+state_dir = "./state/offline"
+overlay_ip = "10.7.0.2"
+
+[network]
+id = "00000000-0000-0000-0000-000000000000"   # replace with the signed network id
+name = "offline-demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+# No control.url / endpoint_id: this node only uses the offline credential.
+controller_keys = ["0000000000000000000000000000000000000000000000000000000000000000"]
+
+[transport]
+listen_port = 5901
+advertise = ["192.0.2.20:5901"]
+
+[dataplane]
+enabled = true
+tun_name = "stellaris0"
+mtu = 1280
+
+[api]
+bind = "127.0.0.1:7777"

@@ -1023,21 +1023,11 @@ impl Config {
                 "network.auth.mode = static requires at least one [[peers]] entry".into(),
             ));
         }
-        if self.network.auth.mode == AuthMode::Controller {
-            if self.control.controller_keys.is_empty() {
-                return Err(ConfigError::Invalid(
-                    "network.auth.mode = controller requires control.controller_keys".into(),
-                ));
-            }
-            if self.node.role != "controller"
-                && self.control.endpoint_id.is_none()
-                && self.control.url.is_none()
-            {
-                return Err(ConfigError::Invalid(
-                    "network.auth.mode = controller requires control.endpoint_id or control.url"
-                        .into(),
-                ));
-            }
+        if self.network.auth.mode == AuthMode::Controller && self.control.controller_keys.is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "network.auth.mode = controller requires control.controller_keys".into(),
+            ));
         }
         if self.dataplane.mtu < 576 {
             return Err(ConfigError::Invalid("dataplane.mtu must be >= 576".into()));
@@ -1753,5 +1743,33 @@ cidr = \"10.30.0.0/25\"
 "
         );
         assert!(Config::from_toml(&overlap).is_err());
+    }
+
+    #[test]
+    fn controller_mode_allows_offline_credentials_without_a_controller_url() {
+        let toml = r#"
+[node]
+name = "offline"
+overlay_ip = "10.7.0.2"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+controller_keys = ["0202020202020202020202020202020202020202020202020202020202020202"]
+"#;
+        let config = Config::from_toml(toml).expect("offline credential config");
+        assert!(config.control.url.is_none());
+        assert_eq!(config.network.auth.mode, AuthMode::Controller);
+
+        let missing_keys = toml.replace(
+            "controller_keys = [\"0202020202020202020202020202020202020202020202020202020202020202\"]",
+            "",
+        );
+        assert!(Config::from_toml(&missing_keys).is_err());
     }
 }

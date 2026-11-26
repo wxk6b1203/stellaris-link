@@ -193,7 +193,7 @@ url = "http://10.0.0.1:7800"
 secret = "change-me"
 ```
 
-controller 集群内部通过 `raft_peers` + mTLS 复制。旧 `control.urls` active-active fanout 已移除；配置中出现会直接报错。
+controller 集群内部通过 `raft_peers` + mTLS 复制。旧 `control.urls` active-active fanout 已移除；配置中出现会直接报错。无 controller 的离线部署可省略 `control.url`，改用离线签发的 `credential.json`。
 
 选举超时是正式配置项，默认值按**跨地域**部署取值（深圳/上海/成都三地滚动重启验证通过的值）：
 
@@ -608,6 +608,7 @@ examples/               # 示例 TOML
 | [REAL-LAN-MDNS.md](REAL-LAN-MDNS.md) | 真实局域网 mDNS 验证记录 |
 | [OPENRAFT-HA.md](OPENRAFT-HA.md) | openraft controller HA 设计与实现记录 |
 | [examples/policy.toml](examples/policy.toml) | ACL/QoS 配置示例 |
+| [examples/offline-node.toml](examples/offline-node.toml) | 离线凭据成员配置示例 |
 | [scripts/demo-linkstate.sh](scripts/demo-linkstate.sh) | controller-mediated link-state 演示 |
 | [scripts/demo-distributed-linkstate.sh](scripts/demo-distributed-linkstate.sh) | 分布式 LSA/SPF 演示 |
 | [stellaris-linking-routing-design.md](stellaris-linking-routing-design.md) | 路由/低功耗设计背景 |
@@ -666,6 +667,9 @@ curl -X POST -H "x-stellaris-secret: admin-secret" \
 语义：
 
 - 凭据默认 1 小时有效，member 在 2/3 生命周期自动续签，落盘到 `state_dir/credential.json`。
+- 无 controller 的小规模部署可用 `stellaris credential issue` 离线签发（读取 controller
+  `identity.key`，输出 0600 的 `credential.json`）；成员配置可省略 `control.url`。
+  详见 [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) §3.1。
 - 撤销（`POST /v1/revoke`、deny 或从 members 移除）：controller 递增该节点 revision；
   member 在下一个快照（≤10s）主动断开该 peer 并丢弃它的 grant，LSA 同时被拒绝。
 - 改前缀/能力用 `POST /v1/members/<node>/grants`，不需要重新入网。
@@ -751,7 +755,7 @@ curl -H "x-stellaris-secret: $SECRET" http://controller:5801/metrics
 
 ## 已知限制
 
-- controller 已完成 openraft quorum/leader election/mTLS/snapshot/failover；member 入口仍是单 URL（可指向 LB/任一 controller）。旧 fanout 已移除。
+- controller 已完成 openraft quorum/leader election/mTLS/snapshot/failover；在线 member 入口仍是单 URL（可指向 LB/任一 controller），离线签发模式不需要 URL。旧 fanout 已移除。
 - 数据面 IPv4/IPv6 overlay 已启用；应用层分片重组、ACL ICMP reject、IPv6 ≥1280 MTU 已实现；完整 PMTUD 状态机仍以 iroh/内核为主。
 - 初始 bootstrap 仍需要 controller URL 或静态 peer；之后可由 controller manifest/LSA `overlay_ip/addrs` 自动发现/连接。
 - agent 的路由写 API 只接受 `scope=local`；network scope 目前只能通过 controller 配置/静态路由（`api.rs:365-369` 会拒绝 network scope）。
@@ -767,7 +771,7 @@ curl -H "x-stellaris-secret: $SECRET" http://controller:5801/metrics
   详见 [IPAM-RECONFIG.md](IPAM-RECONFIG.md)。
 - relay 建连、direct→relay 切换已测；relay 故障后会在旧连接关闭时经 `transport.relay_urls` 列表重连（实测约 60s，非秒级切换；多 relay 同时承载未实现）。生产建议自建 relay 并监控（见 AUDIT.md）。
 - 2026-11-24 完成静态审计（[AUDIT.md](AUDIT.md)）并修复 P0：LSA 签名、transit 强制、OS 路由防护、iroh 走 Raft、Raft RPC 必须配 `raft_secret` 且有超时、admin secret、routes/LSA TTL/epoch 入 Raft、动态 membership。2026-11-25 进一步把入网收敛为 controller 签名的成员凭据。仍没有第三方安全审计，MVP 仅用于开发/实验。
-- 2026-11-25 配置变更（不兼容）：删除 `network.auth.secret`、`network.auth.allowed_nodes`、`control.join_token(s)`、`control.require_join_signature`、`control.admission`、`control.request_admission`；新增 `control.credential_ttl_secs`。`network.auth.mode` 只剩 `none`（仅实验）和 `controller`，配 `controller` 时必须给 `control.controller_keys` 以及 `control.endpoint_id` 或 `control.url`。`POST /v1/join` 由 `POST /v1/enroll` 取代，`GET /v1/status` 不再有 `join_config_hash`。
+- 2026-11-25 配置变更（不兼容）：删除 `network.auth.secret`、`network.auth.allowed_nodes`、`control.join_token(s)`、`control.require_join_signature`、`control.admission`、`control.request_admission`；新增 `control.credential_ttl_secs`。`network.auth.mode` 只剩 `none`（仅实验）和 `controller`，配 `controller` 时必须给 `control.controller_keys`；`control.endpoint_id`/`control.url` 在线模式必填，离线签发可省略。`POST /v1/join` 由 `POST /v1/enroll` 取代，`GET /v1/status` 不再有 `join_config_hash`。
 - 之前新增的配置仍然有效：`control.admin_secret`、`control.lsa_ttl_secs`、`dataplane.allow_default_route`、`dataplane.replace_existing_routes`、`transport.disable_discovery`（测试用：强制 relay-only）、`transport.allow_unauthenticated_discovery`（仅隔离实验）、`transport.relay_mode`（auto/n0/custom/disabled，`custom` 必须带 `relay_urls`）、`acl.deny_action`；`transport.listen=false`、`routing.rib_mode!=full`、`set_path_hint` 会直接报错。子网网关/exit 转发需要给对应成员 grant `capabilities = ["transit"]`。MeshHeader 的 `network_hash` 是 SHA-256 前 32 位，混合版本节点必须一起升级。
 
 ## 贡献

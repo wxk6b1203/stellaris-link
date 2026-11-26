@@ -105,6 +105,54 @@ HTTP enroll 请求由节点私钥签名（`stellaris-enroll-v1|network|node|over
 因此抓包重放最多让 controller 重签一张同 node 的凭据，无法冒用身份。iroh enroll
 没有签名步骤：QUIC 连接已经用 node key 认证，`conn.remote_id()` 就是身份。
 
+### 3.1 离线签发（无 controller 进程）
+
+小规模/隔离环境可以拿 controller 的 `identity.key` 在离线机器上签发，不运行
+controller、不暴露 admin secret：
+
+```bash
+# 1. 成员节点自己的 NodeId（identity.key 已生成）
+stellaris-agent --config member.toml --print-id
+
+# 2. 在保存 controller state_dir 的机器上签发
+stellaris credential issue   --controller-state /var/lib/stellaris/controller   --network 3f6a...   --node <node-id>   --overlay-ip 10.7.0.2   --prefix 192.168.50.0/24   --capability member   --ttl-secs 2592000   --out /etc/stellaris/credential.json
+
+# 3. 把 credential.json 放到成员的 state_dir/credential.json
+```
+
+成员配置**不需要** `control.url`/`control.endpoint_id`：
+
+```toml
+[node]
+overlay_ip = "10.7.0.2"          # 必须与凭据的 overlay_ip 一致
+state_dir = "/var/lib/stellaris/member"
+
+[network]
+id = "<network-uuid>"            # 必须与签发时的 --network 一致
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+controller_keys = ["<controller-node-id>"]   # 用于验证所有 peer 的凭据
+```
+
+语义与限制：
+
+- CLI 只读取 32 字节 `identity.key`，不会启动 controller 或写网络；输出文件默认 0600。
+- 成员的 `credential.json` 是**公开凭据**，不是秘密；真正的秘密仍是各节点自己的
+  `identity.key`。
+- 离线模式没有自动续签/撤销：凭据过期后需重新签发并重启成员；revision 必须递增，
+  否则对端会按 replay fencing 拒绝。
+- `--network` 要匹配成员的 network id；若配置只写 `network.name`，id 是 UUIDv5，
+  建议离线部署显式写 `network.id`。
+- `ipam = "auto"` 仍需要 controller（地址分配是控制面行为）；离线模式使用静态
+  `overlay_ip`。
+- 没有 controller 就没有自动 discovery；多节点离线部署要在每台 `[[peers]]` 里写
+  `addrs = ["<ip>:<port>"]`（或自行提供 LSA 发现），否则 iroh 不知道往哪里连。
+
 ---
 
 ## 4. 握手

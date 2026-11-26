@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use reqwest::{Client, Method, Response};
 use serde_json::{Value, json};
 
+mod credential_cmd;
+
 #[derive(Debug, Parser)]
 #[command(name = "stellaris", version, about = "Stellaris Linking CLI")]
 struct Cli {
@@ -29,6 +31,11 @@ enum Command {
     Route {
         #[command(subcommand)]
         cmd: RouteCmd,
+    },
+    /// Membership credential commands (offline issuance).
+    Credential {
+        #[command(subcommand)]
+        cmd: credential_cmd::CredentialCmd,
     },
 }
 
@@ -165,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 print(&v);
             }
         },
+        Command::Credential { cmd } => credential_cmd::run(cmd)?,
         Command::Route { cmd } => match cmd {
             RouteCmd::List { view } => {
                 let v = api
@@ -358,6 +366,55 @@ mod tests {
                 cmd: RouteCmd::Pin { ttl: Some(30), .. }
             }
         ));
+    }
+
+    #[test]
+    fn parses_offline_credential_issue() {
+        let cli = parse(&[
+            "stellaris",
+            "credential",
+            "issue",
+            "--controller-key",
+            "/tmp/identity.key",
+            "--network",
+            "00000000-0000-0000-0000-000000000001",
+            "--node",
+            "0202020202020202020202020202020202020202020202020202020202020202",
+            "--overlay-ip",
+            "10.7.0.2",
+            "--prefix",
+            "192.168.50.0/24",
+            "--ttl-secs",
+            "600",
+            "--out",
+            "/tmp/credential.json",
+        ]);
+        match cli.cmd {
+            Command::Credential {
+                cmd: credential_cmd::CredentialCmd::Issue(args),
+            } => {
+                assert_eq!(args.overlay_ip, Some("10.7.0.2".parse().unwrap()));
+                assert_eq!(args.prefixes.len(), 1);
+                assert_eq!(args.ttl_secs, 600);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_issue_requires_a_key_source() {
+        assert!(
+            Cli::try_parse_from([
+                "stellaris",
+                "credential",
+                "issue",
+                "--network",
+                "00000000-0000-0000-0000-000000000001",
+                "--node",
+                "0202020202020202020202020202020202020202020202020202020202020202",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

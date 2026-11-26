@@ -19,6 +19,7 @@ use stellaris_types::AclDirection;
 
 /// Handle to the live TUN device for in-process address changes.
 #[derive(Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct DataplaneHandle {
     tun_name: String,
     prefix_len: u8,
