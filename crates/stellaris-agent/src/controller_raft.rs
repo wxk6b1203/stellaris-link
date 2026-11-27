@@ -761,6 +761,16 @@ impl StateMachineStore {
                 }
             }
         }
+        // Upgrade path: an existing model already has membership/pools and
+        // must not be re-seeded from whatever config this process happens to
+        // carry.
+        if !data.model.bootstrap_seeded
+            && (!data.model.members.is_empty()
+                || !data.model.pools.is_empty()
+                || !data.model.revoked.is_empty())
+        {
+            data.model.bootstrap_seeded = true;
+        }
         Self {
             inner: Arc::new(RwLock::new(data)),
             snapshot: Arc::new(RwLock::new(None)),

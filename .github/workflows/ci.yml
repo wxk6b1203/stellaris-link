@@ -39,6 +39,8 @@ jobs:
         run: BIN_DIR="$PWD/target/release" ./scripts/test-controller-approval-auth.sh
       - name: Controller follower failover
         run: BIN_DIR="$PWD/target/release" ./scripts/test-controller-failover.sh
+      - name: Controller bootstrap seed convergence
+        run: BIN="$PWD/target/release/stellaris-controller" ./scripts/test-controller-bootstrap-divergence.sh
       - name: Docker mDNS discovery
         run: BIN="$PWD/target/release/stellaris-agent" ./scripts/test-docker-mdns.sh
       - name: netns TUN overlay

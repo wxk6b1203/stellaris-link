@@ -68,6 +68,9 @@ pub struct ControllerState {
     grants: Arc<RwLock<HashMap<NodeId, ControllerMemberConfig>>>,
     model: Arc<RwLock<ControllerModel>>,
     strict_membership: bool,
+    /// Bootstrap seeds replicated by the first leader in Raft mode.
+    seed_pools: Vec<AddressPool>,
+    seed_members: Vec<(NodeId, ControllerMemberConfig)>,
     signing_key: Option<Arc<SigningKey>>,
     signer: Option<NodeId>,
     raft: Option<Arc<Raft<TypeConfig, StateMachineStore>>>,
@@ -342,46 +345,65 @@ impl ControllerState {
             grants.insert(node, member.clone());
         }
         let strict_membership = !config.control.members.is_empty() || !grants.is_empty();
+        let raft_mode = config.control.raft_dir.is_some();
         let mut model = ControllerModel::new(network, epoch);
-        let replay = load_commands(&commands_path);
-        for command in replay {
-            model.apply(command);
-        }
-        for pool in &config.control.ipam.pools {
-            model.apply(ControllerCommand::CreatePool { pool: pool.clone() });
-        }
-        let mut seeded: Vec<(&NodeId, &ControllerMemberConfig)> = grants.iter().collect();
-        seeded.sort_by(|a, b| a.0.cmp(b.0));
-        for (node, grant) in seeded {
-            let mut member = MemberRecord {
-                overlay_ip: grant.overlay_ip,
-                prefixes: grant.prefixes.iter().map(|p| p.to_string()).collect(),
-                capabilities: grant.capabilities.clone(),
-            };
-            if member.overlay_ip.is_none() && !model.pools.is_empty() {
-                match model.allocate_address(*node, None, None, 0) {
-                    Ok((ip, _pool, _, _)) => member.overlay_ip = Some(ip),
-                    Err(error) => {
-                        tracing::warn!(%node, %error, "pre-registered member has no address")
+        if !raft_mode {
+            // Non-Raft controllers keep the local seed path. Raft replicas
+            // start empty and receive the leader's seeds through Raft.
+            let replay = load_commands(&commands_path);
+            for command in replay {
+                model.apply(command);
+            }
+            for pool in &config.control.ipam.pools {
+                model.apply(ControllerCommand::CreatePool { pool: pool.clone() });
+            }
+            let mut seeded: Vec<(&NodeId, &ControllerMemberConfig)> = grants.iter().collect();
+            seeded.sort_by(|a, b| a.0.cmp(b.0));
+            for (node, grant) in seeded {
+                let mut member = MemberRecord {
+                    overlay_ip: grant.overlay_ip,
+                    prefixes: grant.prefixes.iter().map(|p| p.to_string()).collect(),
+                    capabilities: grant.capabilities.clone(),
+                };
+                if member.overlay_ip.is_none() && !model.pools.is_empty() {
+                    match model.allocate_address(*node, None, None, 0) {
+                        Ok((ip, _pool, _, _)) => member.overlay_ip = Some(ip),
+                        Err(error) => {
+                            tracing::warn!(%node, %error, "pre-registered member has no address")
+                        }
                     }
                 }
+                if member.overlay_ip.is_none() {
+                    model.apply(ControllerCommand::UpsertMember {
+                        node: *node,
+                        member,
+                    });
+                } else {
+                    model.apply(ControllerCommand::ApproveAdmission {
+                        node: *node,
+                        member,
+                        auto: false,
+                        pool: None,
+                        zone: None,
+                        now: 0,
+                    });
+                }
             }
-            if member.overlay_ip.is_none() {
-                model.apply(ControllerCommand::UpsertMember {
-                    node: *node,
-                    member,
-                });
-            } else {
-                model.apply(ControllerCommand::ApproveAdmission {
-                    node: *node,
-                    member,
-                    auto: false,
-                    pool: None,
-                    zone: None,
-                    now: 0,
-                });
-            }
+            model.bootstrap_seeded = true;
         }
+        let seed_pools = config.control.ipam.pools.clone();
+        let seed_members: Vec<(NodeId, ControllerMemberConfig)> = config
+            .control
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .node_id
+                    .parse::<NodeId>()
+                    .map(|node| (node, member.clone()))
+            })
+            .collect::<Result<_, _>>()
+            .context("controller member node_id")?;
         Ok(Self {
             network,
             cidr: config.network.cidr,
@@ -399,6 +421,8 @@ impl ControllerState {
             grants: Arc::new(RwLock::new(grants)),
             model: Arc::new(RwLock::new(model)),
             strict_membership,
+            seed_pools,
+            seed_members,
             signing_key: None,
             signer: None,
             raft: None,
@@ -952,6 +976,87 @@ impl ControllerState {
         match (&self.raft, self.raft_id) {
             (Some(raft), Some(id)) => raft.current_leader().await == Some(id),
             _ => false,
+        }
+    }
+
+    /// Replicate the configured bootstrap members/pools exactly once. Every
+    /// replica starts from an empty Raft model, so the leader's config is the
+    /// only seed and followers converge through the log instead of diverging
+    /// on their own local config.
+    async fn seed_raft(&self, raft: &Raft<TypeConfig, StateMachineStore>) -> Result<(), String> {
+        let now = crate::credential::now_secs();
+        for pool in &self.seed_pools {
+            let model = self.model_current().await;
+            if model.pools.contains_key(&pool.id) {
+                continue;
+            }
+            raft.client_write(ControllerCommand::CreatePool { pool: pool.clone() })
+                .await
+                .map_err(|error| format!("seed pool {}: {error}", pool.id))?;
+        }
+        let mut model = self.model_current().await;
+        for (node, grant) in &self.seed_members {
+            if model.members.contains_key(node) || model.revoked.contains(node) {
+                continue;
+            }
+            let mut member = MemberRecord {
+                overlay_ip: grant.overlay_ip,
+                prefixes: grant.prefixes.iter().map(|p| p.to_string()).collect(),
+                capabilities: grant.capabilities.clone(),
+            };
+            if member.overlay_ip.is_none() && !model.pools.is_empty() {
+                match model.allocate_address(*node, None, None, now) {
+                    Ok((ip, _pool, _, _)) => member.overlay_ip = Some(ip),
+                    Err(error) => {
+                        tracing::warn!(%node, %error, "bootstrap member has no address");
+                    }
+                }
+            }
+            if member.overlay_ip.is_none() {
+                tracing::warn!(%node, "skipping bootstrap member without an overlay address");
+                continue;
+            }
+            raft.client_write(ControllerCommand::ApproveAdmission {
+                node: *node,
+                member,
+                auto: false,
+                pool: None,
+                zone: None,
+                now,
+            })
+            .await
+            .map_err(|error| format!("seed member {}: {error}", node.short()))?;
+            model = self.model_current().await;
+        }
+        raft.client_write(ControllerCommand::MarkSeeded)
+            .await
+            .map_err(|error| format!("mark seeded: {error}"))?;
+        tracing::info!(
+            members = self.seed_members.len(),
+            pools = self.seed_pools.len(),
+            "replicated controller bootstrap seeds"
+        );
+        Ok(())
+    }
+
+    async fn raft_bootstrap(&self) {
+        let Some(raft) = self.raft.clone() else {
+            return;
+        };
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if self.model_current().await.bootstrap_seeded {
+                return;
+            }
+            if !self.raft_is_leader().await {
+                continue;
+            }
+            match self.seed_raft(&raft).await {
+                Ok(()) => return,
+                Err(error) => tracing::debug!(%error, "raft bootstrap seed attempt failed"),
+            }
         }
     }
 
@@ -3033,6 +3138,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         state.set_raft_timing(timing);
         state.set_raft_identity(id);
         state.set_raft(Arc::new(node.raft), node.store);
+        let bootstrap = state.clone();
+        tokio::spawn(async move {
+            bootstrap.raft_bootstrap().await;
+        });
         let housekeeping = state.clone();
         tokio::spawn(async move {
             housekeeping.raft_housekeeping().await;

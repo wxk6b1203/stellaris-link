@@ -64,6 +64,9 @@ pub enum ControllerCommand {
     SetEpoch {
         epoch: u64,
     },
+    /// Leader finished replicating the bootstrap pools/members. Prevents a
+    /// later leader from re-seeding local config over an existing model.
+    MarkSeeded,
     ApplyLsa {
         lsa: Lsa,
     },
@@ -176,6 +179,11 @@ pub struct ControllerModel {
     pub network: NetworkId,
     pub epoch: u64,
     pub generation: u64,
+    /// True once the leader has replicated the bootstrap seeds. Existing
+    /// clusters migrating from older binaries are treated as seeded when they
+    /// already contain members/pools/revocations.
+    #[serde(default)]
+    pub bootstrap_seeded: bool,
     pub lsas: BTreeMap<NodeId, Lsa>,
     pub members: BTreeMap<NodeId, MemberRecord>,
     pub acks: BTreeMap<NodeId, AckRecord>,
@@ -213,6 +221,7 @@ impl ControllerModel {
             network,
             epoch,
             generation: 1,
+            bootstrap_seeded: false,
             lsas: BTreeMap::new(),
             members: BTreeMap::new(),
             acks: BTreeMap::new(),
@@ -242,6 +251,14 @@ impl ControllerModel {
                     true
                 } else {
                     false
+                }
+            }
+            ControllerCommand::MarkSeeded => {
+                if self.bootstrap_seeded {
+                    false
+                } else {
+                    self.bootstrap_seeded = true;
+                    true
                 }
             }
             ControllerCommand::ApplyLsa { lsa } => {
@@ -924,6 +941,7 @@ impl ControllerModel {
             network: &'a NetworkId,
             epoch: u64,
             generation: u64,
+            bootstrap_seeded: bool,
             lsas: Vec<&'a Lsa>,
             members: Vec<(&'a NodeId, &'a MemberRecord)>,
             acks: Vec<(&'a NodeId, &'a AckRecord)>,
@@ -941,6 +959,7 @@ impl ControllerModel {
             network: &self.network,
             epoch: self.epoch,
             generation: self.generation,
+            bootstrap_seeded: self.bootstrap_seeded,
             lsas: self.lsas.values().collect(),
             members: self.members.iter().collect(),
             acks: self.acks.iter().collect(),

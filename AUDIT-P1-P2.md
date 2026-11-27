@@ -49,12 +49,11 @@
 | P1-22 | IPAM 校验只在 handler，状态机可绕过（duplicate overlay/越界/exclude） | R-5 | **已修（入口层）** | `validate_overlay` 增加 CIDR/range/exclude/quarantine；enroll、approve、reinstate、grants、reserve 均复用；状态机 `overlay_taken` 仍是最后一道防线 |
 | P1-23 | member 只配 follower URL 时 snapshot/LSA/enroll 永久 503 | R-6 | **已修** | 新增 `control.failover_urls`；客户端在 503/连接失败时轮换 endpoint；`scripts/test-controller-failover.sh` 真实 3-controller 单机测试 follower→leader 通过 |
 | P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **已修（reset）/迁移 P2** | rotate/reset 目录 fsync；reset 先写 `reset.pending` 日志，崩溃后 `LogFiles::open` 自动重放；单测 `log_files_complete_an_interrupted_reset`。legacy `raft-log.json` 迁移 marker 归入 P2-84 |
-| P1-25 | LSA 授权在 client_write 前，revoke 与在途 LSA 竞争 | R-8 | **部分** | `ControllerModel::apply(ApplyLsa)` 拒绝已 revoked origin；授权与提交仍非同一原子步骤 |
-| P1-26 | Raft 初始状态来自各副本本地 config/legacy 文件，副本可分歧 | R-9 | **开放** | 架构级：bootstrap 种子应走 leader 提交的复制命令 |
+| P1-25 | LSA 授权在 client_write 前，revoke 与在途 LSA 竞争 | R-8 | **已修** | `ApplyLsa` 在状态机里拒绝 revoked origin；若 LSA 先提交，`RevokeMember` 会删除该 origin 的 LSA。两种提交顺序最终都不会留下已撤销 LSA |
+| P1-26 | Raft 初始状态来自各副本本地 config/legacy 文件，副本可分歧 | R-9 | **已修** | Raft 副本从空 model 启动；leader 通过 `CreatePool/ApproveAdmission/MarkSeeded` 复制自己的 bootstrap 种子；旧状态有 members/pools/revoked 时视为已 seed。`test-controller-bootstrap-divergence.sh` 用 3 个不同本地 seed 验证三副本收敛到 leader |
 | P1-27 | control endpoint 与 data endpoint 同 NodeId/同 relay，relay 可能把一路置 inactive | T-3 | **已修（设计）** | 数据 endpoint 同时注册 DATA/CONTROL ALPN；`control.endpoint_id` 在有 transport 时直接复用该 endpoint，不再创建同 NodeId 的第二 endpoint；accept 侧按 ALPN 过滤；`test-real-iroh-raft.sh` 通过。relay-only 真实链路仍建议补一条专项测试 |
 | P1-28 | 只有 NodeId 较小一侧拨号，单边配置/出站故障时不连接 | T-17 | **已修** | 较小侧立即拨号；较大侧先等 5s，若仍无 link 则也拨号。双向都配置时不会产生重复 role；真实 3 机静态 mesh + 单边 rogue 拒绝通过 |
 | P1-29 | 非 Raft controller 重启 generation 归零、config seed 复活 revoked | S-2/S-4 | **弃用** | 单 controller 标记 deprecated，启动告警；generation/seed 持久化列为 P2 |
-| P1-30 | `admin_secret` 未配置时回落 member secret | S-9 | **部分** | 启动时打 warn；完全分权仍要求部署配置 `admin_secret`（列为 P2） |
 
 ---
 
@@ -67,7 +66,7 @@
 | P2-01 | 启动加载 `credential.json` 不验签/不查过期，bootstrap 检查被它满足 | S-1 | 开放 |
 | P2-02 | `controller_keys` 大小写敏感字符串比较，大写 hex 导致快照全拒 | S-2 | 开放 |
 | P2-03 | 静态 overlay 不校验 CIDR/冲突（enroll/grants 两条路径） | S-3 | 部分（CIDR/update_grants 已加） |
-| P2-04 | `admin_secret` 缺省回落 member secret | S-4 | 开放（P1-30） |
+| P2-04 | `admin_secret` 缺省回落 member secret | S-4 | 已缓解：启动告警；部署必须显式配置 admin_secret 才能完全分权 |
 | P2-05 | 非 Raft 快照 epoch 用启动副本，revoke bump 不反映 | S-5 | 弃用 |
 | P2-06 | 撤销后本地 LSA DB 不清理，旧路由最多残留 30s | S-6 | 开放 |
 | P2-07 | 被撤销节点无法重新审批（reinstate 已补） | S-7 | 已修（P1-09） |
@@ -209,6 +208,7 @@
 | follower URL failover | **通过**（member 初始指向 follower，轮换到 leader；test-controller-failover.sh） |
 | iroh control 与 data 共用 endpoint | **通过**（test-real-iroh-raft.sh；不再创建同 NodeId 的第二 endpoint） |
 | IPv6 over 1280B underlay | **通过**（peer max_datagram=1192，TCP 1MiB 完整；test-netns-ipv6-mtu1280.sh） |
+| Raft bootstrap 配置分歧 | **通过**（三副本不同本地 seed 收敛到 leader；test-controller-bootstrap-divergence.sh） |
 | 3 机静态 mesh + 单边 rogue | **通过**（6 方向 connected/ping；较大 NodeId 侧 5s 后补拨号，rogue 被 allowlist 拒绝） |
 | 撤销后旧凭据/新成员 | **单测通过**（revoked tombstone 对未见节点设 floor+close；reinstate 后恢复） |
 | netns 套件 | **16/16 通过**（route-safety、acl-reject、reassembly、tun、3node、3node-controller、ipv6、nat44、nat66、mdns、discovery、raft-tls、raft-membership、iroh-large、persistence；3node-controller/ipv6 需 12–14s 收敛等待） |
@@ -224,6 +224,6 @@
 - 真实 3 机与 netns 回归均通过；本轮新增 9 个单测/回归断言（HTTP LSA 签名、
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
   单边 link SPF、grant expiry、no-op 409、IPAM range/exclude）。
-- 仍开放：Raft 初始状态副本分歧（P1-26）；legacy 迁移 marker（P2-84）。
+- **P1 清单已全部闭环**；剩余 P2-84（legacy raft-log.json 迁移 marker，仅升级窗口）。
   （`commit_command` changed/409、IPAM 入口校验、follower URL failover 已补齐。）
 - 非 Raft 按用户决定标记 deprecated，不再投入 P1 级修复；启动日志会明确告警。

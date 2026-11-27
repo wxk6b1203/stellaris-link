@@ -15,6 +15,9 @@
 > 而不是 200。**非 Raft 单 controller 模式已标记 deprecated**，启动会打印告警；
 > `control.admin_secret` 未配置但 `control.secret` 存在时也会告警（成员 secret 可调
 > admin 接口），生产请配置 `control.raft_dir` 和独立的 `admin_secret`。
+> Raft 模式下 `[[control.members]]`/`control.ipam.pools` 只作为 **leader 一次性 bootstrap
+> 种子**通过 Raft 复制（`MarkSeeded`），各副本不再用本地 config 直接构造状态；副本间
+> 配置不一致时以 leader 为准。
 >
 > **2026-11-25 入网收敛为单一凭据**：删除 PSK、join token、`admission` 的 legacy/allowlist；controller 签发带 `revision` 和过期时间的 `MembershipCredential`，peer 在 iroh 握手时用 `control.controller_keys` 验签；撤销 ≤10s 内断连并丢弃 grant/LSA；新增 `POST /v1/enroll` 与 `POST /v1/members/{node}/grants`。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。
