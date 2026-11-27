@@ -48,7 +48,7 @@
 | P1-21 | `commit_command` 丢弃状态机 apply 结果，多个写端点失败仍 200 | R-4 | **已修** | `CommandResult.changed` + `commit_command` 对 no-op 返回 409；create/update/delete pool、lease、reserve、reassign、approve/deny 等统一生效 |
 | P1-22 | IPAM 校验只在 handler，状态机可绕过（duplicate overlay/越界/exclude） | R-5 | **已修（入口层）** | `validate_overlay` 增加 CIDR/range/exclude/quarantine；enroll、approve、reinstate、grants、reserve 均复用；状态机 `overlay_taken` 仍是最后一道防线 |
 | P1-23 | member 只配 follower URL 时 snapshot/LSA/enroll 永久 503 | R-6 | **已修** | 新增 `control.failover_urls`；客户端在 503/连接失败时轮换 endpoint；`scripts/test-controller-failover.sh` 真实 3-controller 单机测试 follower→leader 通过 |
-| P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **部分** | rotate/reset 现在对新 segment/目录做 fsync；reset 的“先删后写”原子切换和 legacy 迁移 marker 仍需专项设计 + kill -9 注入 |
+| P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **已修（reset）/迁移 P2** | rotate/reset 目录 fsync；reset 先写 `reset.pending` 日志，崩溃后 `LogFiles::open` 自动重放；单测 `log_files_complete_an_interrupted_reset`。legacy `raft-log.json` 迁移 marker 归入 P2-84 |
 | P1-25 | LSA 授权在 client_write 前，revoke 与在途 LSA 竞争 | R-8 | **部分** | `ControllerModel::apply(ApplyLsa)` 拒绝已 revoked origin；授权与提交仍非同一原子步骤 |
 | P1-26 | Raft 初始状态来自各副本本地 config/legacy 文件，副本可分歧 | R-9 | **开放** | 架构级：bootstrap 种子应走 leader 提交的复制命令 |
 | P1-27 | control endpoint 与 data endpoint 同 NodeId/同 relay，relay 可能把一路置 inactive | T-3 | **已修（设计）** | 数据 endpoint 同时注册 DATA/CONTROL ALPN；`control.endpoint_id` 在有 transport 时直接复用该 endpoint，不再创建同 NodeId 的第二 endpoint；accept 侧按 ALPN 过滤；`test-real-iroh-raft.sh` 通过。relay-only 真实链路仍建议补一条专项测试 |
@@ -167,6 +167,7 @@
 | P2-81 | PMTUD 三个脚本拓扑不可复现/`-M dont` 语义误读 | E-A/E-C | 开放（`-M dont` 已复核为“不置 DF”，不是 bug） |
 | P2-82 | 脚本端口/目录冲突（5801/5900/47001/opt 路径） | E-C | 开放 |
 | P2-83 | 3host overlay/IPv6 不做 loss/path/connected 断言 | E-B | 开放 |
+| P2-84 | legacy `raft-log.json` 迁移无 marker：崩溃后可能只读新目录、丢失 vote/committed | R-7 | 开放（仅升级窗口，P1-24 的 reset 已修） |
 
 > 说明：`-M dont` 在 iputils 里是“不设置 DF”，因此原脚本的 2000B ping 确实会
 > 本地分片，evidence-review 的“DF 假绿”判断是误报；本轮已实测 0% loss。
@@ -196,7 +197,7 @@
 
 | 测试 | 结果 |
 |---|---|
-| `cargo test --workspace` | 220 passed / 0 failed / 2 ignored |
+| `cargo test --workspace` | 221 passed / 0 failed / 2 ignored |
 | 3 机 controller HA + mTLS + failover | **通过**（leader 1→2，snapshot/failover 正常；test-real-3host-ha.sh） |
 | 3 机 IPv4 TUN overlay | **通过**（3/3、1000B/2000B 各 3/3，0% loss） |
 | 3 机 IPv6 TUN overlay | **通过**（1200B 3/3，0% loss） |
@@ -223,6 +224,6 @@
 - 真实 3 机与 netns 回归均通过；本轮新增 9 个单测/回归断言（HTTP LSA 签名、
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
   单边 link SPF、grant expiry、no-op 409、IPAM range/exclude）。
-- 仍开放且建议优先：Raft reset/legacy 迁移的原子切换、Raft 初始状态副本分歧。
+- 仍开放：Raft 初始状态副本分歧（P1-26）；legacy 迁移 marker（P2-84）。
   （`commit_command` changed/409、IPAM 入口校验、follower URL failover 已补齐。）
 - 非 Raft 按用户决定标记 deprecated，不再投入 P1 级修复；启动日志会明确告警。

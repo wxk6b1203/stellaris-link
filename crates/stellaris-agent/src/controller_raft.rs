@@ -184,6 +184,11 @@ fn read_log_segment(path: &Path) -> io::Result<Vec<(u64, Vec<u8>)>> {
     Ok(out)
 }
 
+#[derive(Serialize, Deserialize)]
+struct ResetPending {
+    entries: Vec<(u64, Vec<u8>)>,
+}
+
 #[derive(Default)]
 struct LogFiles {
     dir: PathBuf,
@@ -196,6 +201,30 @@ struct LogFiles {
 impl LogFiles {
     fn open(dir: PathBuf) -> io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        let pending_path = dir.join("reset.pending");
+        if let Ok(bytes) = std::fs::read(&pending_path) {
+            match serde_json::from_slice::<ResetPending>(&bytes) {
+                Ok(pending) => {
+                    // Complete an interrupted reset before loading segments.
+                    let mut files = Self {
+                        dir: dir.clone(),
+                        ..Default::default()
+                    };
+                    files.reset_locked(&pending.entries)?;
+                    let _ = std::fs::remove_file(&pending_path);
+                    sync_dir(&dir);
+                    return Ok(files);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %pending_path.display(),
+                        "ignoring invalid raft reset journal"
+                    );
+                    let _ = std::fs::remove_file(&pending_path);
+                }
+            }
+        }
         let mut segment_paths = Vec::new();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
@@ -272,6 +301,20 @@ impl LogFiles {
     }
 
     fn reset(&mut self, entries: &[(u64, Vec<u8>)]) -> io::Result<()> {
+        // Persist the survivors first. A crash at any point after this leaves
+        // a valid journal that `open` replays, instead of a half-deleted log.
+        let pending = ResetPending {
+            entries: entries.to_vec(),
+        };
+        let bytes = serde_json::to_vec(&pending).map_err(invalid_data)?;
+        atomic_write(&self.dir.join("reset.pending"), &bytes)?;
+        self.reset_locked(entries)?;
+        let _ = std::fs::remove_file(self.dir.join("reset.pending"));
+        sync_dir(&self.dir);
+        Ok(())
+    }
+
+    fn reset_locked(&mut self, entries: &[(u64, Vec<u8>)]) -> io::Result<()> {
         if let Some(file) = self.active.take() {
             let _ = file.sync_data();
         }
@@ -3277,6 +3320,36 @@ mod tests {
         let entries = reader.try_get_log_entries(1u64..=200u64).await.unwrap();
         assert_eq!(entries.len(), 200);
         assert_eq!(entries.last().unwrap().index(), 200);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_files_complete_an_interrupted_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "stellaris-raft-reset-journal-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Leave a stale segment and a valid reset journal, as if the process
+        // died after writing the journal but before rewriting segments.
+        std::fs::write(dir.join("seg-00000000000000000001.wal"), b"stale").unwrap();
+        let pending = ResetPending {
+            entries: vec![(5u64, b"five".to_vec()), (6u64, b"six".to_vec())],
+        };
+        std::fs::write(
+            dir.join("reset.pending"),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        let files = LogFiles::open(dir.clone()).unwrap();
+        assert_eq!(files.segments.len(), 1);
+        assert_eq!(files.segments[0].0, 5);
+        assert_eq!(files.segments[0].1, 6);
+        let entries = read_log_segment(&files.segments[0].2).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 5);
+        assert_eq!(entries[0].1, b"five");
+        assert!(!dir.join("reset.pending").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
