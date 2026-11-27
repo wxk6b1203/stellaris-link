@@ -214,10 +214,12 @@
 
 - 本轮把安全边界上最危险的 P1 闭环：HTTP LSA 签名、撤销持久化、manifest 重放、
   预认证帧上限、link 竞态、多跳授权、LSA 双向校验、凭据过期重检、reinstate、
-  中转 PTB、FIB 过滤、非 Raft deprecated 告警。
+  中转 PTB、FIB 过滤、非 Raft deprecated 告警；并把 `commit_command` 的 no-op
+  统一改为 409、IPAM range/exclude/quarantine 校验放到所有入口。
 - 真实 3 机与 netns 回归均通过；本轮新增 9 个单测/回归断言（HTTP LSA 签名、
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
-  单边 link SPF、grant expiry）。
-- 仍开放且建议优先：`commit_command` 的 changed/409、follower URL failover、
-  Raft 日志崩溃一致性、control/data endpoint 同 NodeId 复现、单边拨号规则。
+  单边 link SPF、grant expiry、no-op 409、IPAM range/exclude）。
+- 仍开放且建议优先：follower URL failover、Raft 日志 rotate/reset 崩溃一致性、
+  Raft 初始状态副本分歧、control/data endpoint 同 NodeId 复现、单边拨号规则。
+  （`commit_command` changed/409 与 IPAM 入口校验已在本轮补齐。）
 - 非 Raft 按用户决定标记 deprecated，不再投入 P1 级修复；启动日志会明确告警。
