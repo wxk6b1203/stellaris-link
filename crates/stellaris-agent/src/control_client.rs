@@ -216,32 +216,45 @@ async fn run_iroh(
         .collect();
     let addr = EndpointAddr::from_parts(remote, addrs);
 
-    let key = SecretKey::from_bytes(&state.identity_secret);
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(key)
-        .alpns(vec![CONTROL_ALPN.to_vec()]);
-    if state.config.transport.disable_relay {
-        builder = builder.relay_mode(RelayMode::Disabled);
-    } else if !state.config.transport.relay_urls.is_empty() {
-        let urls: Vec<RelayUrl> = state
-            .config
-            .transport
-            .relay_urls
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        builder = builder.relay_mode(RelayMode::custom(urls));
-    }
-    let endpoint = match builder.bind().await {
-        Ok(ep) => ep,
-        Err(e) => {
-            tracing::warn!(error = %e, "bind control endpoint");
-            return;
+    // Prefer the data endpoint: a second endpoint with the same NodeId on the
+    // same relay makes iroh-relay mark one of them inactive, which can silently
+    // break relay-only data paths. A standalone endpoint is only needed when
+    // the data transport is disabled.
+    let endpoint = if let Some(transport) = &transport {
+        transport.endpoint()
+    } else {
+        let key = SecretKey::from_bytes(&state.identity_secret);
+        let mut builder = Endpoint::builder(presets::N0)
+            .secret_key(key)
+            .alpns(vec![CONTROL_ALPN.to_vec()]);
+        if state.config.transport.disable_relay {
+            builder = builder.relay_mode(RelayMode::Disabled);
+        } else if !state.config.transport.relay_urls.is_empty() {
+            let urls: Vec<RelayUrl> = state
+                .config
+                .transport
+                .relay_urls
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            builder = builder.relay_mode(RelayMode::custom(urls));
         }
+        let endpoint = match builder.bind().await {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::warn!(error = %e, "bind control endpoint");
+                return;
+            }
+        };
+        if !state.config.transport.disable_relay
+            && tokio::time::timeout(Duration::from_secs(10), endpoint.online())
+                .await
+                .is_err()
+        {
+            tracing::warn!("control relay did not come online within 10s");
+        }
+        endpoint
     };
-    if !state.config.transport.disable_relay {
-        endpoint.online().await;
-    }
 
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;

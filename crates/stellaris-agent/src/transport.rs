@@ -109,7 +109,13 @@ async fn build_endpoint(
 ) -> anyhow::Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret.clone())
-        .alpns(vec![DATA_ALPN.to_vec()]);
+        // The data endpoint also carries the controller control ALPN when
+        // `control.endpoint_id` is used, so the member does not register a
+        // second endpoint with the same NodeId on the same relay.
+        .alpns(vec![
+            DATA_ALPN.to_vec(),
+            crate::control_wire::CONTROL_ALPN.to_vec(),
+        ]);
     if let Some(port) = port {
         let ip = config
             .transport
@@ -260,6 +266,11 @@ impl IrohTransport {
                             continue;
                         }
                     };
+                    if conn.alpn() != DATA_ALPN {
+                        debug!(alpn = ?conn.alpn(), "ignoring non-data inbound connection");
+                        conn.close(4u8.into(), b"wrong alpn");
+                        continue;
+                    }
                     let remote = conn.remote_id();
                     let node = NodeId::new(*remote.as_bytes());
                     if transport.is_blocked(node) {
@@ -445,6 +456,11 @@ impl IrohTransport {
 
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// Shared endpoint used for control connections when possible.
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
     }
 
     /// Force-close every link to a peer (used when the controller revokes it).

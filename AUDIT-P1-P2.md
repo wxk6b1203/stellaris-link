@@ -51,7 +51,7 @@
 | P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **开放** | 需目录 fsync/原子切换 + kill -9 注入；本轮未改 |
 | P1-25 | LSA 授权在 client_write 前，revoke 与在途 LSA 竞争 | R-8 | **部分** | `ControllerModel::apply(ApplyLsa)` 拒绝已 revoked origin；授权与提交仍非同一原子步骤 |
 | P1-26 | Raft 初始状态来自各副本本地 config/legacy 文件，副本可分歧 | R-9 | **开放** | 架构级：bootstrap 种子应走 leader 提交的复制命令 |
-| P1-27 | control endpoint 与 data endpoint 同 NodeId/同 relay，relay 可能把一路置 inactive | T-3 | **待复现** | 需在新 3 机跑 control.endpoint_id + relay-only 场景；修复是传输层复用 endpoint，成本高 |
+| P1-27 | control endpoint 与 data endpoint 同 NodeId/同 relay，relay 可能把一路置 inactive | T-3 | **已修（设计）** | 数据 endpoint 同时注册 DATA/CONTROL ALPN；`control.endpoint_id` 在有 transport 时直接复用该 endpoint，不再创建同 NodeId 的第二 endpoint；accept 侧按 ALPN 过滤；`test-real-iroh-raft.sh` 通过。relay-only 真实链路仍建议补一条专项测试 |
 | P1-28 | 只有 NodeId 较小一侧拨号，单边配置/出站故障时不连接 | T-17 | **开放** | 静态 mesh rogue 测试约 50% 失败；需要连接代际/双向协商 |
 | P1-29 | 非 Raft controller 重启 generation 归零、config seed 复活 revoked | S-2/S-4 | **弃用** | 单 controller 标记 deprecated，启动告警；generation/seed 持久化列为 P2 |
 | P1-30 | `admin_secret` 未配置时回落 member secret | S-9 | **部分** | 启动时打 warn；完全分权仍要求部署配置 `admin_secret`（列为 P2） |
@@ -206,6 +206,7 @@
 | ACK epoch / idle generation | **通过**（正确 epoch 200、陈旧 409、idle gen 3→3；test-controller-ack.sh） |
 | manifest/snapshot 重放 | **单测通过**（floor 持久化、旧 epoch/generation 拒绝） |
 | follower URL failover | **通过**（member 初始指向 follower，轮换到 leader；test-controller-failover.sh） |
+| iroh control 与 data 共用 endpoint | **通过**（test-real-iroh-raft.sh；不再创建同 NodeId 的第二 endpoint） |
 | 撤销后旧凭据/新成员 | **单测通过**（revoked tombstone 对未见节点设 floor+close；reinstate 后恢复） |
 | netns 套件 | **16/16 通过**（route-safety、acl-reject、reassembly、tun、3node、3node-controller、ipv6、nat44、nat66、mdns、discovery、raft-tls、raft-membership、iroh-large、persistence；3node-controller/ipv6 需 12–14s 收敛等待） |
 
@@ -221,6 +222,6 @@
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
   单边 link SPF、grant expiry、no-op 409、IPAM range/exclude）。
 - 仍开放且建议优先：Raft 日志 rotate/reset 崩溃一致性、Raft 初始状态副本分歧、
-  control/data endpoint 同 NodeId 复现、单边拨号规则、IPv6 <1296 端到端。
+  单边拨号规则、IPv6 <1296 端到端。
   （`commit_command` changed/409、IPAM 入口校验、follower URL failover 已补齐。）
 - 非 Raft 按用户决定标记 deprecated，不再投入 P1 级修复；启动日志会明确告警。
