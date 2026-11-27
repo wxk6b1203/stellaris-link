@@ -49,6 +49,8 @@ jobs:
         run: sudo BIN="$PWD/target/release/stellaris-agent" ./scripts/test-netns-reassembly.sh
       - name: netns 3-node controller
         run: sudo BIN="$PWD/target/release/stellaris-agent" CTRL="$PWD/target/release/stellaris-controller" ./scripts/test-linux-netns-3node-controller.sh
+      - name: netns IPv6 over 1280-byte underlay
+        run: sudo BIN="$PWD/target/release/stellaris-agent" ./scripts/test-netns-ipv6-mtu1280.sh
 
   scripts:
     name: script lint

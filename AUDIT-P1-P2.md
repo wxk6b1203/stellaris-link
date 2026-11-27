@@ -43,7 +43,7 @@
 | P1-16 | 配置 relay 后丢弃 `peer.addrs`，direct 永不尝试 | T-8 | **已修**（上一轮） | 仅 dual-endpoint 模式强制 pinned relay；roaming 初始 direct |
 | P1-17 | `/v1/peers` path/rtt/mtu 建连后不再刷新 | T-7 | **已修**（上一轮） | 2s path watcher；真实 roaming `direct→relay` 可观测 |
 | P1-18 | 中转不按下一跳 MTU 检查/回 PTB，异构 MTU 静默丢包 | D-2 | **已修** | transit 超限时向上一跳回 ICMP PTB；单测 `transit_too_big_returns_ptb_to_previous_hop` |
-| P1-19 | IPv6 underlay <1296B 时 PTB 不可达、MSS 被 clamp 进黑洞 | D-1 | **部分** | `path_mtu` 不再锁 1280，MSS/PTB 使用真实容量；单测 `ipv6_path_mtu_is_not_pinned_to_1280`；TUN 设备 MTU/端到端仍待测（P2 边界） |
+| P1-19 | IPv6 underlay <1296B 时 PTB 不可达、MSS 被 clamp 进黑洞 | D-1 | **已修** | `path_mtu` 不再锁 1280，MSS/PTB 使用真实容量；新增 `test-netns-ipv6-mtu1280.sh`：veth MTU 1280、peer max_datagram=1192 下，1000B ping 0% loss、TCP 1MiB 完整传输 |
 | P1-20 | FIB 选中失联下一跳，ECMP 槽黑洞 | D-18 | **已修**（P2 顺带） | `FibEntry::select_where` + dataplane 只选 connected peer |
 | P1-21 | `commit_command` 丢弃状态机 apply 结果，多个写端点失败仍 200 | R-4 | **已修** | `CommandResult.changed` + `commit_command` 对 no-op 返回 409；create/update/delete pool、lease、reserve、reassign、approve/deny 等统一生效 |
 | P1-22 | IPAM 校验只在 handler，状态机可绕过（duplicate overlay/越界/exclude） | R-5 | **已修（入口层）** | `validate_overlay` 增加 CIDR/range/exclude/quarantine；enroll、approve、reinstate、grants、reserve 均复用；状态机 `overlay_taken` 仍是最后一道防线 |
@@ -207,6 +207,7 @@
 | manifest/snapshot 重放 | **单测通过**（floor 持久化、旧 epoch/generation 拒绝） |
 | follower URL failover | **通过**（member 初始指向 follower，轮换到 leader；test-controller-failover.sh） |
 | iroh control 与 data 共用 endpoint | **通过**（test-real-iroh-raft.sh；不再创建同 NodeId 的第二 endpoint） |
+| IPv6 over 1280B underlay | **通过**（peer max_datagram=1192，TCP 1MiB 完整；test-netns-ipv6-mtu1280.sh） |
 | 撤销后旧凭据/新成员 | **单测通过**（revoked tombstone 对未见节点设 floor+close；reinstate 后恢复） |
 | netns 套件 | **16/16 通过**（route-safety、acl-reject、reassembly、tun、3node、3node-controller、ipv6、nat44、nat66、mdns、discovery、raft-tls、raft-membership、iroh-large、persistence；3node-controller/ipv6 需 12–14s 收敛等待） |
 
@@ -222,6 +223,6 @@
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
   单边 link SPF、grant expiry、no-op 409、IPAM range/exclude）。
 - 仍开放且建议优先：Raft reset/legacy 迁移的原子切换、Raft 初始状态副本分歧、
-  单边拨号规则、IPv6 <1296 端到端。
+  单边拨号规则。
   （`commit_command` changed/409、IPAM 入口校验、follower URL failover 已补齐。）
 - 非 Raft 按用户决定标记 deprecated，不再投入 P1 级修复；启动日志会明确告警。
