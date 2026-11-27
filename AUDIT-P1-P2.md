@@ -45,8 +45,8 @@
 | P1-18 | 中转不按下一跳 MTU 检查/回 PTB，异构 MTU 静默丢包 | D-2 | **已修** | transit 超限时向上一跳回 ICMP PTB；单测 `transit_too_big_returns_ptb_to_previous_hop` |
 | P1-19 | IPv6 underlay <1296B 时 PTB 不可达、MSS 被 clamp 进黑洞 | D-1 | **部分** | `path_mtu` 不再锁 1280，MSS/PTB 使用真实容量；单测 `ipv6_path_mtu_is_not_pinned_to_1280`；TUN 设备 MTU/端到端仍待测（P2 边界） |
 | P1-20 | FIB 选中失联下一跳，ECMP 槽黑洞 | D-18 | **已修**（P2 顺带） | `FibEntry::select_where` + dataplane 只选 connected peer |
-| P1-21 | `commit_command` 丢弃状态机 apply 结果，多个写端点失败仍 200 | R-4 | **开放** | 需要给 `CommandResult` 增加 `changed` 并逐个 handler 映射 409；已记录，本轮未做 |
-| P1-22 | IPAM 校验只在 handler，状态机可绕过（duplicate overlay/越界/exclude） | R-5 | **部分** | `validate_overlay` 增加 CIDR；`update_grants` 复用校验；auto enroll/reserve/exclude 仍未进状态机 |
+| P1-21 | `commit_command` 丢弃状态机 apply 结果，多个写端点失败仍 200 | R-4 | **已修** | `CommandResult.changed` + `commit_command` 对 no-op 返回 409；create/update/delete pool、lease、reserve、reassign、approve/deny 等统一生效 |
+| P1-22 | IPAM 校验只在 handler，状态机可绕过（duplicate overlay/越界/exclude） | R-5 | **已修（入口层）** | `validate_overlay` 增加 CIDR/range/exclude/quarantine；enroll、approve、reinstate、grants、reserve 均复用；状态机 `overlay_taken` 仍是最后一道防线 |
 | P1-23 | member 只配 follower URL 时 snapshot/LSA/enroll 永久 503 | R-6 | **开放** | 需要多 controller URL failover 或 leader-hint 重试；当前文档应明确必须指向 leader/LB |
 | P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **开放** | 需目录 fsync/原子切换 + kill -9 注入；本轮未改 |
 | P1-25 | LSA 授权在 client_write 前，revoke 与在途 LSA 竞争 | R-8 | **部分** | `ControllerModel::apply(ApplyLsa)` 拒绝已 revoked origin；授权与提交仍非同一原子步骤 |
@@ -54,7 +54,7 @@
 | P1-27 | control endpoint 与 data endpoint 同 NodeId/同 relay，relay 可能把一路置 inactive | T-3 | **待复现** | 需在新 3 机跑 control.endpoint_id + relay-only 场景；修复是传输层复用 endpoint，成本高 |
 | P1-28 | 只有 NodeId 较小一侧拨号，单边配置/出站故障时不连接 | T-17 | **开放** | 静态 mesh rogue 测试约 50% 失败；需要连接代际/双向协商 |
 | P1-29 | 非 Raft controller 重启 generation 归零、config seed 复活 revoked | S-2/S-4 | **弃用** | 单 controller 标记 deprecated，启动告警；generation/seed 持久化列为 P2 |
-| P1-30 | `admin_secret` 未配置时回落 member secret | S-9 | **开放（P2）** | 默认共享 secret 部署下成员即管理员；建议下轮强制 admin_secret 或启动拒绝 |
+| P1-30 | `admin_secret` 未配置时回落 member secret | S-9 | **部分** | 启动时打 warn；完全分权仍要求部署配置 `admin_secret`（列为 P2） |
 
 ---
 
@@ -196,7 +196,7 @@
 
 | 测试 | 结果 |
 |---|---|
-| `cargo test --workspace` | 219 passed / 0 failed / 2 ignored |
+| `cargo test --workspace` | 220 passed / 0 failed / 2 ignored |
 | 3 机 controller HA + mTLS + failover | **通过**（leader 1→2，snapshot/failover 正常；test-real-3host-ha.sh） |
 | 3 机 IPv4 TUN overlay | **通过**（3/3、1000B/2000B 各 3/3，0% loss） |
 | 3 机 IPv6 TUN overlay | **通过**（1200B 3/3，0% loss） |
@@ -215,7 +215,7 @@
 - 本轮把安全边界上最危险的 P1 闭环：HTTP LSA 签名、撤销持久化、manifest 重放、
   预认证帧上限、link 竞态、多跳授权、LSA 双向校验、凭据过期重检、reinstate、
   中转 PTB、FIB 过滤、非 Raft deprecated 告警。
-- 真实 3 机与 netns 回归均通过；本轮新增 8 个单测/回归断言（HTTP LSA 签名、
+- 真实 3 机与 netns 回归均通过；本轮新增 9 个单测/回归断言（HTTP LSA 签名、
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
   单边 link SPF、grant expiry）。
 - 仍开放且建议优先：`commit_command` 的 changed/409、follower URL failover、

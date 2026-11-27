@@ -268,6 +268,13 @@ impl ControllerState {
         if config.node.role != "controller" {
             bail!("node.role must be \"controller\" for stellaris-controller");
         }
+        if config.control.admin_secret.is_none() && config.control.secret.is_some() {
+            tracing::warn!(
+                target: "stellaris_deprecation",
+                "control.admin_secret is unset: every member holding control.secret can \
+                 call admin endpoints (revoke, grants, IPAM, reinstate)"
+            );
+        }
         if config.control.allow_unsigned_lsa {
             tracing::warn!(
                 target: "stellaris_deprecation",
@@ -552,6 +559,29 @@ impl ControllerState {
                 format!("overlay address {ip} is outside the configured IPAM pools"),
             ));
         }
+        if let Some(pool) = model.pool_of(ip) {
+            if let Some((start, end)) = pool.range
+                && (ip < start || ip > end)
+            {
+                return Err((
+                    409,
+                    format!("overlay address {ip} is outside pool {} range", pool.id),
+                ));
+            }
+            if pool.exclude.iter().any(|prefix| prefix.contains(&ip)) {
+                return Err((
+                    409,
+                    format!("overlay address {ip} is excluded from pool {}", pool.id),
+                ));
+            }
+        }
+        if model
+            .quarantine
+            .get(&ip)
+            .is_some_and(|until| *until > crate::credential::now_secs())
+        {
+            return Err((409, format!("overlay address {ip} is quarantined")));
+        }
         Ok(())
     }
 
@@ -583,20 +613,41 @@ impl ControllerState {
 
     /// Write a command through Raft when enabled, otherwise apply it locally.
     async fn commit_command(&self, command: ControllerCommand) -> Result<(), (u16, String)> {
+        if self.commit_command_changed(command).await? {
+            Ok(())
+        } else {
+            // A deterministic no-op must not be reported as success: callers
+            // would otherwise believe a pool was deleted, a lease renewed, or
+            // a member admitted when the replicated model did not change.
+            Err((409, "command produced no state change".into()))
+        }
+    }
+
+    /// Like [`commit_command`] but reports whether the deterministic state
+    /// machine actually changed. Handlers use this to return 409 instead of
+    /// reporting success for a no-op command.
+    async fn commit_command_changed(
+        &self,
+        command: ControllerCommand,
+    ) -> Result<bool, (u16, String)> {
         if let Some(raft) = &self.raft {
-            raft.client_write(command)
+            let response = raft
+                .client_write(command)
                 .await
-                .map(|_| ())
-                .map_err(|e| (503, format!("raft write failed: {e}")))
+                .map_err(|e| (503, format!("raft write failed: {e}")))?;
+            Ok(response.data.changed)
         } else {
             self.append_command(command.clone());
-            self.model
+            let changed = self
+                .model
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .apply(command.clone());
-            self.mirror_member_command(&command);
-            self.generation.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if changed {
+                self.mirror_member_command(&command);
+                self.generation.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(changed)
         }
     }
 
@@ -2643,6 +2694,13 @@ async fn approve_admission(
             }
         },
     };
+    if let Err((code, message)) = state.validate_overlay(&model, node, overlay) {
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT),
+            message,
+        )
+            .into_response();
+    }
     let member = crate::controller_model::MemberRecord {
         overlay_ip: Some(overlay),
         prefixes: req.prefixes.clone(),
@@ -5169,6 +5227,40 @@ quarantine_secs = 30"#,
         assert_eq!(pools["pools"].as_array().unwrap().len(), 1);
         let (status, _) = get_json(&app, "/v1/ipam/pools").await;
         assert_eq!(status, StatusCode::OK);
+
+        // A duplicate create is a deterministic no-op and must be 409.
+        let create_pool = |id: &'static str| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ipam/pools")
+                    .header("x-stellaris-secret", "admin-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"id": id, "cidr": "10.20.1.0/24"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(create_pool("q").await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            create_pool("q").await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        // Deleting a pool with live leases without force is also a no-op.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/ipam/pools/p")
+                    .header("x-stellaris-secret", "admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -5219,6 +5311,40 @@ lease_secs = 600"#,
                 .await
                 .0,
             StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn ipam_rejects_range_exclude_and_quarantine() {
+        let dir = temp_state_dir();
+        let config = ipam_config(
+            &dir,
+            r#"[[control.ipam.pools]]
+id = "p"
+cidr = "10.20.0.0/24"
+range = ["10.20.0.10", "10.20.0.20"]
+exclude = ["10.20.0.12/32"]
+lease_secs = 600"#,
+            "",
+        );
+        let mut state = ControllerState::from_config(&config).unwrap();
+        state.set_signing_key([7u8; 32]);
+        let network = state.network;
+        let app = router(state);
+        for ip in ["10.20.0.5", "10.20.0.12", "10.20.0.25"] {
+            assert_eq!(
+                post_enroll(&app, &network, [4u8; 32], false, Some(ip))
+                    .await
+                    .0,
+                StatusCode::CONFLICT,
+                "{ip} should be rejected"
+            );
+        }
+        assert_eq!(
+            post_enroll(&app, &network, [4u8; 32], false, Some("10.20.0.15"))
+                .await
+                .0,
+            StatusCode::ACCEPTED
         );
     }
 

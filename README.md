@@ -10,8 +10,11 @@
 > revision/snapshot/manifest floor 持久化到 `control-state.json`，重启后旧快照/旧 manifest/
 > 旧凭据不能复活；新增 `POST /v1/members/{node}/reinstate` 显式恢复被撤销成员；
 > `transport.disable_discovery = true` 同时关闭 LSA 自动加 peer；transit 超下一跳 MTU
-> 会回 ICMP PTB；SPF 只使用双向 link。**非 Raft 单 controller 模式已标记 deprecated**，
-> 启动会打印告警，生产请配置 `control.raft_dir`。
+> 会回 ICMP PTB；SPF 只使用双向 link；IPAM 的 CIDR/range/exclude/quarantine 在
+> enroll/approve/grants/reserve 入口统一校验；管理写命令的确定性 no-op 返回 409
+> 而不是 200。**非 Raft 单 controller 模式已标记 deprecated**，启动会打印告警；
+> `control.admin_secret` 未配置但 `control.secret` 存在时也会告警（成员 secret 可调
+> admin 接口），生产请配置 `control.raft_dir` 和独立的 `admin_secret`。
 >
 > **2026-11-25 入网收敛为单一凭据**：删除 PSK、join token、`admission` 的 legacy/allowlist；controller 签发带 `revision` 和过期时间的 `MembershipCredential`，peer 在 iroh 握手时用 `control.controller_keys` 验签；撤销 ≤10s 内断连并丢弃 grant/LSA；新增 `POST /v1/enroll` 与 `POST /v1/members/{node}/grants`。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。

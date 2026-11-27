@@ -48,6 +48,10 @@ openraft::declare_raft_types!(
 pub struct CommandResult {
     pub generation: u64,
     pub epoch: u64,
+    /// False when the command was a deterministic no-op (duplicate pool,
+    /// delete with live leases, approve of an already-taken address, ...).
+    #[serde(default)]
+    pub changed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -604,16 +608,15 @@ struct StateMachineData {
     last_membership: StoredMembershipOf<TypeConfig>,
 }
 
-fn apply_entry_to_data(data: &mut StateMachineData, entry: &EntryOf<TypeConfig>) {
+fn apply_entry_to_data(data: &mut StateMachineData, entry: &EntryOf<TypeConfig>) -> bool {
     data.last_applied = Some(entry.log_id);
     match &entry.payload {
-        EntryPayload::Blank => {}
-        EntryPayload::Normal(command) => {
-            data.model.apply(command.clone());
-        }
+        EntryPayload::Blank => false,
+        EntryPayload::Normal(command) => data.model.apply(command.clone()),
         EntryPayload::Membership(membership) => {
             data.last_membership =
                 StoredMembershipOf::<TypeConfig>::new(Some(entry.log_id), membership.clone());
+            true
         }
     }
 }
@@ -828,13 +831,14 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             self.append_wal(&entry)?;
             let response = {
                 let mut inner = self.inner.write().await;
-                apply_entry_to_data(&mut inner, &entry);
+                let changed = apply_entry_to_data(&mut inner, &entry);
                 if let Err(error) = self.maybe_snapshot(&inner) {
                     tracing::warn!(%error, "state snapshot failed; keeping the WAL");
                 }
                 CommandResult {
                     generation: inner.model.generation,
                     epoch: inner.model.epoch,
+                    changed,
                 }
             };
             if let Some(responder) = responder {
