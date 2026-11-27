@@ -22,12 +22,13 @@ pub mod stats;
 pub mod transport;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use stellaris_routing::RouteEngine;
 use stellaris_types::{Config, NetworkId, NodeId, PeerConfig, RouteAttributes};
 use uuid::Uuid;
@@ -48,6 +49,12 @@ pub struct AgentState {
     pub credential: Arc<RwLock<Option<credential::SignedCredential>>>,
     /// Highest credential revision observed per node (replay fencing).
     pub revisions: Arc<RwLock<HashMap<NodeId, u64>>>,
+    /// Last applied `(epoch, generation)` from a signed snapshot. Persisted so
+    /// a replayed old snapshot cannot revive revoked members after a restart.
+    pub snapshot_floor: Arc<RwLock<(u64, u64)>>,
+    /// Last accepted `(epoch, generation)` from a signed membership manifest.
+    pub manifest_floor: Arc<RwLock<(u64, u64)>>,
+    control_state_path: PathBuf,
     /// Effective local overlay address (config or controller-allocated).
     pub local_overlay: Arc<RwLock<Option<std::net::IpAddr>>>,
     /// Live TUN handle, set once the dataplane has created the device.
@@ -56,6 +63,34 @@ pub struct AgentState {
     pub stats: Arc<stats::Stats>,
     pub reassembly: Arc<std::sync::Mutex<reassembly::Reassembler>>,
     pub started_at: Instant,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ControlStateDisk {
+    #[serde(default)]
+    revisions: BTreeMap<String, u64>,
+    #[serde(default)]
+    snapshot_epoch: u64,
+    #[serde(default)]
+    snapshot_generation: u64,
+    #[serde(default)]
+    manifest_epoch: u64,
+    #[serde(default)]
+    manifest_generation: u64,
+}
+
+fn load_control_state(path: &std::path::Path) -> ControlStateDisk {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, path = %path.display(), "invalid control state; starting empty");
+            ControlStateDisk::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ControlStateDisk::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "read control state");
+            ControlStateDisk::default()
+        }
+    }
 }
 
 /// Same-zone routes get a local_pref bonus; the zone is kept for explain/UI.
@@ -199,6 +234,21 @@ impl AgentState {
             None
         };
         let local_overlay = config.node.overlay_ip.or(cached_overlay);
+        let control_state_path = state_dir.join("control-state.json");
+        let control_state = load_control_state(&control_state_path);
+        let revisions: HashMap<NodeId, u64> = control_state
+            .revisions
+            .iter()
+            .filter_map(|(node, revision)| node.parse().ok().map(|node| (node, *revision)))
+            .collect();
+        let snapshot_floor = (
+            control_state.snapshot_epoch,
+            control_state.snapshot_generation,
+        );
+        let manifest_floor = (
+            control_state.manifest_epoch,
+            control_state.manifest_generation,
+        );
 
         Ok(Self {
             config: Arc::new(config),
@@ -209,7 +259,10 @@ impl AgentState {
             peers,
             grants: Arc::new(RwLock::new(HashMap::new())),
             credential: Arc::new(RwLock::new(credential)),
-            revisions: Arc::new(RwLock::new(HashMap::new())),
+            revisions: Arc::new(RwLock::new(revisions)),
+            snapshot_floor: Arc::new(RwLock::new(snapshot_floor)),
+            manifest_floor: Arc::new(RwLock::new(manifest_floor)),
+            control_state_path,
             local_overlay: Arc::new(RwLock::new(local_overlay)),
             dataplane_handle: Arc::new(std::sync::Mutex::new(None)),
             policy,
@@ -300,11 +353,144 @@ impl AgentState {
     }
 
     pub fn observe_revision(&self, node: NodeId, revision: u64) {
-        let mut revisions = self.revisions.write().unwrap_or_else(|e| e.into_inner());
-        let entry = revisions.entry(node).or_insert(0);
-        if revision > *entry {
-            *entry = revision;
+        let changed = {
+            let mut revisions = self.revisions.write().unwrap_or_else(|e| e.into_inner());
+            let entry = revisions.entry(node).or_insert(0);
+            if revision > *entry {
+                *entry = revision;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.save_control_state();
         }
+    }
+
+    pub fn snapshot_floor(&self) -> (u64, u64) {
+        *self
+            .snapshot_floor
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Accept a snapshot only when it is newer than the persisted floor. A
+    /// higher epoch permits a lower generation (new controller incarnation);
+    /// within an epoch the generation must strictly increase.
+    pub fn snapshot_floor_allows(&self, epoch: u64, generation: u64) -> bool {
+        let (last_epoch, last_generation) = self.snapshot_floor();
+        epoch > last_epoch || (epoch == last_epoch && generation > last_generation)
+    }
+
+    pub fn record_snapshot_floor(&self, epoch: u64, generation: u64) {
+        let changed = {
+            let mut floor = self
+                .snapshot_floor
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if epoch > floor.0 || (epoch == floor.0 && generation > floor.1) {
+                *floor = (epoch, generation);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.save_control_state();
+        }
+    }
+
+    pub fn manifest_floor(&self) -> (u64, u64) {
+        *self
+            .manifest_floor
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A manifest with the same `(epoch, generation)` is idempotent; anything
+    /// older is a replay and must be ignored.
+    pub fn manifest_floor_allows(&self, epoch: u64, generation: u64) -> bool {
+        let (last_epoch, last_generation) = self.manifest_floor();
+        epoch > last_epoch || (epoch == last_epoch && generation >= last_generation)
+    }
+
+    pub fn record_manifest_floor(&self, epoch: u64, generation: u64) {
+        let changed = {
+            let mut floor = self
+                .manifest_floor
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if epoch > floor.0 || (epoch == floor.0 && generation > floor.1) {
+                *floor = (epoch, generation);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.save_control_state();
+        }
+    }
+
+    fn save_control_state(&self) {
+        let revisions: BTreeMap<String, u64> = self
+            .revisions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(node, revision)| (node.to_string(), *revision))
+            .collect();
+        let (snapshot_epoch, snapshot_generation) = self.snapshot_floor();
+        let (manifest_epoch, manifest_generation) = self.manifest_floor();
+        let disk = ControlStateDisk {
+            revisions,
+            snapshot_epoch,
+            snapshot_generation,
+            manifest_epoch,
+            manifest_generation,
+        };
+        let Ok(bytes) = serde_json::to_vec(&disk) else {
+            return;
+        };
+        let tmp = self
+            .control_state_path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, bytes)
+            .and_then(|_| std::fs::rename(&tmp, &self.control_state_path))
+        {
+            tracing::warn!(error = %e, path = %self.control_state_path.display(), "persist control floor");
+        }
+    }
+
+    /// Install the controller-signed member table as grants. This lets a
+    /// member authorize multi-hop LSAs (B may flood C's LSA to A even when A
+    /// has no direct credential exchange with C). The snapshot/manifest is
+    /// already signature-verified by the controller channel.
+    pub fn install_snapshot_grant(
+        &self,
+        node: NodeId,
+        overlay_ip: Option<std::net::IpAddr>,
+        prefixes: Vec<ipnet::IpNet>,
+        capabilities: Vec<String>,
+        revision: u64,
+    ) {
+        if revision < self.revision(node) {
+            return;
+        }
+        self.observe_revision(node, revision);
+        self.grants
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                node,
+                membership::Grant {
+                    overlay_ip,
+                    prefixes,
+                    capabilities,
+                    expires_at: None,
+                },
+            );
     }
 
     /// Record a peer's verified credential as its dataplane grant.
@@ -317,6 +503,22 @@ impl AgentState {
                 credential.node,
                 membership::Grant::from_verified(credential),
             );
+    }
+
+    /// Drop handshake grants whose credential deadline has passed. Returns the
+    /// affected nodes so the caller can close/re-authenticate their links even
+    /// when the controller is unreachable.
+    pub fn expire_grants(&self, now: u64) -> Vec<NodeId> {
+        let mut grants = self.grants.write().unwrap_or_else(|e| e.into_inner());
+        let expired: Vec<NodeId> = grants
+            .iter()
+            .filter(|(_, grant)| grant.expires_at.is_some_and(|deadline| deadline <= now))
+            .map(|(node, _)| *node)
+            .collect();
+        for node in &expired {
+            grants.remove(node);
+        }
+        expired
     }
 
     pub fn drop_grant(&self, node: NodeId) {
@@ -414,6 +616,24 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
             });
         }
         discovery::start(state.clone(), transport.clone());
+        {
+            let expiry_state = state.clone();
+            let expiry_transport = transport.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    for node in expiry_state.expire_grants(crate::credential::now_secs()) {
+                        tracing::warn!(
+                            peer = %node.short(),
+                            "peer credential expired while connected; re-authenticating"
+                        );
+                        expiry_transport.reconnect_peer(node);
+                    }
+                }
+            });
+        }
         if let Some(rx) = control_rx {
             let state = state.clone();
             let transport = transport.clone();
@@ -477,6 +697,76 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revisions_and_control_floors_survive_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-control-state-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+"#,
+            dir.display()
+        );
+        let config = Config::from_toml(&toml).unwrap();
+        let node = NodeId::new([1u8; 32]);
+        {
+            let state = AgentState::build(config.clone()).unwrap();
+            state.observe_revision(node, 7);
+            state.record_snapshot_floor(5, 9);
+            state.record_manifest_floor(5, 11);
+        }
+        let state = AgentState::build(config).unwrap();
+        assert_eq!(state.revision(node), 7);
+        assert_eq!(state.snapshot_floor(), (5, 9));
+        assert_eq!(state.manifest_floor(), (5, 11));
+        assert!(!state.snapshot_floor_allows(5, 9));
+        assert!(state.snapshot_floor_allows(5, 10));
+        assert!(state.snapshot_floor_allows(6, 1));
+        assert!(!state.manifest_floor_allows(5, 10));
+    }
+
+    #[test]
+    fn expired_handshake_grant_is_dropped() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-grant-expiry-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "a"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+"#,
+            dir.display()
+        );
+        let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        let node = NodeId::new([3u8; 32]);
+        state.grants.write().unwrap().insert(
+            node,
+            membership::Grant {
+                overlay_ip: Some("10.7.0.3".parse().unwrap()),
+                prefixes: Vec::new(),
+                capabilities: Vec::new(),
+                expires_at: Some(10),
+            },
+        );
+        assert!(state.expire_grants(9).is_empty());
+        assert_eq!(state.expire_grants(10), vec![node]);
+        assert!(state.grants.read().unwrap().is_empty());
+    }
 
     #[test]
     fn same_zone_route_wins_by_local_pref() {

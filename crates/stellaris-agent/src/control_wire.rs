@@ -12,6 +12,11 @@ pub const CONTROL_ALPN: &[u8] = b"stellaris/control/1";
 /// megabytes, so the cap is raised well above the largest controller model we
 /// support; oversized frames fail with a clear error instead of hanging.
 pub(crate) const MAX_FRAME: usize = 64 << 20;
+/// Requests accepted from unauthenticated control connections are small
+/// (snapshot request, LSA, ACK, enroll). Keep the pre-auth allocation far
+/// below the response cap so a peer cannot reserve tens of MiB before it has
+/// presented any credential.
+pub(crate) const MAX_REQUEST_FRAME: usize = 8 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -103,12 +108,21 @@ pub async fn write_frame<T: Serialize>(
 pub async fn read_frame<T: DeserializeOwned>(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<Option<T>> {
+    read_frame_limited(recv, MAX_FRAME).await
+}
+
+/// Same as [`read_frame`] but with an explicit allocation cap. Use this on the
+/// server side before a request has been authenticated.
+pub async fn read_frame_limited<T: DeserializeOwned>(
+    recv: &mut iroh::endpoint::RecvStream,
+    max: usize,
+) -> anyhow::Result<Option<T>> {
     let mut len = [0u8; 4];
     if recv.read_exact(&mut len).await.is_err() {
         return Ok(None);
     }
     let len = u32::from_be_bytes(len) as usize;
-    if len == 0 || len > MAX_FRAME {
+    if len == 0 || len > max {
         anyhow::bail!("invalid control frame length {len}");
     }
     let mut bytes = vec![0u8; len];

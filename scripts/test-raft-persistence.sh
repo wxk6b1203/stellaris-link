@@ -32,6 +32,7 @@ cidr = "10.0.0.0/8"
 [control]
 bind = "127.0.0.1:$PORT"
 secret = "$SECRET"
+allow_unsigned_lsa = true
 raft_dir = "$DIR/raft"
 raft_secret = "raft-secret"
 raft_id = 1

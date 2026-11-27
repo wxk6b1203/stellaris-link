@@ -54,6 +54,7 @@ discover_members=false
 [transport]
 relay_urls=[]
 disable_relay=true
+disable_discovery=true
 listen_port=$port
 advertise=["$adv:$port"]
 bind_ip="$adv"
@@ -121,7 +122,7 @@ sleep 2
 ip netns exec sa env RUST_LOG=stellaris_agent::dataplane=debug,stellaris_agent::control_client=debug,stellaris_agent::transport=debug "$BIN" --config "$DIR/a.toml" > "$DIR/a.log" 2>&1 & A_PID=$!
 ip netns exec sb env RUST_LOG=stellaris_agent::dataplane=debug,stellaris_agent::control_client=debug,stellaris_agent::transport=debug "$BIN" --config "$DIR/b.toml" > "$DIR/b.log" 2>&1 & B_PID=$!
 ip netns exec sc env RUST_LOG=stellaris_agent::dataplane=debug,stellaris_agent::control_client=debug,stellaris_agent::transport=debug "$BIN" --config "$DIR/c.toml" > "$DIR/c.log" 2>&1 & C_PID=$!
-sleep 8
+sleep 12
 echo '--- routes ---'
 for ns in sa sb sc; do echo "== $ns"; ip netns exec $ns ip route; ip netns exec $ns ip route get 10.115.0.1 2>&1 || true; done
 echo '--- tcpdump C tun ---'

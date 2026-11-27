@@ -30,6 +30,7 @@ cidr = "10.7.0.0/16"
 [control]
 bind = "127.0.0.1:4790$i"
 secret = "$SECRET"
+allow_unsigned_lsa = true
 raft_dir = "$TMP/n$i/raft"
 raft_id = $i
 raft_bind = "127.0.0.1:4780$i"

@@ -216,6 +216,13 @@ pub struct ControlConfig {
     /// when unset; setting it separates member and admin authority.
     #[serde(default)]
     pub admin_secret: Option<String>,
+    /// Development only: accept unsigned HTTP `POST /v1/lsa` requests.
+    ///
+    /// Controller-authenticated members sign every LSA with their NodeId key;
+    /// without a signature any holder of `control.secret` could impersonate
+    /// another member's origin. Left false by default.
+    #[serde(default)]
+    pub allow_unsigned_lsa: bool,
     /// Controller term/epoch; generated at startup when omitted.
     #[serde(default)]
     pub epoch: Option<u64>,
@@ -334,6 +341,7 @@ impl Default for ControlConfig {
             bind: None,
             secret: None,
             admin_secret: None,
+            allow_unsigned_lsa: false,
             epoch: None,
             leader_id: None,
             previous_secrets: Vec::new(),

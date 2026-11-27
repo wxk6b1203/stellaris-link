@@ -56,6 +56,7 @@ pub struct ControllerState {
     pub cidr: IpNet,
     secret: Option<String>,
     admin_secret: Option<String>,
+    allow_unsigned_lsa: bool,
     routes: Arc<RwLock<Vec<RouteEntry>>>,
     link_state: Arc<RwLock<LinkStateDb>>,
     acks: Arc<RwLock<HashMap<NodeId, u64>>>,
@@ -83,6 +84,13 @@ pub struct ControllerState {
     generation: Arc<AtomicU64>,
 }
 
+/// A revoked member and the revision that fences its old credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevokedView {
+    pub node_id: String,
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub network_id: String,
@@ -90,6 +98,9 @@ pub struct Snapshot {
     pub generation: u64,
     pub members: Vec<MemberView>,
     pub routes: Vec<RouteEntry>,
+    /// Revoked nodes with the revision that fences their old credentials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<RevokedView>,
     /// Controller NodeId when the snapshot is Ed25519-signed.
     #[serde(default)]
     pub signer: Option<String>,
@@ -126,6 +137,9 @@ pub struct MembershipManifest {
     pub issued_at: u64,
     pub expires_at: u64,
     pub members: Vec<MemberView>,
+    /// Revoked nodes with the revision that fences their old credentials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<RevokedView>,
     #[serde(default)]
     pub signature: Option<String>,
 }
@@ -139,6 +153,7 @@ struct ManifestPayload<'a> {
     issued_at: u64,
     expires_at: u64,
     members: &'a [MemberView],
+    revoked: &'a [RevokedView],
 }
 
 pub fn manifest_payload_bytes(manifest: &MembershipManifest) -> Vec<u8> {
@@ -150,6 +165,7 @@ pub fn manifest_payload_bytes(manifest: &MembershipManifest) -> Vec<u8> {
         issued_at: manifest.issued_at,
         expires_at: manifest.expires_at,
         members: &manifest.members,
+        revoked: &manifest.revoked,
     };
     serde_json::to_vec(&payload).unwrap_or_default()
 }
@@ -160,6 +176,7 @@ struct ManifestAgreement<'a> {
     epoch: u64,
     generation: u64,
     members: &'a [MemberView],
+    revoked: &'a [RevokedView],
 }
 
 /// Controller-independent manifest content used for multi-controller threshold.
@@ -169,6 +186,7 @@ pub fn manifest_agreement_bytes(manifest: &MembershipManifest) -> Vec<u8> {
         epoch: manifest.epoch,
         generation: manifest.generation,
         members: &manifest.members,
+        revoked: &manifest.revoked,
     };
     serde_json::to_vec(&payload).unwrap_or_default()
 }
@@ -180,6 +198,7 @@ struct SnapshotPayload<'a> {
     generation: u64,
     members: &'a [MemberView],
     routes: &'a [RouteEntry],
+    revoked: &'a [RevokedView],
 }
 
 /// Canonical snapshot payload bytes used by HMAC and Ed25519 signatures.
@@ -189,6 +208,7 @@ pub fn snapshot_payload_bytes(
     generation: u64,
     members: &[MemberView],
     routes: &[RouteEntry],
+    revoked: &[RevokedView],
 ) -> Vec<u8> {
     let payload = SnapshotPayload {
         network_id,
@@ -196,6 +216,7 @@ pub fn snapshot_payload_bytes(
         generation,
         members,
         routes,
+        revoked,
     };
     serde_json::to_vec(&payload).unwrap_or_default()
 }
@@ -209,8 +230,9 @@ pub fn snapshot_signature(
     generation: u64,
     members: &[MemberView],
     routes: &[RouteEntry],
+    revoked: &[RevokedView],
 ) -> String {
-    let bytes = snapshot_payload_bytes(network_id, epoch, generation, members, routes);
+    let bytes = snapshot_payload_bytes(network_id, epoch, generation, members, routes, revoked);
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
     mac.update(&bytes);
     hex::encode(mac.finalize().into_bytes())
@@ -230,10 +252,36 @@ pub fn verify_ed25519(signer: NodeId, payload: &[u8], signature: &str) -> anyhow
     Ok(())
 }
 
+fn revoked_from_model(model: &ControllerModel) -> Vec<RevokedView> {
+    model
+        .revoked
+        .iter()
+        .map(|node| RevokedView {
+            node_id: node.to_string(),
+            revision: model.member_revisions.get(node).copied().unwrap_or(1),
+        })
+        .collect()
+}
+
 impl ControllerState {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         if config.node.role != "controller" {
             bail!("node.role must be \"controller\" for stellaris-controller");
+        }
+        if config.control.allow_unsigned_lsa {
+            tracing::warn!(
+                target: "stellaris_deprecation",
+                "control.allow_unsigned_lsa is enabled: any member holding control.secret \
+                 can forge another member's LSA; use only for legacy tests"
+            );
+        }
+        if config.control.raft_dir.is_none() {
+            tracing::warn!(
+                target: "stellaris_deprecation",
+                "non-Raft controller mode is deprecated: it has no quorum, no durable \
+                 generation fencing and is kept for legacy single-controller deployments; \
+                 configure control.raft_dir for production"
+            );
         }
         let network = config.network.id.unwrap_or_else(|| {
             NetworkId(Uuid::new_v5(
@@ -332,6 +380,7 @@ impl ControllerState {
             cidr: config.network.cidr,
             secret: config.control.secret.clone(),
             admin_secret: config.control.admin_secret.clone(),
+            allow_unsigned_lsa: config.control.allow_unsigned_lsa,
             routes: Arc::new(RwLock::new(routes)),
             link_state: Arc::new(RwLock::new(link_state)),
             acks: Arc::new(RwLock::new(acks)),
@@ -488,6 +537,12 @@ impl ControllerState {
         node: NodeId,
         ip: std::net::IpAddr,
     ) -> Result<(), (u16, String)> {
+        if !self.cidr.contains(&ip) {
+            return Err((
+                409,
+                format!("overlay address {ip} is outside network CIDR {}", self.cidr),
+            ));
+        }
         if model.overlay_taken(ip, node) {
             return Err((409, format!("overlay address {ip} is already in use")));
         }
@@ -668,14 +723,24 @@ impl ControllerState {
         }
         routes.extend(model.route_entries());
         let members = self.members_from_model(&model);
+        let revoked = revoked_from_model(&model);
         let network_id = self.network.to_string();
         let generation = model.generation;
         let epoch = model.epoch;
         let signature = self.secret.as_deref().map(|secret| {
-            snapshot_signature(secret, &network_id, epoch, generation, &members, &routes)
+            snapshot_signature(
+                secret,
+                &network_id,
+                epoch,
+                generation,
+                &members,
+                &routes,
+                &revoked,
+            )
         });
         let ed25519_signature = self.signing_key.as_ref().map(|key| {
-            let bytes = snapshot_payload_bytes(&network_id, epoch, generation, &members, &routes);
+            let bytes =
+                snapshot_payload_bytes(&network_id, epoch, generation, &members, &routes, &revoked);
             hex::encode(key.sign(&bytes).to_bytes())
         });
         Snapshot {
@@ -684,10 +749,17 @@ impl ControllerState {
             generation,
             members,
             routes,
+            revoked,
             signer: self.signer.map(|n| n.to_string()),
             signature,
             ed25519_signature,
         }
+    }
+
+    /// Revoked nodes plus the revision that fences their credential.
+    fn revoked_view(&self) -> Vec<RevokedView> {
+        let model = self.model.read().unwrap_or_else(|e| e.into_inner());
+        revoked_from_model(&model)
     }
 
     fn members_from_model(&self, model: &ControllerModel) -> Vec<MemberView> {
@@ -940,6 +1012,7 @@ impl ControllerState {
             issued_at,
             expires_at: issued_at.saturating_add(self.manifest_ttl),
             members: self.members(),
+            revoked: self.revoked_view(),
             signature: None,
         };
         if let Some(key) = &self.signing_key {
@@ -966,6 +1039,7 @@ impl ControllerState {
             issued_at,
             expires_at: issued_at.saturating_add(self.manifest_ttl),
             members: self.members_from_model(&model),
+            revoked: revoked_from_model(&model),
             signature: None,
         };
         if let Some(key) = &self.signing_key {
@@ -998,6 +1072,7 @@ impl ControllerState {
         let generation = self.generation.load(Ordering::Relaxed);
         let network_id = self.network.to_string();
         let members = self.members();
+        let revoked = self.revoked_view();
         let signature = self.secret.as_deref().map(|secret| {
             snapshot_signature(
                 secret,
@@ -1006,11 +1081,18 @@ impl ControllerState {
                 generation,
                 &members,
                 &routes,
+                &revoked,
             )
         });
         let ed25519_signature = self.signing_key.as_ref().map(|key| {
-            let bytes =
-                snapshot_payload_bytes(&network_id, self.epoch, generation, &members, &routes);
+            let bytes = snapshot_payload_bytes(
+                &network_id,
+                self.epoch,
+                generation,
+                &members,
+                &routes,
+                &revoked,
+            );
             hex::encode(key.sign(&bytes).to_bytes())
         });
         Snapshot {
@@ -1019,6 +1101,7 @@ impl ControllerState {
             generation,
             members,
             routes,
+            revoked,
             signer: self.signer.map(|n| n.to_string()),
             signature,
             ed25519_signature,
@@ -1544,6 +1627,7 @@ pub fn router(state: ControllerState) -> Router {
         .route("/v1/lsa", post(apply_lsa))
         .route("/v1/enroll", post(enroll))
         .route("/v1/members/{node}/grants", post(update_grants))
+        .route("/v1/members/{node}/reinstate", post(reinstate_member))
         .route("/v1/manifest", get(manifest))
         .route("/v1/model", get(model))
         .route("/v1/revoke", post(revoke))
@@ -2179,13 +2263,42 @@ async fn manifest(State(state): State<ControllerState>, headers: HeaderMap) -> R
     Json(state.manifest_current().await).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LsaRequest {
+    /// Preferred shape: the LSA plus an Ed25519 signature by `lsa.origin`.
+    Signed { lsa: Lsa, signature: String },
+    /// Legacy shape accepted only with `control.allow_unsigned_lsa = true`.
+    Legacy(Lsa),
+}
+
 async fn apply_lsa(
     State(state): State<ControllerState>,
     headers: HeaderMap,
-    Json(lsa): Json<Lsa>,
+    Json(body): Json<LsaRequest>,
 ) -> Response {
     if !state.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (lsa, signature) = match body {
+        LsaRequest::Signed { lsa, signature } => (lsa, Some(signature)),
+        LsaRequest::Legacy(lsa) => (lsa, None),
+    };
+    match signature {
+        Some(signature) => {
+            if !crate::lsa_auth::verify(&lsa, &signature) {
+                return (StatusCode::FORBIDDEN, "LSA signature required or invalid")
+                    .into_response();
+            }
+        }
+        None if !state.allow_unsigned_lsa => {
+            return (
+                StatusCode::FORBIDDEN,
+                "unsigned LSA rejected; set control.allow_unsigned_lsa only for legacy tests",
+            )
+                .into_response();
+        }
+        None => {}
     }
     match state.apply_lsa_current(lsa).await {
         Ok(changed) => {
@@ -2338,6 +2451,15 @@ async fn update_grants(
             return (StatusCode::BAD_REQUEST, format!("invalid prefix: {prefix}")).into_response();
         }
     }
+    if let Some(ip) = overlay_ip
+        && let Err((code, message)) = state.validate_overlay(&model, node, ip)
+    {
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT),
+            message,
+        )
+            .into_response();
+    }
     let member = MemberRecord {
         overlay_ip,
         prefixes: req.prefixes,
@@ -2348,6 +2470,109 @@ async fn update_grants(
         .await
     {
         Ok(()) => Json(json!({"updated": node.to_string()})).into_response(),
+        Err((code, message)) => controller_error(&state, code, message).await,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReinstateRequest {
+    #[serde(default)]
+    overlay_ip: Option<String>,
+    #[serde(default)]
+    prefixes: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// Bring a revoked member back. Revocation used to be a one-way tombstone;
+/// this is the explicit admin path required by MEMBERSHIP-AUTH §5.4.
+async fn reinstate_member(
+    State(state): State<ControllerState>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+    Json(req): Json<ReinstateRequest>,
+) -> Response {
+    if !state.admin_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let node: NodeId = match node.parse() {
+        Ok(node) => node,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
+    };
+    let model = state.model_current().await;
+    if !model.revoked.contains(&node) {
+        return (StatusCode::CONFLICT, "node is not revoked").into_response();
+    }
+    if let Some(existing) = model.members.get(&node) {
+        // Should not happen (revoke removes the member), but keep it safe.
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "node is already a member with overlay {:?}",
+                existing.overlay_ip
+            ),
+        )
+            .into_response();
+    }
+    let requested = match req
+        .overlay_ip
+        .as_deref()
+        .map(str::parse::<std::net::IpAddr>)
+        .transpose()
+    {
+        Ok(ip) => ip,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid overlay_ip: {e}")).into_response();
+        }
+    };
+    let now = crate::credential::now_secs();
+    let overlay = match requested {
+        Some(ip) => ip,
+        None => {
+            let pending = model.pending_admissions.get(&node);
+            if let Some(ip) = pending.and_then(|p| p.overlay_ip) {
+                ip
+            } else {
+                match model.allocate_address(node, None, None, now) {
+                    Ok((ip, _, _, _)) => ip,
+                    Err(error) => {
+                        return (
+                            StatusCode::CONFLICT,
+                            format!("no overlay_ip supplied and allocation failed: {error}"),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    };
+    if let Err((code, message)) = state.validate_overlay(&model, node, overlay) {
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT),
+            message,
+        )
+            .into_response();
+    }
+    for prefix in &req.prefixes {
+        if prefix.parse::<IpNet>().is_err() {
+            return (StatusCode::BAD_REQUEST, format!("invalid prefix: {prefix}")).into_response();
+        }
+    }
+    drop(model);
+    let member = MemberRecord {
+        overlay_ip: Some(overlay),
+        prefixes: req.prefixes,
+        capabilities: req.capabilities,
+    };
+    match state
+        .commit_command(ControllerCommand::UpsertMember { node, member })
+        .await
+    {
+        Ok(()) => Json(json!({
+            "reinstated": node.to_string(),
+            "overlay_ip": overlay.to_string(),
+        }))
+        .into_response(),
         Err((code, message)) => controller_error(&state, code, message).await,
     }
 }
@@ -2482,6 +2707,11 @@ async fn revoke(
             return (StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")).into_response();
         }
     };
+    let model = state.model_current().await;
+    if !model.members.contains_key(&node) && !model.revoked.contains(&node) {
+        return (StatusCode::NOT_FOUND, "member not found").into_response();
+    }
+    drop(model);
     match state.revoke_current(node).await {
         Ok(()) => {
             let model = state.model_current().await;
@@ -2852,7 +3082,12 @@ async fn handle_control_conn(
     conn: iroh::endpoint::Connection,
 ) -> anyhow::Result<()> {
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-        let Some(request) = crate::control_wire::read_frame(&mut recv).await? else {
+        let Some(request) = crate::control_wire::read_frame_limited(
+            &mut recv,
+            crate::control_wire::MAX_REQUEST_FRAME,
+        )
+        .await?
+        else {
             break;
         };
         let remote = NodeId::new(*conn.remote_id().as_bytes());
@@ -3025,6 +3260,7 @@ cidr = "10.7.0.0/16"
 [control]
 bind = "127.0.0.1:0"
 secret = "s3cret"
+allow_unsigned_lsa = true
 
 [[peers]]
 name = "b"
@@ -3164,6 +3400,70 @@ via = "b"
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn http_lsa_requires_a_valid_signature() {
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+bind = "127.0.0.1:0"
+secret = "s3cret"
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let app = router(state);
+        let secret = [7u8; 32];
+        let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let origin = NodeId::new(key.verifying_key().to_bytes());
+        let lsa = stellaris_linkstate::Lsa {
+            origin,
+            seq: 1,
+            zone: None,
+            links: Vec::new(),
+            prefixes: Vec::new(),
+            overlay_ip: Some("10.7.0.7".parse().unwrap()),
+            addrs: Vec::new(),
+        };
+        let post = |body: String| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/lsa")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let unsigned = serde_json::to_string(&lsa).unwrap();
+        assert_eq!(
+            post(unsigned).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let signature = crate::lsa_auth::sign(&secret, &lsa);
+        let signed = serde_json::json!({"lsa": &lsa, "signature": signature});
+        assert_eq!(
+            post(signed.to_string()).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let bad = serde_json::json!({"lsa": &lsa, "signature": "00".repeat(64)});
+        assert_eq!(
+            post(bad.to_string()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
@@ -3513,6 +3813,7 @@ bind = "127.0.0.1:0"
             snapshot.generation,
             &snapshot.members,
             &snapshot.routes,
+            &snapshot.revoked,
         );
         assert_eq!(snapshot.signature.as_deref(), Some(expected.as_str()));
         let mut tampered = snapshot.routes.clone();
@@ -3526,6 +3827,7 @@ bind = "127.0.0.1:0"
             snapshot.generation,
             &snapshot.members,
             &tampered,
+            &snapshot.revoked,
         );
         assert_ne!(expected, bad);
     }
@@ -3542,6 +3844,7 @@ bind = "127.0.0.1:0"
             snapshot.generation,
             &snapshot.members,
             &snapshot.routes,
+            &snapshot.revoked,
         );
         verify_ed25519(
             signer,
@@ -3706,6 +4009,7 @@ cidr = "10.7.0.0/16"
 [control]
 secret = "s3cret"
 epoch = 1
+allow_unsigned_lsa = true
 
 [[control.members]]
 node_id = "0101010101010101010101010101010101010101010101010101010101010101"
@@ -3754,6 +4058,46 @@ prefixes = ["192.168.70.0/24"]
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/snapshot")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json(response).await;
+        assert_eq!(body["revoked"][0]["node_id"], node);
+        assert!(
+            body["revoked"][0]["revision"].as_u64().unwrap_or(0) > 0,
+            "revoked tombstone must carry a revision: {body}"
+        );
+        assert!(
+            body["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["node_id"] != node),
+            "revoked member must not be in the snapshot member list"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/manifest")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json(response).await;
+        assert_eq!(body["revoked"][0]["node_id"], node, "{body}");
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3766,6 +4110,96 @@ prefixes = ["192.168.70.0/24"]
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn revoked_member_can_be_reinstated_explicitly() {
+        let toml = format!(
+            r#"
+[node]
+name = "ctrl"
+role = "controller"
+state_dir = "{}"
+
+[network]
+name = "demo"
+cidr = "10.7.0.0/16"
+
+[control]
+secret = "s3cret"
+epoch = 1
+allow_unsigned_lsa = true
+
+[[control.members]]
+node_id = "0101010101010101010101010101010101010101010101010101010101010101"
+overlay_ip = "10.7.0.1"
+prefixes = ["192.168.70.0/24"]
+"#,
+            temp_state_dir()
+        );
+        let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let app = router(state);
+        let node = "0101010101010101010101010101010101010101010101010101010101010101";
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/revoke")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"node_id": node}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/members/{node}/reinstate"))
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "overlay_ip": "10.7.0.1",
+                            "prefixes": ["192.168.70.0/24"],
+                            "capabilities": ["member"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/snapshot")
+                    .header("x-stellaris-secret", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json(response).await;
+        assert!(
+            body["revoked"].as_array().is_none_or(|r| r.is_empty()),
+            "{body}"
+        );
+        assert!(
+            body["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["node_id"] == node),
+            "reinstated member missing: {body}"
+        );
     }
 
     #[test]
@@ -4398,6 +4832,7 @@ cidr = "10.7.0.0/16"
 [control]
 secret = "s3cret"
 epoch = 1
+allow_unsigned_lsa = true
 
 [[control.members]]
 node_id = "0101010101010101010101010101010101010101010101010101010101010101"
@@ -4495,7 +4930,11 @@ prefixes = ["192.168.50.0/24"]
                 origin: b,
                 seq: 1,
                 zone: Some("az-a".into()),
-                links: vec![],
+                links: vec![stellaris_linkstate::Link {
+                    to: a,
+                    metric: 1,
+                    zone: Some("az-a".into()),
+                }],
                 prefixes: vec![stellaris_linkstate::Prefix {
                     prefix: "192.168.50.0/24".parse().unwrap(),
                     metric: 0,

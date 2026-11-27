@@ -167,6 +167,12 @@ impl Service {
     }
 
     fn discover(&self, lsa: &Lsa) {
+        // `disable_discovery` also disables LSA auto-peering: tests and
+        // locked-down deployments that only allow the configured underlay
+        // topology must not dial every address a flooded LSA advertises.
+        if self.state.config.transport.disable_discovery {
+            return;
+        }
         if lsa.origin == self.state.node_id || self.state.peers.get(&lsa.origin).is_some() {
             return;
         }

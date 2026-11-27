@@ -37,6 +37,7 @@ cidr = "10.247.0.0/16"
 [control]
 bind = "0.0.0.0:$C_PORT"
 secret = "$SECRET"
+allow_unsigned_lsa = true
 raft_dir = "$DIR/n$((i+1))/raft"
 raft_id = $((i+1))
 raft_bind = "0.0.0.0:$R_PORT"

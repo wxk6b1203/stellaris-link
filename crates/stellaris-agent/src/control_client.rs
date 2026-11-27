@@ -49,8 +49,6 @@ async fn run_http(
     };
     let mut last_enroll = Instant::now() - Duration::from_secs(60);
     let mut last_manifest = Instant::now() - Duration::from_secs(60);
-    let mut last_generation = 0u64;
-    let mut last_epoch = 0u64;
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
@@ -74,11 +72,13 @@ async fn run_http(
         if last_lsa.elapsed() >= Duration::from_secs(10) {
             seq = seq.max(now_seq());
             let lsa = local_lsa(&state, seq);
+            let signature = crate::lsa_auth::sign(&state.identity_secret, &lsa);
+            let body = serde_json::json!({"lsa": &lsa, "signature": signature});
             let mut request = client.post(format!("{base}/v1/lsa"));
             if let Some(secret) = &secret {
                 request = request.header("x-stellaris-secret", secret);
             }
-            match request.json(&lsa).send().await {
+            match request.json(&body).send().await {
                 Ok(response) if response.status().is_success() => {
                     last_lsa = Instant::now();
                 }
@@ -114,15 +114,9 @@ async fn run_http(
         }
 
         if let Some(snapshot) = snapshot
-            && let Some((generation, epoch)) = apply_verified_snapshot(
-                &state,
-                snapshot,
-                last_generation,
-                &mut last_epoch,
-                transport.as_ref(),
-            )
+            && let Some((generation, epoch)) =
+                apply_verified_snapshot(&state, snapshot, transport.as_ref())
         {
-            last_generation = generation;
             let mut ack = client.post(format!("{base}/v1/ack"));
             if let Some(secret) = &secret {
                 ack = ack.header("x-stellaris-secret", secret);
@@ -198,8 +192,6 @@ async fn run_iroh(
         endpoint.online().await;
     }
 
-    let mut last_generation = 0u64;
-    let mut last_epoch = 0u64;
     let mut last_lsa = Instant::now() - Duration::from_secs(60);
     let mut seq = 0u64;
     loop {
@@ -272,15 +264,9 @@ async fn run_iroh(
             match request(&conn, &req).await {
                 Ok(Response::Snapshot { snapshot }) => {
                     if verify_snapshot(&state, secret.as_deref(), &snapshot)
-                        && let Some((generation, epoch)) = apply_verified_snapshot(
-                            &state,
-                            snapshot,
-                            last_generation,
-                            &mut last_epoch,
-                            transport.as_ref(),
-                        )
+                        && let Some((generation, epoch)) =
+                            apply_verified_snapshot(&state, snapshot, transport.as_ref())
                     {
-                        last_generation = generation;
                         let ack = Request::Ack {
                             node: state.node_id.to_string(),
                             generation,
@@ -351,7 +337,19 @@ async fn try_manifest(
                     if verify_manifest(state, &manifest, now).is_none() {
                         return false;
                     }
-                    apply_members(state, &manifest.members, transport);
+                    if !state.manifest_floor_allows(manifest.epoch, manifest.generation) {
+                        let (epoch, generation) = state.manifest_floor();
+                        tracing::warn!(
+                            got_epoch = manifest.epoch,
+                            got_generation = manifest.generation,
+                            seen_epoch = epoch,
+                            seen_generation = generation,
+                            "membership manifest replayed or stale; ignored"
+                        );
+                        return false;
+                    }
+                    apply_members(state, &manifest.members, &manifest.revoked, transport);
+                    state.record_manifest_floor(manifest.epoch, manifest.generation);
                     tracing::debug!(
                         generation = manifest.generation,
                         members = manifest.members.len(),
@@ -493,6 +491,7 @@ fn install_credential(state: &AgentState, signed: &crate::credential::SignedCred
 fn apply_members(
     state: &AgentState,
     members: &[crate::controller::MemberView],
+    revoked: &[crate::controller::RevokedView],
     transport: Option<&std::sync::Arc<IrohTransport>>,
 ) {
     let mut known = std::collections::HashSet::new();
@@ -504,6 +503,20 @@ fn apply_members(
                 // must be allowed to reconnect after a prior revoke.
                 transport.allow_peer(node);
             }
+            // Multi-hop LSA authorization uses controller-signed grants, not
+            // only grants learned from a direct credential handshake.
+            let prefixes = member
+                .prefixes
+                .iter()
+                .filter_map(|prefix| prefix.parse().ok())
+                .collect();
+            state.install_snapshot_grant(
+                node,
+                member.overlay_ip,
+                prefixes,
+                member.capabilities.clone(),
+                member.revision,
+            );
             let previous = state.revision(node);
             state.observe_revision(node, member.revision);
             if node != state.node_id && member.revision > previous {
@@ -523,6 +536,19 @@ fn apply_members(
                 if let Some(transport) = transport {
                     transport.reconnect_peer(node);
                 }
+            }
+        }
+    }
+    // Explicit tombstones: fence the revoked node even when this process has
+    // never seen its grant and the credential has not expired yet.
+    for member in revoked {
+        if let Ok(node) = member.node_id.parse::<NodeId>() {
+            let floor = member.revision.saturating_add(1);
+            state.observe_revision(node, floor);
+            tracing::warn!(peer = %node.short(), revision = member.revision, "controller revoked member");
+            match transport {
+                Some(transport) => transport.close_peer(node),
+                None => state.drop_grant(node),
             }
         }
     }
@@ -649,6 +675,7 @@ fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot
             snapshot.generation,
             &snapshot.members,
             &snapshot.routes,
+            &snapshot.revoked,
         );
         if let Err(e) = crate::controller::verify_ed25519(signer, &payload, signature) {
             tracing::warn!(error = %e, "controller Ed25519 signature mismatch");
@@ -663,6 +690,7 @@ fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot
             snapshot.generation,
             &snapshot.members,
             &snapshot.routes,
+            &snapshot.revoked,
         );
         if snapshot.signature.as_deref() != Some(expected.as_str()) {
             tracing::warn!("controller snapshot signature mismatch; ignored");
@@ -683,49 +711,28 @@ fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot
 fn apply_verified_snapshot(
     state: &AgentState,
     mut snapshot: Snapshot,
-    last_generation: u64,
-    last_epoch: &mut u64,
     transport: Option<&std::sync::Arc<IrohTransport>>,
 ) -> Option<(u64, u64)> {
-    if snapshot.generation <= last_generation {
-        if snapshot.generation < last_generation {
-            tracing::warn!(
-                got = snapshot.generation,
-                seen = last_generation,
-                "controller snapshot generation rolled back; ignored"
-            );
-        }
-        return None;
-    }
-    if snapshot.epoch < *last_epoch {
+    let (last_epoch, last_generation) = state.snapshot_floor();
+    if !state.snapshot_floor_allows(snapshot.epoch, snapshot.generation) {
         tracing::warn!(
-            got = snapshot.epoch,
-            seen = *last_epoch,
-            "controller snapshot epoch rolled back; ignored"
+            got_epoch = snapshot.epoch,
+            got_generation = snapshot.generation,
+            seen_epoch = last_epoch,
+            seen_generation = last_generation,
+            "controller snapshot is not newer than the persisted floor; ignored"
         );
         return None;
     }
-    *last_epoch = (*last_epoch).max(snapshot.epoch);
-    apply_members(state, &snapshot.members, transport);
+    let epoch = snapshot.epoch;
+    let generation = snapshot.generation;
+    apply_members(state, &snapshot.members, &snapshot.revoked, transport);
     if state.config.control.discover_members {
         discover_members(state, &snapshot.members, transport);
     }
-    let before = snapshot.routes.len();
-    snapshot.routes.retain(|route| {
-        route.next_hop == state.node_id
-            || state
-                .peers
-                .get(&route.next_hop)
-                .is_some_and(|peer| peer.connected)
-    });
-    if snapshot.routes.len() != before {
-        tracing::warn!(
-            dropped = before - snapshot.routes.len(),
-            "dropped controller routes with unconnected next hop"
-        );
-    }
     if !state.config.control.apply_routes {
-        return Some((snapshot.generation, snapshot.epoch));
+        state.record_snapshot_floor(epoch, generation);
+        return Some((generation, epoch));
     }
     if state.config.routing.prefer_same_zone
         && let Some(local_zone) = state.config.node.zone.as_deref()
@@ -743,7 +750,8 @@ fn apply_verified_snapshot(
                 local_generation,
                 "applied controller routes"
             );
-            Some((snapshot.generation, snapshot.epoch))
+            state.record_snapshot_floor(epoch, generation);
+            Some((generation, epoch))
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to apply controller routes");
@@ -896,6 +904,7 @@ url = "http://127.0.0.1:7800"
             generation: 2,
             members: Vec::new(),
             routes: Vec::new(),
+            revoked: Vec::new(),
             signer: None,
             signature: None,
             ed25519_signature: None,
@@ -925,16 +934,20 @@ url = "http://127.0.0.1:7800"
 
     #[test]
     fn snapshot_epoch_rollback_is_rejected() {
-        let mut state = agent("allow_unsigned_snapshot = true");
-        state.config = std::sync::Arc::new(state.config.as_ref().clone());
-        let mut last_epoch = 5;
-        let generation = 9;
+        let state = agent("allow_unsigned_snapshot = true");
         let mut snap = snapshot(&state.network.to_string());
+        snap.epoch = 5;
+        snap.generation = 9;
+        assert!(apply_verified_snapshot(&state, snap.clone(), None).is_some());
+        assert_eq!(state.snapshot_floor(), (5, 9));
+        // Same epoch, older generation is a replay.
+        snap.generation = 8;
+        assert!(apply_verified_snapshot(&state, snap.clone(), None).is_none());
+        // Older epoch is a replay even with a higher generation.
         snap.epoch = 4;
-        assert!(
-            apply_verified_snapshot(&state, snap, generation - 1, &mut last_epoch, None).is_none()
-        );
-        assert_eq!(last_epoch, 5);
+        snap.generation = 10;
+        assert!(apply_verified_snapshot(&state, snap, None).is_none());
+        assert_eq!(state.snapshot_floor(), (5, 9));
     }
 
     fn node_for(secret: [u8; 32]) -> NodeId {
@@ -1028,6 +1041,7 @@ prefixes = ["192.168.50.0/24"]
                 overlay_ip: Some("10.7.0.5".parse().unwrap()),
                 prefixes: Vec::new(),
                 capabilities: vec!["member".into()],
+                expires_at: None,
             },
         );
         let view = crate::controller::MemberView {
@@ -1042,13 +1056,33 @@ prefixes = ["192.168.50.0/24"]
             last_seq: 0,
             revision: 5,
         };
-        apply_members(&state, &[view], None);
+        apply_members(&state, &[view], &[], None);
         assert_eq!(state.revision(node), 5);
         assert!(state.grants.read().unwrap().contains_key(&node));
-        apply_members(&state, &[], None);
+        apply_members(&state, &[], &[], None);
         assert!(!state.grants.read().unwrap().contains_key(&node));
         // The revoked node's still-valid credential is fenced locally.
         assert_eq!(state.revision(node), 6);
+    }
+
+    #[test]
+    fn revoked_snapshot_fences_a_node_never_seen_before() {
+        let state = agent("");
+        let node = NodeId::new([9u8; 32]);
+        assert_eq!(state.revision(node), 0);
+        apply_members(
+            &state,
+            &[],
+            &[crate::controller::RevokedView {
+                node_id: node.to_string(),
+                revision: 4,
+            }],
+            None,
+        );
+        // Old credentials use revision <= 4, so the floor must be 5 even
+        // though this process never saw the node's grant.
+        assert_eq!(state.revision(node), 5);
+        assert!(!state.grants.read().unwrap().contains_key(&node));
     }
 
     #[tokio::test]

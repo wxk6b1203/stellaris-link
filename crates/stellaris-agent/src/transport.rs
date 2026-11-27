@@ -328,18 +328,13 @@ impl IrohTransport {
                         .peers
                         .mark(&node, true, path, rtt, mtu, addr, path_count);
                     let tx = accept_tx.clone();
-                    let peers = transport.peers.clone();
                     let network_hash = network_hash(transport.network);
                     let down_tx = control_tx.clone();
                     let transport_for_close = transport.clone();
                     let stable_id = conn.stable_id();
                     tokio::spawn(async move {
                         read_loop(conn, node, network_hash, tx).await;
-                        let (empty, _) = transport_for_close.remove_conn(node, stable_id);
-                        if empty {
-                            peers.mark(&node, false, None, None, None, None, 0);
-                            transport_for_close.state.drop_grant(node);
-                        }
+                        let _ = transport_for_close.remove_conn(node, stable_id);
                         if let Some(tx) = &down_tx {
                             let _ = tx.send(ControlEvent::Down { node, stable_id }).await;
                         }
@@ -633,6 +628,11 @@ impl IrohTransport {
         links.links.retain(|link| link.stable_id != stable_id);
         if links.links.is_empty() {
             guard.remove(&node);
+            // Clear peer/grant state while still holding the connection lock:
+            // otherwise a new link can be inserted between the empty check and
+            // the cleanup, and the stale cleanup would fence a live peer.
+            self.peers.mark(&node, false, None, None, None, None, 0);
+            self.state.drop_grant(node);
             return (true, was_active);
         }
         if was_active {
@@ -959,13 +959,7 @@ async fn connect_loop(
                     read_loop(read_conn, node, network_hash, tx).await;
                 });
                 conn.closed().await;
-                let (empty, _) = transport.remove_conn(node, stable_id);
-                if empty {
-                    transport
-                        .peers
-                        .mark(&node, false, None, None, None, None, 0);
-                    transport.state.drop_grant(node);
-                }
+                let _ = transport.remove_conn(node, stable_id);
                 if let Some(tx) = &control_tx {
                     let _ = tx.send(ControlEvent::Down { node, stable_id }).await;
                 }

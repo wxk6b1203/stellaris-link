@@ -42,6 +42,7 @@ cidr = "10.7.0.0/16"
 [control]
 bind = "0.0.0.0:4790$((i+1))"
 secret = "$SECRET"
+allow_unsigned_lsa = true
 raft_dir = "/raft"
 raft_id = $((i+1))
 raft_bind = "0.0.0.0:4780$((i+1))"

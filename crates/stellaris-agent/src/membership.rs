@@ -27,6 +27,9 @@ pub struct Grant {
     pub overlay_ip: Option<IpAddr>,
     pub prefixes: Vec<IpNet>,
     pub capabilities: Vec<String>,
+    /// Credential expiry for handshake-issued grants. Snapshot grants leave
+    /// this `None` because the controller is the live authority for them.
+    pub expires_at: Option<u64>,
 }
 
 pub type GrantMap = Arc<RwLock<HashMap<NodeId, Grant>>>;
@@ -37,6 +40,7 @@ impl Grant {
             overlay_ip: credential.overlay_ip,
             prefixes: credential.prefixes.clone(),
             capabilities: credential.capabilities.clone(),
+            expires_at: Some(credential.not_after),
         }
     }
 }
@@ -269,6 +273,7 @@ overlay_ip = "10.7.0.2"
                 overlay_ip: Some("10.7.0.2".parse().unwrap()),
                 prefixes: vec!["192.168.50.0/24".parse().unwrap()],
                 capabilities: vec!["member".into()],
+                expires_at: None,
             },
         );
         let own = Lsa {
@@ -342,6 +347,7 @@ overlay_ip = "10.7.0.2"
                 overlay_ip: Some("10.7.0.2".parse().unwrap()),
                 prefixes: vec!["192.168.50.0/24".parse().unwrap()],
                 capabilities: vec!["member".into()],
+                expires_at: None,
             },
         );
         assert!(inbound_source_allowed(
@@ -365,6 +371,7 @@ overlay_ip = "10.7.0.2"
                 overlay_ip: Some("10.7.0.1".parse().unwrap()),
                 prefixes: Vec::new(),
                 capabilities: vec!["member".into()],
+                expires_at: None,
             },
         );
         // A plain member may not carry another member's source address.

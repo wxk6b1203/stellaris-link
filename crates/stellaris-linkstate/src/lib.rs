@@ -182,7 +182,11 @@ impl LinkStateDb {
         };
         let mut out = HashMap::new();
         let mut neighbor_dists: HashMap<NodeId, HashMap<NodeId, u32>> = HashMap::new();
-        for link in &local_lsa.links {
+        for link in local_lsa
+            .links
+            .iter()
+            .filter(|link| self.link_is_bidirectional(local, link))
+        {
             neighbor_dists
                 .entry(link.to)
                 .or_insert_with(|| self.distances(link.to));
@@ -192,7 +196,11 @@ impl LinkStateDb {
                 continue;
             }
             let mut vias = HashSet::new();
-            for link in &local_lsa.links {
+            for link in local_lsa
+                .links
+                .iter()
+                .filter(|link| self.link_is_bidirectional(local, link))
+            {
                 let direct = link.to == *dest && link.metric == *metric;
                 let via_neighbor = neighbor_dists
                     .get(&link.to)
@@ -219,6 +227,17 @@ impl LinkStateDb {
         out
     }
 
+    /// SPF only trusts links that the peer also advertises back. A member
+    /// must not be able to blackhole or hijack traffic by claiming a
+    /// zero-cost link it does not actually have.
+    fn link_is_bidirectional(&self, from: NodeId, link: &Link) -> bool {
+        if link.to == from {
+            return false;
+        }
+        self.get(&link.to)
+            .is_some_and(|target| target.links.iter().any(|reverse| reverse.to == from))
+    }
+
     fn distances(&self, local: NodeId) -> HashMap<NodeId, u32> {
         let mut dist: HashMap<NodeId, u32> = HashMap::new();
         let mut heap = BinaryHeap::new();
@@ -227,6 +246,8 @@ impl LinkStateDb {
             .get(&local)
             .map(|lsa| lsa.links.as_slice())
             .unwrap_or_default()
+            .iter()
+            .filter(|link| self.link_is_bidirectional(local, link))
         {
             let entry = dist.entry(link.to).or_insert(u32::MAX);
             if link.metric < *entry {
@@ -245,7 +266,11 @@ impl LinkStateDb {
             let Some(lsa) = self.get(&node) else {
                 continue;
             };
-            for link in &lsa.links {
+            for link in lsa
+                .links
+                .iter()
+                .filter(|link| self.link_is_bidirectional(node, link))
+            {
                 let next_cost = cost.saturating_add(link.metric);
                 let known = dist.get(&link.to).copied().unwrap_or(u32::MAX);
                 if next_cost < known {
@@ -383,6 +408,24 @@ mod tests {
         assert_eq!(c.next_hop, node(2));
         assert_eq!(c.metric, 2);
         assert_eq!(c.source, RouteSource::LinkState);
+    }
+
+    #[test]
+    fn one_way_link_claim_is_not_used_by_spf() {
+        let mut db = LinkStateDb::new();
+        db.apply(lsa(1, 1, &[(2, 1)], &[]));
+        // B no longer advertises C, but C still advertises B.
+        db.apply(lsa(2, 2, &[(1, 1)], &[]));
+        db.apply(lsa(3, 1, &[(2, 1)], &["192.168.50.0/24"]));
+        let paths = db.shortest_paths(node(1));
+        assert!(
+            !paths.contains_key(&node(3)),
+            "SPF accepted a one-way B->C link: {paths:?}"
+        );
+        assert!(
+            db.compute_routes(node(1), net()).is_empty(),
+            "one-way link produced a route"
+        );
     }
 
     #[test]

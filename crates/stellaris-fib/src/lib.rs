@@ -24,25 +24,42 @@ pub struct FibEntry {
 
 impl FibEntry {
     pub fn select(&self, flow_hash: u32) -> Option<&FibNextHop> {
-        if self.next_hops.is_empty() {
+        self.select_where(flow_hash, |_| true)
+    }
+
+    /// ECMP selection restricted to next hops accepted by `usable`. This keeps
+    /// traffic away from peers whose transport link is currently down instead
+    /// of handing it to `transport.send` for a silent drop.
+    pub fn select_where<F>(&self, flow_hash: u32, mut usable: F) -> Option<&FibNextHop>
+    where
+        F: FnMut(NodeId) -> bool,
+    {
+        let mut total: u32 = 0;
+        let mut candidates = 0usize;
+        for nh in &self.next_hops {
+            if usable(nh.node) {
+                candidates += 1;
+                total = total.saturating_add(nh.weight.max(1) as u32);
+            }
+        }
+        if candidates == 0 {
             return None;
         }
-        if self.next_hops.len() == 1 {
-            return self.next_hops.first();
-        }
-        let total: u32 = self.next_hops.iter().map(|n| n.weight.max(1) as u32).sum();
-        if total == 0 {
-            return self.next_hops.first();
+        if candidates == 1 {
+            return self.next_hops.iter().find(|nh| usable(nh.node));
         }
         let mut slot = flow_hash % total;
         for nh in &self.next_hops {
+            if !usable(nh.node) {
+                continue;
+            }
             let w = nh.weight.max(1) as u32;
             if slot < w {
                 return Some(nh);
             }
             slot -= w;
         }
-        self.next_hops.last()
+        self.next_hops.iter().rev().find(|nh| usable(nh.node))
     }
 }
 

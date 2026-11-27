@@ -15,6 +15,7 @@ use crate::policy::{AclVerdict, QosVerdict};
 use crate::transport::{InboundPacket, IrohTransport};
 use crate::wire::{HEADER_LEN, MeshHeader, PacketInfo, decrement_ttl, flow_hash};
 use crate::{AgentState, wire};
+use stellaris_fib::FibEntry;
 use stellaris_types::AclDirection;
 
 /// Handle to the live TUN device for in-process address changes.
@@ -893,7 +894,7 @@ fn route_outbound_priority(
         return None;
     }
     let entry = state.routes.lookup(info.dst)?;
-    let next = entry.select(flow_hash(&info))?;
+    let next = select_connected(state, &entry, flow_hash(&info))?;
     if next.node == state.node_id {
         return None;
     }
@@ -1042,6 +1043,16 @@ async fn handle_inbound(
     }
 }
 
+fn select_connected<'a>(
+    state: &AgentState,
+    entry: &'a FibEntry,
+    flow: u32,
+) -> Option<&'a stellaris_fib::FibNextHop> {
+    entry.select_where(flow, |node| {
+        state.peers.get(&node).is_some_and(|peer| peer.connected)
+    })
+}
+
 fn path_mtu(state: &AgentState, peer: Option<&crate::PeerState>, packet: &[u8]) -> u16 {
     let v6 = packet.first().is_some_and(|b| b >> 4 == 6);
     // When no peer path MTU is known yet, use the configured overlay MTU.
@@ -1054,8 +1065,10 @@ fn path_mtu(state: &AgentState, peer: Option<&crate::PeerState>, packet: &[u8]) 
     let path = peer
         .and_then(|peer| peer.mtu)
         .map(|mtu| mtu.saturating_sub(HEADER_LEN as u16));
-    path.map_or(configured, |mtu| configured.min(mtu))
-        .max(if v6 { 1280 } else { 576 })
+    // Do not clamp the *usable* path MTU to IPv6's 1280 floor. If the
+    // underlay cannot carry 1296 bytes, holding 1280 here makes the PTB path
+    // unreachable and clamps MSS to a segment that transport will drop.
+    path.map_or(configured, |mtu| configured.min(mtu)).max(576)
 }
 
 fn too_big_action(
@@ -1071,7 +1084,7 @@ fn too_big_action(
     let mut error = wire::icmp_too_big(packet, mtu, local)?;
     let error_info = PacketInfo::parse(&error)?;
     let entry = state.routes.lookup(error_info.dst)?;
-    let next = entry.select(flow_hash(&error_info))?;
+    let next = select_connected(state, &entry, flow_hash(&error_info))?;
     if next.node == state.node_id {
         return None;
     }
@@ -1179,7 +1192,7 @@ pub fn decide_inbound(
     let Some(entry) = state.routes.lookup(info.dst) else {
         return InboundAction::Drop("no transit route");
     };
-    let Some(next) = entry.select(flow_hash(&info)) else {
+    let Some(next) = select_connected(state, &entry, flow_hash(&info)) else {
         return InboundAction::Drop("no next hop");
     };
     if next.node == state.node_id {
@@ -1187,6 +1200,25 @@ pub fn decide_inbound(
     }
     let next_peer = state.peers.get(&next.node);
     let mtu = path_mtu(state, next_peer.as_ref(), &forwarded);
+    if forwarded.len() > mtu as usize {
+        // Transit is the only place that can tell the source about a smaller
+        // next hop. Quote the original packet and send the PTB back to the
+        // previous hop; do not silently hand an oversized frame to transport.
+        if let Some(local) = state.local_overlay()
+            && let Some(error) = wire::icmp_too_big(payload, mtu, local)
+            && let Some(error_info) = PacketInfo::parse(&error)
+        {
+            let header = MeshHeader::new(state.network, 64, flow_hash(&error_info));
+            let mut frame = Vec::with_capacity(HEADER_LEN + error.len());
+            frame.extend_from_slice(&header.encode());
+            frame.extend_from_slice(&error);
+            return InboundAction::Forward {
+                next: from,
+                frame: Bytes::from(frame),
+            };
+        }
+        return InboundAction::Drop("transit packet exceeds next-hop mtu");
+    }
     wire::clamp_tcp_mss(&mut forwarded, mtu);
     let mut frame = Vec::with_capacity(HEADER_LEN + forwarded.len());
     frame.extend_from_slice(&header.encode());
@@ -1240,7 +1272,23 @@ via = "c"
             hex::encode([2u8; 32]),
             hex::encode([3u8; 32])
         );
-        AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
+        let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        mark_all_connected(&state);
+        state
+    }
+
+    fn mark_all_connected(state: &AgentState) {
+        for peer in state.peers.list() {
+            state.peers.mark(
+                &peer.node_id,
+                true,
+                Some("direct".into()),
+                Some(1),
+                Some(1400),
+                Some("127.0.0.1:1".into()),
+                1,
+            );
+        }
     }
 
     fn state_v6() -> AgentState {
@@ -1266,7 +1314,9 @@ overlay_ip = "fd00::2"
             dir.display(),
             hex::encode([2u8; 32]),
         );
-        AgentState::build(Config::from_toml(&toml).unwrap()).unwrap()
+        let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        mark_all_connected(&state);
+        state
     }
 
     fn v6(src: [u8; 16], dst: [u8; 16], hop: u8) -> Vec<u8> {
@@ -1453,6 +1503,7 @@ overlay_ip = "10.7.0.2"
             hex::encode([2u8; 32])
         );
         let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        mark_all_connected(&state);
 
         let ssh = v4([10, 7, 0, 1], [10, 7, 0, 2], 64);
         // v4() uses port 53; rewrite to TCP/22.
@@ -1556,6 +1607,74 @@ overlay_ip = "10.7.0.2"
             route_state_from("stellaris0", untagged),
             RouteState::Foreign
         );
+    }
+
+    #[test]
+    fn transit_too_big_returns_ptb_to_previous_hop() {
+        let state = state();
+        let from = node(2);
+        let next = node(3);
+        // Previous hop can carry the packet; the next hop cannot.
+        state.peers.mark(
+            &from,
+            true,
+            Some("direct".into()),
+            Some(1),
+            Some(1500),
+            None,
+            1,
+        );
+        state.peers.mark(
+            &next,
+            true,
+            Some("direct".into()),
+            Some(1),
+            Some(1100),
+            None,
+            1,
+        );
+        let mut packet = v4([10, 7, 0, 2], [10, 8, 0, 5], 64);
+        packet[9] = 17;
+        packet.resize(1400, 0);
+        packet[2..4].copy_from_slice(&1400u16.to_be_bytes());
+        let info = PacketInfo::parse(&packet).unwrap();
+        let header = MeshHeader::new(state.network, 64, flow_hash(&info));
+        let mut framed = Vec::with_capacity(HEADER_LEN + packet.len());
+        framed.extend_from_slice(&header.encode());
+        framed.extend_from_slice(&packet);
+        match decide_inbound(&state, from, &framed) {
+            InboundAction::Forward { next: hop, frame } => {
+                assert_eq!(hop, from, "PTB must go back to the previous hop");
+                let inner = &frame[HEADER_LEN..];
+                assert_eq!(inner[0] >> 4, 4);
+                assert_eq!(inner[9], 1, "expected ICMP");
+            }
+            other => panic!("expected PTB forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv6_path_mtu_is_not_pinned_to_1280() {
+        let state = state_v6();
+        let peer = node(2);
+        state.peers.mark(
+            &peer,
+            true,
+            Some("direct".into()),
+            Some(1),
+            Some(1248),
+            None,
+            1,
+        );
+        let mut packet = v6(
+            [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            64,
+        );
+        packet.resize(700, 0);
+        let peer = state.peers.get(&peer);
+        let mtu = path_mtu(&state, peer.as_ref(), &packet);
+        assert_eq!(mtu, 1232, "usable MTU must follow the underlay, not 1280");
     }
 
     #[test]

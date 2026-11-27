@@ -245,14 +245,20 @@ impl ControllerModel {
                 }
             }
             ControllerCommand::ApplyLsa { lsa } => {
-                let newer = self
-                    .lsas
-                    .get(&lsa.origin)
-                    .is_none_or(|current| lsa.seq > current.seq);
-                if newer {
-                    self.lsas.insert(lsa.origin, lsa);
+                if self.revoked.contains(&lsa.origin) {
+                    // A revocation may race with an in-flight LSA write; never
+                    // resurrect a tombstoned origin in the replicated model.
+                    false
+                } else {
+                    let newer = self
+                        .lsas
+                        .get(&lsa.origin)
+                        .is_none_or(|current| lsa.seq > current.seq);
+                    if newer {
+                        self.lsas.insert(lsa.origin, lsa);
+                    }
+                    newer
                 }
-                newer
             }
             ControllerCommand::ExpireLsas { entries } => {
                 let mut removed = false;
