@@ -114,6 +114,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn sync_dir(path: &Path) {
+    if let Ok(dir) = std::fs::File::open(path) {
+        let _ = dir.sync_all();
+    }
+}
+
 /// Maximum size of one append-only log segment.
 const LOG_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Write a full state snapshot every N applied entries.
@@ -238,6 +244,9 @@ impl LogFiles {
         self.active_bytes = file.metadata()?.len();
         self.active = Some(file);
         self.segments.push((first, first.saturating_sub(1), path));
+        // Make the new directory entry durable before openraft acknowledges
+        // appends written into it.
+        sync_dir(&self.dir);
         Ok(())
     }
 
@@ -291,6 +300,7 @@ impl LogFiles {
         if let Some(file) = self.active.as_mut() {
             file.sync_data()?;
         }
+        sync_dir(&self.dir);
         Ok(())
     }
 }
