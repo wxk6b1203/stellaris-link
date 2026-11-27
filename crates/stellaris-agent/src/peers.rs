@@ -95,7 +95,12 @@ impl PeerRegistry {
     ) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(peer) = guard.get_mut(node) {
-            if peer.path != path {
+            // A relay-to-relay switch keeps `path == "relay"`; compare the
+            // concrete address as well so the API and metrics reflect it.
+            if connected
+                && path.is_some()
+                && (peer.path != path || (peer.connected && peer.path_addr != path_addr))
+            {
                 peer.path_changes = peer.path_changes.saturating_add(1);
             }
             peer.connected = connected;
@@ -189,5 +194,37 @@ overlay_ip = "10.7.0.2"
             0,
         );
         assert_eq!(registry.get(&node).unwrap().path_changes, 2);
+        // Relay-to-relay switches keep `path == "relay"`; the concrete relay
+        // URL must still be counted.
+        registry.mark(
+            &node,
+            true,
+            Some("relay".into()),
+            Some(51),
+            Some(1100),
+            Some("https://r1.example/".into()),
+            0,
+        );
+        assert_eq!(registry.get(&node).unwrap().path_changes, 3);
+        registry.mark(
+            &node,
+            true,
+            Some("relay".into()),
+            Some(52),
+            Some(1100),
+            Some("https://r2.example/".into()),
+            0,
+        );
+        assert_eq!(registry.get(&node).unwrap().path_changes, 4);
+        registry.mark(
+            &node,
+            true,
+            Some("relay".into()),
+            Some(53),
+            Some(1100),
+            Some("https://r2.example/".into()),
+            0,
+        );
+        assert_eq!(registry.get(&node).unwrap().path_changes, 4);
     }
 }

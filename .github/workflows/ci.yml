@@ -30,11 +30,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --bins
+      - run: cargo build --release --bins
       - name: TLS controller integration
-        run: ./scripts/test-tls.sh
+        run: BIN="$PWD/target/release/stellaris-agent" CTRL_BIN="$PWD/target/release/stellaris-controller" ./scripts/test-tls.sh
+      - name: Controller ACK epoch/generation regression
+        run: BIN_DIR="$PWD/target/release" ./scripts/test-controller-ack.sh
+      - name: Approval-only LSA authorization
+        run: BIN_DIR="$PWD/target/release" ./scripts/test-controller-approval-auth.sh
       - name: Docker mDNS discovery
-        run: BIN="$PWD/target/debug/stellaris-agent" ./scripts/test-docker-mdns.sh
+        run: BIN="$PWD/target/release/stellaris-agent" ./scripts/test-docker-mdns.sh
       - name: netns TUN overlay
         run: sudo BIN="$PWD/target/release/stellaris-agent" ./scripts/test-linux-netns-tun.sh
       - name: netns ACL reject/drop

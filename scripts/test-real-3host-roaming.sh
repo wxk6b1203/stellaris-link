@@ -9,11 +9,17 @@ DIR="${DIR:-/opt/stellaris/roaming}"
 hosts=("$H1" "$H2" "$H3")
 pips=("$P1" "$P2" "$P3")
 pubs=("${H1##*@}" "${H2##*@}" "${H3##*@}")
+# iroh also probes IPv6; block each peer's global IPv6 addresses as well, but
+# leave other IPv6 traffic (notably the N0 relay) reachable.
+v6s=()
+for h in "${hosts[@]}"; do
+  v6s+=("$(ssh -o BatchMode=yes "$h" "ip -6 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | tr '\n' ' '" 2>/dev/null || true)")
+done
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/stellaris-real-roam.XXXXXX")"
 cleanup(){ unblock; for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "for f in $DIR/*.pid; do [ -f \"\$f\" ] && kill \$(cat \"\$f\") 2>/dev/null || true; done" 2>/dev/null || true; done; rm -rf "$TMP"; }
 trap cleanup EXIT
-unblock(){ for i in 0 1 2; do for j in 0 1 2; do [[ "$i" == "$j" ]] && continue; for ip in "${pips[$j]}" "${pubs[$j]}"; do ssh -o BatchMode=yes "${hosts[$i]}" "iptables -D OUTPUT -p udp -d $ip -j REJECT 2>/dev/null || true; iptables -D INPUT -p udp -s $ip -j REJECT 2>/dev/null || true" 2>/dev/null || true; done; done; done; }
-block(){ for i in 0 1 2; do for j in 0 1 2; do [[ "$i" == "$j" ]] && continue; for ip in "${pips[$j]}" "${pubs[$j]}"; do ssh -o BatchMode=yes "${hosts[$i]}" "iptables -I OUTPUT -p udp -d $ip -j REJECT; iptables -I INPUT -p udp -s $ip -j REJECT" 2>/dev/null || true; done; done; done; }
+unblock(){ for i in 0 1 2; do for j in 0 1 2; do [[ "$i" == "$j" ]] && continue; for ip in "${pips[$j]}" "${pubs[$j]}"; do ssh -o BatchMode=yes "${hosts[$i]}" "iptables -D OUTPUT -p udp -d $ip -j REJECT 2>/dev/null || true; iptables -D INPUT -p udp -s $ip -j REJECT 2>/dev/null || true" 2>/dev/null || true; done; for v6 in ${v6s[$j]:-}; do ssh -o BatchMode=yes "${hosts[$i]}" "ip6tables -D OUTPUT -p udp -d $v6 -j REJECT 2>/dev/null || true; ip6tables -D INPUT -p udp -s $v6 -j REJECT 2>/dev/null || true" 2>/dev/null || true; done; done; done; }
+block(){ for i in 0 1 2; do for j in 0 1 2; do [[ "$i" == "$j" ]] && continue; for ip in "${pips[$j]}" "${pubs[$j]}"; do ssh -o BatchMode=yes "${hosts[$i]}" "iptables -I OUTPUT -p udp -d $ip -j REJECT; iptables -I INPUT -p udp -s $ip -j REJECT" 2>/dev/null || true; done; for v6 in ${v6s[$j]:-}; do ssh -o BatchMode=yes "${hosts[$i]}" "ip6tables -I OUTPUT -p udp -d $v6 -j REJECT; ip6tables -I INPUT -p udp -s $v6 -j REJECT" 2>/dev/null || true; done; done; done; }
 ids=()
 for h in "${hosts[@]}"; do ssh -o BatchMode=yes "$h" "rm -rf $DIR/n1 $DIR/n2 $DIR/n3" 2>/dev/null || true; done
 for i in 0 1 2; do
@@ -29,6 +35,10 @@ cidr = "10.252.0.0/16"
 [transport]
 relay_urls = []
 disable_relay = false
+# Keep the peer set to the static IPv4 addresses below: iroh address discovery
+# would otherwise publish IPv6 addresses and the direct path would survive an
+# IPv4 iptables block, making the relay fallback assertion meaningless.
+disable_discovery = true
 listen_port = $port
 bind_ip = "$p"
 advertise = ["$p:$port"]

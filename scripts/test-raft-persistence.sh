@@ -129,6 +129,17 @@ start
 RESTART_END=$(python3 -c 'import time;print(time.time())')
 echo "restart_seconds=$(python3 -c "print(f'{$RESTART_END-$RESTART_START:.2f}')")"
 MODEL=$(curl -fsS -H "x-stellaris-secret: $SECRET" "http://127.0.0.1:$PORT/v1/model")
-echo "$MODEL" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("recovered_generation=",d["generation"],"recovered_lsas=",len(d["lsas"]))'
+read -r RECOVERED_GEN RECOVERED_LSAS < <(
+  echo "$MODEL" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["generation"], len(d["lsas"]))'
+)
+echo "recovered_generation=$RECOVERED_GEN recovered_lsas=$RECOVERED_LSAS"
+[[ "$RECOVERED_LSAS" == "$N" ]] || {
+  echo "FAIL: expected $N LSAs after restart, recovered $RECOVERED_LSAS" >&2
+  exit 1
+}
+[[ "$RECOVERED_GEN" -ge "$N" ]] || {
+  echo "FAIL: recovered generation $RECOVERED_GEN is behind $N applied commands" >&2
+  exit 1
+}
 
 echo "OK: persistence benchmark complete"

@@ -48,7 +48,7 @@ api() { # api <host-index> <port> <path>
 
 cleanup() {
   for i in "${!HOST_ARR[@]}"; do
-    sshh "${HOST_ARR[$i]}" "pkill -f '[s]tellaris-agent --config $DIR/n$((i + 1)).toml' 2>/dev/null; ip link del stellaris0 2>/dev/null" >/dev/null 2>&1 || true
+    sshh "${HOST_ARR[$i]}" "pkill -9 -f '[s]tellaris-agent --config $DIR' 2>/dev/null; sleep 0.5; ip link del stellaris0 2>/dev/null" >/dev/null 2>&1 || true
   done
   sshh "${HOST_ARR[0]}" "pkill -f '[s]tellaris-controller --config $DIR/controller.toml' 2>/dev/null" >/dev/null 2>&1 || true
   if [[ "${KEEP:-0}" != "1" ]]; then
@@ -254,6 +254,36 @@ for _ in $(seq 1 60); do sshq "${HOST_ARR[1]}" "curl -fsS --max-time 2 -H 'Autho
 addr=$(api 1 $((API_BASE + 1)) /v1/status | python3 -c 'import json,sys;d=json.load(sys.stdin);c=d.get("credential") or {};print(c.get("overlay_ip") or "")')
 [[ "$addr" == "10.66.0.1" ]] || { echo "FAIL: restarted n1 has $addr" >&2; exit 1; }
 echo "n1 kept 10.66.0.1"
+
+echo "== hot reassign n1 to 10.66.0.9"
+code=$(sshh "${HOST_ARR[0]}" "curl -s -o /tmp/reassign.out -w '%{http_code}' --max-time 5 -H 'x-stellaris-secret: $ADMIN' -H 'content-type: application/json' -d '{\"ip\":\"10.66.0.9\"}' http://127.0.0.1:$CTRL_PORT/v1/ipam/leases/${NODE_IDS[0]}/reassign")
+[[ "$code" == "200" ]] || { echo "FAIL: reassign returned $code" >&2; sshh "${HOST_ARR[0]}" "cat /tmp/reassign.out" >&2; exit 1; }
+for _ in $(seq 1 80); do
+  addr=$(api 1 $((API_BASE + 1)) /v1/status | python3 -c 'import json,sys;d=json.load(sys.stdin);c=d.get("credential") or {};print(c.get("overlay_ip") or "")')
+  [[ "$addr" == "10.66.0.9" ]] && break
+  sleep 0.5
+done
+[[ "$addr" == "10.66.0.9" ]] || { echo "FAIL: n1 credential did not move to .9 (got $addr)" >&2; exit 1; }
+for _ in $(seq 1 80); do
+  sshh "${HOST_ARR[1]}" "ip -4 addr show stellaris0 2>/dev/null | grep -q '10.66.0.9'" && break
+  sleep 0.5
+done
+sshh "${HOST_ARR[1]}" "ip -4 addr show stellaris0 | grep -q '10.66.0.9'" || {
+  echo "FAIL: n1 TUN did not move to 10.66.0.9" >&2; sshh "${HOST_ARR[1]}" "ip -4 addr show stellaris0" >&2; exit 1; }
+# The old address is released into quarantine and must no longer answer.
+ok=0
+for _ in $(seq 1 40); do
+  if sshh "${HOST_ARR[2]}" "ping -c 2 -W 2 10.66.0.9 >/dev/null 2>&1"; then ok=1; break; fi
+  sleep 1
+done
+[[ "$ok" == 1 ]] || { echo "FAIL: n2 cannot ping n1's new address .9" >&2; exit 1; }
+if sshh "${HOST_ARR[2]}" "ping -c 2 -W 2 10.66.0.1 >/dev/null 2>&1"; then
+  echo "FAIL: old address 10.66.0.1 still answers after reassign" >&2; exit 1
+fi
+LEASES=$(sshh "${HOST_ARR[0]}" "curl -fsS -H 'x-stellaris-secret: $ADMIN' http://127.0.0.1:$CTRL_PORT/v1/ipam/leases")
+echo "$LEASES" | python3 -c "import json,sys; d=json.load(sys.stdin); assert any(q['ip']=='10.66.0.9' for q in d['leases']), d; assert any(q['ip']=='10.66.0.1' for q in d.get('quarantine',[])), d" || {
+  echo "FAIL: lease/quarantine state wrong after reassign" >&2; echo "$LEASES" >&2; exit 1; }
+echo "n1 hot-reassigned .1 -> .9 (old address quarantined)"
 
 echo "== revoking the last member releases its lease"
 LAST=$((N - 1))

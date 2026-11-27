@@ -738,13 +738,35 @@ impl ControllerState {
     }
 
     async fn authorize_lsa_current(&self, lsa: &Lsa) -> Result<(), (u16, String)> {
-        if !self.strict_membership {
-            return Ok(());
-        }
         if self.raft.is_none() {
+            // Non-Raft controllers keep the legacy grant-based check. Once a
+            // member has been admitted the grant table is non-empty and the
+            // check is enforced even if the process started without static
+            // members (approval-only deployments).
+            if !self.strict_membership
+                && self
+                    .grants
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+            {
+                return Ok(());
+            }
             return self.authorize_lsa(lsa);
         }
         let model = self.model_current().await;
+        // A Raft controller that started without `[[control.members]]` (the
+        // documented approval-only deployment) still has to enforce membership
+        // once the first admission/revocation has been written. Otherwise a
+        // dynamically approved member could advertise any prefix for the whole
+        // lifetime of the process.
+        if !self.strict_membership
+            && model.members.is_empty()
+            && model.revoked.is_empty()
+            && model.pending_admissions.is_empty()
+        {
+            return Ok(());
+        }
         let Some(member) = model.members.get(&lsa.origin) else {
             return Err((403, format!("member {} is not authorized", lsa.origin)));
         };
@@ -1266,31 +1288,6 @@ impl ControllerState {
             .map_err(|e| (503, format!("raft revoke failed: {e}")))
         } else {
             self.revoke(node)
-        }
-    }
-
-    async fn ack_current(
-        &self,
-        node: NodeId,
-        generation: u64,
-        epoch: Option<u64>,
-    ) -> Result<(), (u16, String)> {
-        if let Some(raft) = &self.raft {
-            if let Some(epoch) = epoch
-                && epoch != self.epoch
-            {
-                return Err((409, "controller epoch changed; refetch snapshot".into()));
-            }
-            raft.client_write(ControllerCommand::Ack {
-                node,
-                generation,
-                epoch: self.epoch,
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| (503, format!("raft ack failed: {e}")))
-        } else {
-            self.record_ack(node, generation, epoch)
         }
     }
 
@@ -2519,7 +2516,10 @@ async fn ack(
         Ok(node) => node,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid node: {e}")).into_response(),
     };
-    match state.ack_current(node, req.generation, req.epoch).await {
+    match state
+        .record_ack_current(node, req.generation, req.epoch)
+        .await
+    {
         Ok(()) => Json(json!({"acked": req.generation, "node": node.to_string()})).into_response(),
         Err((code, message)) => controller_error(&state, code, message).await,
     }

@@ -230,6 +230,11 @@ impl ControllerModel {
 
     /// Apply a command deterministically. Returns true if state changed.
     pub fn apply(&mut self, command: ControllerCommand) -> bool {
+        // An ACK is an observation, not a topology change. Bumping
+        // `generation` here would make every ACK invalidate the snapshot the
+        // member just acknowledged, so the member would fetch, apply and ACK a
+        // new snapshot every poll interval (an unbounded feedback loop).
+        let bumps_generation = !matches!(&command, ControllerCommand::Ack { .. });
         let changed = match command {
             ControllerCommand::SetEpoch { epoch } => {
                 if epoch > self.epoch {
@@ -276,6 +281,19 @@ impl ControllerModel {
                 }
             }
             ControllerCommand::UpsertMember { node, member } => {
+                // Changing a member's overlay address must move the lease with
+                // it. Otherwise the old lease expires later, `ExpireLeases`
+                // deletes the still-online member (and its LSA) and
+                // `allocate_address` can hand the stale address back out.
+                let previous_ip = self.members.get(&node).and_then(|m| m.overlay_ip);
+                if previous_ip != member.overlay_ip {
+                    if let Some(ip) = previous_ip {
+                        self.leases.remove(&ip);
+                    }
+                    if self.node_leases.get(&node) == previous_ip.as_ref() {
+                        self.node_leases.remove(&node);
+                    }
+                }
                 self.bump_revision(node);
                 self.members.insert(node, member);
                 self.revoked.remove(&node);
@@ -520,10 +538,23 @@ impl ControllerModel {
                 let changed = !expired.is_empty();
                 for ip in expired {
                     if let Some(lease) = self.leases.remove(&ip) {
-                        self.node_leases.remove(&lease.node);
-                        self.members.remove(&lease.node);
-                        self.lsas.remove(&lease.node);
-                        self.bump_revision(lease.node);
+                        // A lease may have been superseded by an address change
+                        // (`UpsertMember` / static grants). Only expire the
+                        // member when this lease still owns its current
+                        // overlay address.
+                        let still_current = self
+                            .members
+                            .get(&lease.node)
+                            .and_then(|member| member.overlay_ip)
+                            == Some(lease.ip);
+                        if still_current {
+                            self.node_leases.remove(&lease.node);
+                            self.members.remove(&lease.node);
+                            self.lsas.remove(&lease.node);
+                            self.bump_revision(lease.node);
+                        } else if self.node_leases.get(&lease.node) == Some(&lease.ip) {
+                            self.node_leases.remove(&lease.node);
+                        }
                         let quarantine = self
                             .pools
                             .get(&lease.pool)
@@ -553,7 +584,7 @@ impl ControllerModel {
                 }
             }
         };
-        if changed {
+        if changed && bumps_generation {
             self.generation = self.generation.saturating_add(1);
         }
         changed
@@ -1025,7 +1056,29 @@ mod tests {
         b.apply_all(commands());
         assert_eq!(a.snapshot_bytes(), b.snapshot_bytes());
         assert_eq!(a.lsas.len(), 1);
-        assert_eq!(a.generation, 5);
+        // SetEpoch + ApplyLsa + UpsertMember; the duplicate LSA and the ACK are
+        // observations, not topology changes.
+        assert_eq!(a.generation, 4);
+    }
+
+    #[test]
+    fn ack_does_not_advance_generation() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        let node = NodeId::new([1u8; 32]);
+        let before = model.generation;
+        assert!(model.apply(ControllerCommand::Ack {
+            node,
+            generation: before,
+            epoch: 1,
+        }));
+        assert_eq!(model.generation, before);
+        // A repeated, stale ACK is a no-op.
+        assert!(!model.apply(ControllerCommand::Ack {
+            node,
+            generation: before,
+            epoch: 1,
+        }));
+        assert_eq!(model.generation, before);
     }
 
     #[test]
@@ -1338,6 +1391,78 @@ mod tests {
         assert!(model.leases.is_empty());
         assert!(model.node_leases.is_empty());
         assert_eq!(model.quarantine.get(&ip).copied(), Some(230));
+    }
+
+    #[test]
+    fn upsert_member_moves_address_and_keeps_the_member() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::CreatePool {
+            pool: test_pool("p", "10.13.0.0/24", 60, 30),
+        });
+        let node = NodeId::new([9u8; 32]);
+        assert_eq!(
+            approve_auto(&mut model, node, 100),
+            Some("10.13.0.1".parse().unwrap())
+        );
+        assert!(model.apply(ControllerCommand::UpsertMember {
+            node,
+            member: MemberRecord {
+                overlay_ip: Some("10.13.0.9".parse().unwrap()),
+                prefixes: vec!["192.168.9.0/24".into()],
+                capabilities: vec!["member".into()],
+            },
+        }));
+        // The stale lease must not survive the address change.
+        assert!(!model.leases.contains_key(&"10.13.0.1".parse().unwrap()));
+        assert!(!model.node_leases.contains_key(&node));
+        // Expiring leases after the change must not delete the live member.
+        assert!(!model.apply(ControllerCommand::ExpireLeases { now: 1000 }));
+        assert!(model.members.contains_key(&node));
+        assert_eq!(
+            model.members.get(&node).and_then(|m| m.overlay_ip),
+            Some("10.13.0.9".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn expired_stale_lease_does_not_remove_reassigned_member() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        model.apply(ControllerCommand::CreatePool {
+            pool: test_pool("p", "10.14.0.0/24", 60, 30),
+        });
+        let node = NodeId::new([8u8; 32]);
+        let old: std::net::IpAddr = "10.14.0.1".parse().unwrap();
+        let new: std::net::IpAddr = "10.14.0.9".parse().unwrap();
+        model.members.insert(
+            node,
+            MemberRecord {
+                overlay_ip: Some(new),
+                prefixes: Vec::new(),
+                capabilities: Vec::new(),
+            },
+        );
+        // Simulate a lease left behind by an older writer: it points at the
+        // member's previous address.
+        model.leases.insert(
+            old,
+            Lease {
+                node,
+                ip: old,
+                pool: "p".into(),
+                issued_at: 0,
+                expires_at: 10,
+                reserved: false,
+            },
+        );
+        model.node_leases.insert(node, old);
+        assert!(model.apply(ControllerCommand::ExpireLeases { now: 20 }));
+        assert!(model.members.contains_key(&node));
+        assert_eq!(
+            model.members.get(&node).and_then(|m| m.overlay_ip),
+            Some(new)
+        );
+        assert!(!model.node_leases.contains_key(&node));
+        assert!(!model.leases.contains_key(&old));
     }
 
     #[test]

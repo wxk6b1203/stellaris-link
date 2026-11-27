@@ -517,9 +517,11 @@ fn apply_members(
                     );
                 }
                 // Force re-authentication so the peer's new credential (and
-                // its overlay grant) replaces the cached one.
+                // its overlay grant) replaces the cached one. This is not a
+                // revocation: the peer stays allowed to reconnect and the
+                // connect loop performs the handshake again.
                 if let Some(transport) = transport {
-                    transport.close_peer(node);
+                    transport.reconnect_peer(node);
                 }
             }
         }

@@ -35,6 +35,9 @@ advertise=["10.200.0.1:46411"]
 enabled=true
 tun_name="stellaris0"
 mtu=1100
+# The exit member advertises 0.0.0.0/0; installing a default route into the
+# overlay is opt-in since the route-safety hardening.
+allow_default_route=true
 [api]
 bind="127.0.0.1:46421"
 TOML

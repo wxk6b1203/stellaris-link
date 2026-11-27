@@ -183,9 +183,21 @@ impl IrohTransport {
             None
         };
         if !relay_disabled {
-            endpoint.online().await;
-            if let Some(standby) = &standby_endpoint {
-                standby.online().await;
+            // A relay being down must not block startup forever: `online()`
+            // waits for any home relay, and a dual-relay node with one broken
+            // relay would otherwise never start its API or dataplane.
+            if tokio::time::timeout(Duration::from_secs(10), endpoint.online())
+                .await
+                .is_err()
+            {
+                warn!("primary relay did not come online within 10s; starting anyway");
+            }
+            if let Some(standby) = &standby_endpoint
+                && tokio::time::timeout(Duration::from_secs(10), standby.online())
+                    .await
+                    .is_err()
+            {
+                warn!("standby relay did not come online within 10s; starting anyway");
             }
         }
         let me = endpoint.id();
@@ -301,6 +313,7 @@ impl IrohTransport {
                         continue;
                     }
                     info!(peer = %node.short(), ?role, ?relay, "inbound iroh connection");
+                    spawn_path_watch(conn.clone(), node, conn.stable_id(), transport.clone());
                     if let Some(tx) = &control_tx {
                         let _ = tx
                             .send(ControlEvent::Up {
@@ -440,11 +453,24 @@ impl IrohTransport {
     }
 
     /// Force-close every link to a peer (used when the controller revokes it).
+    /// The peer is fenced and its connect/accept loops stay idle until a
+    /// controller snapshot explicitly re-authorizes it.
     pub fn close_peer(&self, node: NodeId) {
         self.blocked
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(node);
+        self.drop_links(node, b"revoked");
+    }
+
+    /// Close links and drop the cached grant so the peer re-authenticates with
+    /// its new credential. Unlike `close_peer` this is not a revocation and
+    /// must not fence the peer: the connect loop is expected to reconnect.
+    pub fn reconnect_peer(&self, node: NodeId) {
+        self.drop_links(node, b"credential changed");
+    }
+
+    fn drop_links(&self, node: NodeId, reason: &[u8]) {
         let links = self
             .conns
             .write()
@@ -452,9 +478,9 @@ impl IrohTransport {
             .remove(&node);
         if let Some(links) = links {
             for link in links.links {
-                link.conn.close(3u8.into(), b"revoked");
+                link.conn.close(3u8.into(), reason);
             }
-            warn!(peer = %node.short(), "closed revoked peer connections");
+            warn!(peer = %node.short(), "closed peer connections");
         }
         self.state.drop_grant(node);
     }
@@ -664,6 +690,46 @@ impl IrohTransport {
             .get(&node)
             .is_some_and(|links| links.links.iter().any(|link| link.role == role))
     }
+
+    fn is_active_link(&self, node: NodeId, stable_id: usize) -> bool {
+        self.conns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .and_then(PeerLinks::active_stable_id)
+            == Some(stable_id)
+    }
+}
+
+/// Refresh `/v1/peers` path/RTT/MTU while the link is alive. iroh can migrate
+/// an established connection between direct and relay paths, so sampling only
+/// at connect time leaves the API permanently stale after a failover.
+fn spawn_path_watch(
+    conn: iroh::endpoint::Connection,
+    node: NodeId,
+    stable_id: usize,
+    transport: Arc<IrohTransport>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = conn.closed() => break,
+            }
+            if conn.paths().is_empty() {
+                break;
+            }
+            if !transport.is_active_link(node, stable_id) {
+                continue;
+            }
+            let (path, rtt, mtu, addr, path_count) = path_status(&conn);
+            if path.is_some() {
+                transport
+                    .peers
+                    .mark(&node, true, path, rtt, mtu, addr, path_count);
+            }
+        }
+    });
 }
 
 fn selected_relay(conn: &iroh::endpoint::Connection) -> Option<RelayUrl> {
@@ -792,11 +858,21 @@ async fn connect_loop(
         }
     };
     let mut addrs = Vec::new();
-    if let Some(relay) = &relay {
-        addrs.push(TransportAddr::Relay(relay.clone()));
+    // In dual-relay mode each endpoint is pinned to exactly one relay so the
+    // two links really use different relays. With a single endpoint the relay
+    // is a fallback: keep the configured direct addresses so iroh can still
+    // pick a direct path (and roam back to it) instead of forcing relay-only.
+    let force_relay = relay.is_some() && transport.standby_endpoint.is_some();
+    if force_relay {
+        if let Some(relay) = &relay {
+            addrs.push(TransportAddr::Relay(relay.clone()));
+        }
     } else {
         for addr in &peer.addrs {
             addrs.push(TransportAddr::Ip(*addr));
+        }
+        if let Some(relay) = &relay {
+            addrs.push(TransportAddr::Relay(relay.clone()));
         }
         for candidate in &transport.relay_fallbacks {
             let candidate = TransportAddr::Relay(candidate.clone());
@@ -862,6 +938,7 @@ async fn connect_loop(
                 }
                 let stable_id = conn.stable_id();
                 info!(peer = %peer.name, ?role, "outbound iroh connected");
+                spawn_path_watch(conn.clone(), node, stable_id, transport.clone());
                 if let Some(tx) = &control_tx {
                     let _ = tx
                         .send(ControlEvent::Up {
@@ -1778,6 +1855,30 @@ cidr = "10.8.0.0/16"
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(restored, 2, "re-authorized peer should reconnect");
+
+        // A credential revision change closes the links so the next handshake
+        // presents the new credential, but must not fence the peer: the
+        // connect loop has to bring both links back without a controller
+        // snapshot calling `allow_peer`.
+        a.reconnect_peer(b_id);
+        let mut reconnected = 0;
+        for _ in 0..100 {
+            reconnected = a
+                .conns
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&b_id)
+                .map(|peer| peer.links.len())
+                .unwrap_or(0);
+            if reconnected >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            reconnected, 2,
+            "credential-change reconnect must not leave the peer blocked"
+        );
         a.endpoint.close().await;
         b.endpoint.close().await;
         relay1.shutdown().await.unwrap();

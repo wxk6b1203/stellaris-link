@@ -75,8 +75,10 @@ print(f"pushed={count} errors={len(errors)} first={errors[:1]}")
 PY
 python3 "$DIR/push.py" 300 800 48800 "$SECRET"
 sleep 2
-SIZE=$(stat -c %s "$DIR/raft/raft-state.json")
-echo "controller raft-state.json bytes=$SIZE"
+# The segmented log + state WAL replaced the monolithic raft-state.json;
+# measure the whole persisted state (model bytes dominate this workload).
+SIZE=$(du -sb "$DIR/raft" | cut -f1)
+echo "controller raft state bytes=$SIZE"
 [[ "$SIZE" -gt 4194304 ]] || { echo "FAIL: model is not larger than the old 4 MiB cap" >&2; exit 1; }
 
 mkdir -p "$DIR/member-state"

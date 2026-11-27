@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="${BIN:-$ROOT/target/debug/stellaris-agent}"
+CTRL_BIN="${CTRL_BIN:-$ROOT/target/debug/stellaris-controller}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/stellaris-tls.XXXXXX")"
 BASE=$(( (RANDOM % 2000) + 55000 ))
 API=$BASE; CTRL=$((BASE+1)); MEMBER_API=$((BASE+2))
@@ -34,7 +36,7 @@ token = "api-token"
 tls_cert = "$TMP/cert.pem"
 tls_key = "$TMP/key.pem"
 TOML
-"$ROOT/target/debug/stellaris-agent" --config "$TMP/api.toml" > "$TMP/api.log" 2>&1 & A_PID=$!
+"$BIN" --config "$TMP/api.toml" > "$TMP/api.log" 2>&1 & A_PID=$!
 
 cat > "$TMP/ctrl.toml" <<TOML
 [node]
@@ -71,9 +73,9 @@ disable_relay = true
 [api]
 bind = "127.0.0.1:$MEMBER_API"
 TOML
-"$ROOT/target/debug/stellaris-controller" --config "$TMP/ctrl.toml" > "$TMP/ctrl.log" 2>&1 & C_PID=$!
+"$CTRL_BIN" --config "$TMP/ctrl.toml" > "$TMP/ctrl.log" 2>&1 & C_PID=$!
 sleep 2
-"$ROOT/target/debug/stellaris-agent" --config "$TMP/member.toml" > "$TMP/member.log" 2>&1 & M_PID=$!
+"$BIN" --config "$TMP/member.toml" > "$TMP/member.log" 2>&1 & M_PID=$!
 sleep 5
 if ! curl -fsS --cacert "$TMP/ca.pem" -H "Authorization: Bearer api-token" "https://127.0.0.1:$API/v1/status" >/dev/null; then
   echo "FAIL: API HTTPS" >&2; tail -20 "$TMP/api.log" >&2; exit 1
