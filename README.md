@@ -4,6 +4,15 @@
 
 > 状态：**controller HA + P1 数据面生产化基线已完成**（2026-11-23）。3 节点 openraft/mTLS/快照/故障恢复、真实物理三主机 HA、IPv4/IPv6 overlay、NAT44/66、public exit、MSS/MTU/PTB、fragment ACL、direct→relay 切换、per-class queue 已验证。
 > **2026-11-24 已按 [AUDIT.md](AUDIT.md) 修复 P0/P1 并继续完成 P2**：LSA Ed25519 签名、transit capability、OS 路由防护、iroh 走 Raft、Raft 鉴权/超时、routes/LSA TTL/epoch 入 Raft、签名 join、admin secret、动态 membership、签名审批入网、ACL ICMP reject、应用层分片重组、IPv6 最小 MTU、discovery/relay 配置校验、metrics/audit、systemd/CI。剩余边界（真 multipath、真实互联网 PTB 未观测、macOS NAT、Windows）仍以 AUDIT.md 为准。设计记录见 [OPENRAFT-HA.md](OPENRAFT-HA.md)。
+> **2026-11-27 安全复核修复**：HTTP `POST /v1/lsa` 现在默认要求
+> `{ "lsa": ..., "signature": ... }` 的 Ed25519 签名（`control.allow_unsigned_lsa = true`
+> 仅用于 legacy 测试）；撤销节点以签名 `revoked` 列表进入 Snapshot/Manifest，成员把
+> revision/snapshot/manifest floor 持久化到 `control-state.json`，重启后旧快照/旧 manifest/
+> 旧凭据不能复活；新增 `POST /v1/members/{node}/reinstate` 显式恢复被撤销成员；
+> `transport.disable_discovery = true` 同时关闭 LSA 自动加 peer；transit 超下一跳 MTU
+> 会回 ICMP PTB；SPF 只使用双向 link。**非 Raft 单 controller 模式已标记 deprecated**，
+> 启动会打印告警，生产请配置 `control.raft_dir`。
+>
 > **2026-11-25 入网收敛为单一凭据**：删除 PSK、join token、`admission` 的 legacy/allowlist；controller 签发带 `revision` 和过期时间的 `MembershipCredential`，peer 在 iroh 握手时用 `control.controller_keys` 验签；撤销 ≤10s 内断连并丢弃 grant/LSA；新增 `POST /v1/enroll` 与 `POST /v1/members/{node}/grants`。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。
 
@@ -671,8 +680,11 @@ curl -X POST -H "x-stellaris-secret: admin-secret" \
 - 无 controller 的小规模部署可用 `stellaris credential issue` 离线签发（读取 controller
   `identity.key`，输出 0600 的 `credential.json`）；成员配置可省略 `control.url`。
   详见 [MEMBERSHIP-AUTH.md](MEMBERSHIP-AUTH.md) §3.1。
-- 撤销（`POST /v1/revoke`、deny 或从 members 移除）：controller 递增该节点 revision；
-  member 在下一个快照（≤10s）主动断开该 peer 并丢弃它的 grant，LSA 同时被拒绝。
+- 撤销（`POST /v1/revoke` 或 deny）：controller 递增该节点 revision，并把
+  `{node,revision}` 写入签名 Snapshot/Manifest 的 `revoked` 列表；恢复用
+  `POST /v1/members/{node}/reinstate`（admin，显式提供或自动分配 overlay）。
+  撤销后 member 在下一个快照（≤10s）主动断开该 peer、丢弃 grant 并拒绝其 LSA；
+  撤销前签出的旧凭据因 revision/expiry 被拒绝。
 - 改前缀/能力用 `POST /v1/members/<node>/grants`，不需要重新入网。
 - 过期凭据和 revision 回滚都会被拒绝；撤销前签出的旧凭据无法重放。
 
