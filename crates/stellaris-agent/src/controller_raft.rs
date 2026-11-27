@@ -2713,11 +2713,26 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        leader
-            .expect("leader")
-            .client_write(ControllerCommand::ApplyLsa { lsa })
-            .await
-            .unwrap();
+        let leader = leader.expect("leader");
+        // A freshly observed leader can still answer ForwardToLeader(LeaseExpired)
+        // while its lease is being established; retry instead of unwrapping.
+        let mut written = false;
+        for _ in 0..100 {
+            match leader
+                .client_write(ControllerCommand::ApplyLsa { lsa: lsa.clone() })
+                .await
+            {
+                Ok(_) => {
+                    written = true;
+                    break;
+                }
+                Err(error) if format!("{error:?}").contains("ForwardToLeader") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("client_write failed: {error:?}"),
+            }
+        }
+        assert!(written, "leader never accepted the write");
         for store in &cluster.stores {
             for _ in 0..50 {
                 if store.model().await.lsas.contains_key(&node) {
@@ -2790,11 +2805,26 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        leader
-            .expect("leader")
-            .client_write(ControllerCommand::ApplyLsa { lsa })
-            .await
-            .unwrap();
+        let leader = leader.expect("leader");
+        // A freshly observed leader can still answer ForwardToLeader(LeaseExpired)
+        // while its lease is being established; retry instead of unwrapping.
+        let mut written = false;
+        for _ in 0..100 {
+            match leader
+                .client_write(ControllerCommand::ApplyLsa { lsa: lsa.clone() })
+                .await
+            {
+                Ok(_) => {
+                    written = true;
+                    break;
+                }
+                Err(error) if format!("{error:?}").contains("ForwardToLeader") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("client_write failed: {error:?}"),
+            }
+        }
+        assert!(written, "leader never accepted the write");
         for node in &nodes {
             for _ in 0..50 {
                 if node.store.model().await.lsas.contains_key(&target) {

@@ -708,6 +708,14 @@ impl IrohTransport {
             .is_some_and(|links| links.links.iter().any(|link| link.role == role))
     }
 
+    fn has_any_link(&self, node: NodeId) -> bool {
+        self.conns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .is_some_and(|links| !links.links.is_empty())
+    }
+
     fn is_active_link(&self, node: NodeId, stable_id: usize) -> bool {
         self.conns
             .read()
@@ -899,7 +907,23 @@ async fn connect_loop(
         }
     }
     let addr = EndpointAddr::from_parts(remote, addrs);
+    let local = NodeId::new(*transport.endpoint.id().as_bytes());
+    let wait_for_smaller = local >= node;
+    let mut waited = std::time::Duration::ZERO;
     loop {
+        if wait_for_smaller {
+            if transport.has_any_link(node) {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            if waited < Duration::from_secs(5) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                waited += Duration::from_millis(250);
+                continue;
+            }
+            // Grace expired: the smaller side never connected, so this side
+            // becomes the dialer too.
+        }
         if transport.is_blocked(node) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
