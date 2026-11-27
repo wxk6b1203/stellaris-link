@@ -278,7 +278,7 @@ async fn run_iroh(
                     addrs: state.config.transport.advertise.clone(),
                     secret: secret.clone(),
                 };
-                match request(&conn, &req).await {
+                match request_timed(&conn, &req).await {
                     Ok(Response::Credential { credential }) => {
                         if install_credential(&state, &credential) {
                             tracing::info!("membership credential issued");
@@ -309,7 +309,7 @@ async fn run_iroh(
                     signature,
                     secret: secret.clone(),
                 };
-                match request(&conn, &req).await {
+                match request_timed(&conn, &req).await {
                     Ok(Response::Ok { .. }) => last_lsa = Instant::now(),
                     Ok(Response::Error { code, message }) => {
                         tracing::debug!(code, message, "controller rejected LSA")
@@ -325,7 +325,7 @@ async fn run_iroh(
                 node: Some(state.node_id.to_string()),
                 secret: secret.clone(),
             };
-            match request(&conn, &req).await {
+            match request_timed(&conn, &req).await {
                 Ok(Response::Snapshot { snapshot }) => {
                     if verify_snapshot(&state, secret.as_deref(), &snapshot)
                         && let Some((generation, epoch)) =
@@ -337,7 +337,7 @@ async fn run_iroh(
                             epoch: Some(epoch),
                             secret: secret.clone(),
                         };
-                        let _ = request(&conn, &ack).await;
+                        let _ = request_timed(&conn, &ack).await;
                     }
                 }
                 Ok(Response::Error { code, message }) => {
@@ -354,6 +354,16 @@ async fn run_iroh(
     }
 }
 
+async fn request_timed(
+    conn: &iroh::endpoint::Connection,
+    message: &Request,
+) -> anyhow::Result<Response> {
+    match tokio::time::timeout(Duration::from_secs(60), request(conn, message)).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("controller control request timed out after 60s"),
+    }
+}
+
 async fn request(conn: &iroh::endpoint::Connection, request: &Request) -> anyhow::Result<Response> {
     let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
     crate::control_wire::write_frame(&mut send, request).await?;
@@ -364,7 +374,9 @@ async fn request(conn: &iroh::endpoint::Connection, request: &Request) -> anyhow
 }
 
 fn http_client(config: &stellaris_types::Config) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10));
     if let Some(path) = &config.control.tls_ca {
         let pem = std::fs::read(path).with_context(|| format!("read control.tls_ca {path}"))?;
         let cert = reqwest::Certificate::from_pem(&pem).context("parse control.tls_ca")?;
@@ -438,6 +450,16 @@ async fn try_manifest(
     }
 }
 
+fn trusted_controller(state: &AgentState, node: NodeId) -> bool {
+    state
+        .config
+        .control
+        .controller_keys
+        .iter()
+        .filter_map(|key| key.parse::<NodeId>().ok())
+        .any(|key| key == node)
+}
+
 fn verify_manifest(
     state: &AgentState,
     manifest: &crate::controller::MembershipManifest,
@@ -455,13 +477,7 @@ fn verify_manifest(
         .controller
         .as_deref()
         .and_then(|s| s.parse::<NodeId>().ok())?;
-    if !state
-        .config
-        .control
-        .controller_keys
-        .iter()
-        .any(|key| key == &controller.to_string())
-    {
+    if !trusted_controller(state, controller) {
         tracing::warn!(%controller, "untrusted manifest controller");
         return None;
     }
@@ -730,13 +746,7 @@ fn verify_snapshot(state: &AgentState, secret: Option<&str>, snapshot: &Snapshot
             tracing::warn!("controller snapshot has no signer");
             return false;
         };
-        if !state
-            .config
-            .control
-            .controller_keys
-            .iter()
-            .any(|key| key == &signer.to_string())
-        {
+        if !trusted_controller(state, signer) {
             tracing::warn!(%signer, "untrusted controller signer");
             return false;
         }
@@ -1028,6 +1038,17 @@ url = "http://127.0.0.1:7800"
     fn node_for(secret: [u8; 32]) -> NodeId {
         use ed25519_dalek::SigningKey;
         NodeId::new(SigningKey::from_bytes(&secret).verifying_key().to_bytes())
+    }
+
+    #[test]
+    fn controller_key_hex_comparison_is_case_insensitive() {
+        let id = NodeId::new([0xabu8; 32]);
+        let state = agent(&format!(
+            "controller_keys = [\"{}\"]",
+            id.to_string().to_uppercase()
+        ));
+        assert!(trusted_controller(&state, id));
+        assert!(!trusted_controller(&state, NodeId::new([0xacu8; 32])));
     }
 
     #[tokio::test]

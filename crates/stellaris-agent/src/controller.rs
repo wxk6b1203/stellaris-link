@@ -5066,6 +5066,10 @@ prefixes = ["192.168.50.0/24"]
         a.set_signing_key([1u8; 32]);
         let mut b = state();
         b.set_signing_key([2u8; 32]);
+        // Pin the epoch so a second boundary cannot make the two manifests
+        // disagree on a field that is unrelated to controller identity.
+        a.epoch = 1_234;
+        b.epoch = 1_234;
         let ma = a.manifest();
         let mb = b.manifest();
         assert_ne!(ma.controller, mb.controller);

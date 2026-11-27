@@ -63,8 +63,8 @@
 
 | ID | 问题 | 来源 | 状态 |
 |---|---|---|---|
-| P2-01 | 启动加载 `credential.json` 不验签/不查过期，bootstrap 检查被它满足 | S-1 | 开放 |
-| P2-02 | `controller_keys` 大小写敏感字符串比较，大写 hex 导致快照全拒 | S-2 | 开放 |
+| P2-01 | 启动加载 `credential.json` 不验签/不查过期，bootstrap 检查被它满足 | S-1 | **已修**：`load_credential` 后用 `SignedCredential::verify` 校验 network/node/Ed25519/expiry/controller_keys；`cached_credential_signature_expiry_and_trust_anchor_are_enforced` |
+| P2-02 | `controller_keys` 大小写敏感字符串比较，大写 hex 导致快照全拒 | S-2 | **已修**：统一 parse 成 `NodeId` 比较；`controller_key_hex_comparison_is_case_insensitive` |
 | P2-03 | 静态 overlay 不校验 CIDR/冲突（enroll/grants 两条路径） | S-3 | 部分（CIDR/update_grants 已加） |
 | P2-04 | `admin_secret` 缺省回落 member secret | S-4 | 已缓解：启动告警；部署必须显式配置 admin_secret 才能完全分权 |
 | P2-05 | 非 Raft 快照 epoch 用启动副本，revoke bump 不反映 | S-5 | 弃用 |
@@ -110,7 +110,7 @@
 | P2-35 | 动态 peer 无上限/无 TTL/无原子 add_peer | T-12 | 开放 |
 | P2-36 | inbound peer 未写入 registry，LSA/API 不显示单向连接 | T-13 | 开放 |
 | P2-37 | 快照过滤未连接下一跳后不再补装（已改为 FIB 过滤，保路由） | T-15 | 已修（P1-20 顺带） |
-| P2-38 | 控制客户端无 HTTP/iroh 超时，controller 半死卡住续签 | T-16 | 开放 |
+| P2-38 | 控制客户端无 HTTP/iroh 超时，controller 半死卡住续签 | T-16 | **已修**：HTTP connect 5s / total 10s；iroh control request 60s timeout |
 | P2-39 | LSA seq 用墙钟，时钟回拨被旧 LSA 挡住；peer.relay_url 未预解析；transport 无 shutdown | T-17 | 开放 |
 | P2-40 | 流控/链路心跳参数文档写 2s/7s，代码 1s/4s | T-文档 | 开放（文档） |
 
@@ -139,9 +139,9 @@
 | P2-59 | QoS 分类依赖端口，非首片 DSCP 不一致 | D-20 | 开放 |
 | P2-60 | 出入/中转共用一个 token bucket | D-21 | 开放 |
 | P2-61 | 计数器缺字节/route_miss/ttl/datagram_too_large/per-class | D-22 | 开放 |
-| P2-62 | `burst_bytes < 包长` 时该类永久 100% 丢包 | D-23 | 开放 |
+| P2-62 | `burst_bytes < 包长` 时该类永久 100% 丢包 | D-23 | **已修**：容量取 `max(burst, packet)`，首次填满；`qos_byte_shaper_allows_a_packet_larger_than_burst` |
 | P2-63 | `AllocStrategy` 死配置；IPv4 线性扫描 O(n²) | D-24/D-26 | 开放 |
-| P2-64 | `UpdatePool` 可把 CIDR 改到不含现有租约 | D-25 | 开放 |
+| P2-64 | `UpdatePool` 可把 CIDR 改到不含现有租约 | D-25 | **已修**：状态机拒绝 CIDR/range/exclude 排除现有 lease 的更新；`update_pool_rejects_stranding_existing_leases` |
 | P2-65 | `PathHint`/`set_path_hint` no-op | D-27 | 开放 |
 | P2-66 | `routes(RouteView::Fib)` 恒空 | D-28 | 开放 |
 | P2-67 | 每次路由变更全量克隆 intents + 重建 FIB | D-29 | 开放 |
@@ -196,7 +196,7 @@
 
 | 测试 | 结果 |
 |---|---|
-| `cargo test --workspace` | 221 passed / 0 failed / 2 ignored |
+| `cargo test --workspace` | 225 passed / 0 failed / 2 ignored（Linux 构建机，P2 批次后） |
 | 3 机 controller HA + mTLS + failover | **通过**（leader 1→2，snapshot/failover 正常；test-real-3host-ha.sh） |
 | 3 机 IPv4 TUN overlay | **通过**（3/3、1000B/2000B 各 3/3，0% loss） |
 | 3 机 IPv6 TUN overlay | **通过**（1200B 3/3，0% loss） |
@@ -209,6 +209,11 @@
 | iroh control 与 data 共用 endpoint | **通过**（test-real-iroh-raft.sh；不再创建同 NodeId 的第二 endpoint） |
 | IPv6 over 1280B underlay | **通过**（peer max_datagram=1192，TCP 1MiB 完整；test-netns-ipv6-mtu1280.sh） |
 | Raft bootstrap 配置分歧 | **通过**（三副本不同本地 seed 收敛到 leader；test-controller-bootstrap-divergence.sh） |
+| P2 批次单测 | **通过**（cached credential、controller key 大小写、QoS 超 burst、UpdatePool 租约） |
+| P2-01/02 真实进程 | **通过**：有效 credential 启动后 `/v1/status.credential` 非空；篡改签名后为空；`controller_keys` 用大写 hex 仍能验签 |
+| P2-38 真实进程 | **通过**：假 controller 接受连接后挂起，agent 10s 内报 `TimedOut` 并重试 |
+| P2-64 真实 API | **通过**：pool 缩到不含现有 lease 返回 409；合法 range 更新 200 |
+| 新 3 机回归 | **通过**：HA、IPAM、静态 mesh、3host overlay、roaming（direct→relay）、netns TUN/IPv6/1280B/3node/exit-NAT/ACL |
 | 3 机静态 mesh + 单边 rogue | **通过**（6 方向 connected/ping；较大 NodeId 侧 5s 后补拨号，rogue 被 allowlist 拒绝） |
 | 撤销后旧凭据/新成员 | **单测通过**（revoked tombstone 对未见节点设 floor+close；reinstate 后恢复） |
 | netns 套件 | **16/16 通过**（route-safety、acl-reject、reassembly、tun、3node、3node-controller、ipv6、nat44、nat66、mdns、discovery、raft-tls、raft-membership、iroh-large、persistence；3node-controller/ipv6 需 12–14s 收敛等待） |

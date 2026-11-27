@@ -72,6 +72,7 @@ impl PolicyFile {
 struct Bucket {
     tokens: f64,
     last: Instant,
+    started: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -124,6 +125,7 @@ impl Policy {
                         .unwrap_or_else(|| class.rate_pps.unwrap_or(1))
                         .max(1) as f64,
                     last: Instant::now(),
+                    started: false,
                 })
             })
             .collect();
@@ -138,6 +140,7 @@ impl Policy {
                         .unwrap_or_else(|| class.rate_bps.unwrap_or(1))
                         .max(1) as f64,
                     last: Instant::now(),
+                    started: false,
                 })
             })
             .collect();
@@ -300,12 +303,20 @@ impl Policy {
         if let Some(rate) = class.rate_bps {
             let bytes = packet.len() as f64;
             let burst = class.burst_bytes.unwrap_or(rate).max(1) as f64;
+            // A bucket smaller than one packet would reject that packet
+            // forever. Let the bucket grow to one packet; the refill rate
+            // still limits how often an oversized packet can pass.
+            let capacity = burst.max(bytes);
             let mut bucket = self.byte_buckets[idx]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            if !bucket.started {
+                bucket.tokens = capacity;
+                bucket.started = true;
+            }
             let now = Instant::now();
             let elapsed = now.duration_since(bucket.last).as_secs_f64();
-            bucket.tokens = (bucket.tokens + elapsed * rate as f64).min(burst);
+            bucket.tokens = (bucket.tokens + elapsed * rate as f64).min(capacity);
             bucket.last = now;
             if bucket.tokens < bytes {
                 return QosVerdict::RateLimited;
@@ -466,6 +477,31 @@ dst_port = 443
             let mut packet = https_packet();
             assert_eq!(policy.apply_qos(&mut packet, &info), QosVerdict::Marked(46));
         }
+        let mut packet = https_packet();
+        assert_eq!(
+            policy.apply_qos(&mut packet, &info),
+            QosVerdict::RateLimited
+        );
+    }
+
+    #[test]
+    fn qos_byte_shaper_allows_a_packet_larger_than_burst() {
+        let cfg: QosConfig = toml::from_str(
+            r#"
+enabled = true
+[[classes]]
+name = "https"
+dscp = 46
+rate_bps = 1
+burst_bytes = 1
+dst_port = 443
+"#,
+        )
+        .unwrap();
+        let policy = Policy::from_config(AclConfig::default(), cfg);
+        let info = PacketInfo::parse(&https_packet()).unwrap();
+        let mut packet = https_packet();
+        assert_eq!(policy.apply_qos(&mut packet, &info), QosVerdict::Marked(46));
         let mut packet = https_packet();
         assert_eq!(
             policy.apply_qos(&mut packet, &info),

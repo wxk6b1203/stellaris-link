@@ -210,7 +210,9 @@ sshh "${HOST_ARR[0]}" "pkill -f '[s]tellaris-agent --config $DIR/rogue.toml' 2>/
 scp -q -o BatchMode=yes -o StrictHostKeyChecking=no /tmp/rogue.toml "${HOST_ARR[0]}:$DIR/rogue.toml"
 ROGUE_ID=$(sshh "${HOST_ARR[0]}" "$BIN --config $DIR/rogue.toml --print-id")
 sshn "${HOST_ARR[0]}" "{ RUST_LOG=debug setsid $BIN --config $DIR/rogue.toml; } >$DIR/rogue.log 2>&1 </dev/null & exit 0" || true
-sleep 8
+# A larger NodeId waits 5s before its fallback dial; leave enough time for
+# the handshake and n2's rejection log under loaded CI hosts.
+sleep 12
 LIVE_ID=$(sshh "${HOST_ARR[0]}" "curl -fsS -H 'Authorization: Bearer $TOKEN' http://127.0.0.1:$RAPI/v1/status" | python3 -c 'import json,sys;print(json.load(sys.stdin)["node_id"])')
 [[ "$LIVE_ID" == "$ROGUE_ID" ]] || {
   echo "FAIL: rogue agent did not start (log says: $(sshh "${HOST_ARR[0]}" "tail -2 $DIR/rogue.log"))" >&2; exit 1; }

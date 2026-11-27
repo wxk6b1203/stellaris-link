@@ -33,7 +33,11 @@ overlay_ip = "$ip"
 name = "physical-roaming"
 cidr = "10.252.0.0/16"
 [transport]
-relay_urls = []
+# Pin every endpoint to the same relay. With relay_mode=auto each host may
+# register on a different N0 region (e.g. euc1 vs usw1), so a peer that only
+# knows another region's relay URL cannot fall back there.
+relay_mode = "custom"
+relay_urls = ["https://usw1-1.relay.n0.iroh.link/"]
 disable_relay = false
 # Keep the peer set to the static IPv4 addresses below: iroh address discovery
 # would otherwise publish IPv6 addresses and the direct path would survive an
@@ -78,12 +82,15 @@ done
 echo "initial paths: $(path_of 2), $(path_of 3)"
 [[ "$(path_of 2)" == "direct" ]] || { echo "FAIL: initial path is not direct" >&2; exit 1; }
 block
+p2=""; p3=""
 for _ in $(seq 1 180); do
-  [[ "$(path_of 2)" == "relay" ]] && break
+  p2="$(path_of 2)"; p3="$(path_of 3)"
+  [[ "$p2" == "relay" && "$p3" == "relay" ]] && break
   sleep 1
 done
-echo "after direct UDP block: $(path_of 2), $(path_of 3)"
-[[ "$(path_of 2)" == "relay" ]] || { echo "FAIL: did not fall back to relay" >&2; exit 1; }
+echo "after direct UDP block: $p2, $p3"
+[[ "$p2" == "relay" && "$p3" == "relay" ]] || {
+  echo "FAIL: not all blocked paths fell back to relay" >&2; exit 1; }
 unblock
 sleep 3
 echo "after unblock: relay fallback verified; direct recovery is best-effort"

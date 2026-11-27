@@ -210,9 +210,37 @@ impl AgentState {
             policy::Policy::from_config(config.acl.clone(), config.qos.clone())
         };
         let policy = Arc::new(RwLock::new(policy));
+        let controller_keys: Vec<NodeId> = config
+            .control
+            .controller_keys
+            .iter()
+            .filter_map(|key| key.parse().ok())
+            .collect();
         let credential = load_credential(&state_dir).filter(|credential| {
-            credential.credential.network == network.to_string()
-                && credential.credential.node == identity.node_id
+            if credential.credential.network != network.to_string()
+                || credential.credential.node != identity.node_id
+            {
+                return false;
+            }
+            if controller_keys.is_empty() {
+                tracing::warn!(
+                    "cached credential cannot be verified: control.controller_keys is empty"
+                );
+                return false;
+            }
+            match credential.verify(
+                &network,
+                identity.node_id,
+                &controller_keys,
+                0,
+                credential::now_secs(),
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(%error, "cached credential rejected at startup");
+                    false
+                }
+            }
         });
         if let Some(credential) = &credential
             && config.network.auth.mode == stellaris_types::AuthMode::Controller
@@ -917,6 +945,94 @@ controller_keys = ["{}"]
 
         let mismatched = toml.replace("overlay_ip = \"10.7.0.2\"", "overlay_ip = \"10.7.0.9\"");
         assert!(AgentState::build(Config::from_toml(&mismatched).unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cached_credential_signature_expiry_and_trust_anchor_are_enforced() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-cached-cred-{}", uuid::Uuid::now_v7()));
+        let state_dir = dir.join("node");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let identity = identity::load_or_create(&state_dir).unwrap();
+        let network = NetworkId::new();
+        let secret = [9u8; 32];
+        let issuer = NodeId::new(
+            ed25519_dalek::SigningKey::from_bytes(&secret)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let now = credential::now_secs();
+        let make = |not_after: u64| {
+            credential::SignedCredential::sign(
+                &secret,
+                credential::MembershipCredential {
+                    network: network.to_string(),
+                    node: identity.node_id,
+                    overlay_ip: Some("10.7.0.2".parse().unwrap()),
+                    prefixes: vec![],
+                    capabilities: vec!["member".into()],
+                    revision: 1,
+                    issued_at: now,
+                    not_after,
+                },
+            )
+        };
+        let credential_path = state_dir.join("credential.json");
+        let config = |keys: String| {
+            Config::from_toml(&format!(
+                r#"
+[node]
+name = "cached"
+state_dir = "{}"
+overlay_ip = "10.7.0.2"
+
+[network]
+id = "{}"
+name = "cached-demo"
+cidr = "10.7.0.0/16"
+
+[network.auth]
+mode = "controller"
+
+[control]
+{keys}
+"#,
+                state_dir.display(),
+                network
+            ))
+            .unwrap()
+        };
+        let keys = format!("controller_keys = [\"{issuer}\"]");
+        let rejected = |keys: String| {
+            AgentState::build(config(keys))
+                .map(|state| state.credential().is_none())
+                .unwrap_or(true)
+        };
+        std::fs::write(
+            &credential_path,
+            serde_json::to_vec(&make(now + 3600)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            AgentState::build(config(keys.clone()))
+                .unwrap()
+                .credential()
+                .is_some()
+        );
+
+        let mut tampered = make(now + 3600);
+        tampered.signature = "00".repeat(64);
+        std::fs::write(&credential_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(rejected(keys.clone()));
+
+        std::fs::write(
+            &credential_path,
+            serde_json::to_vec(&make(now.saturating_sub(1))).unwrap(),
+        )
+        .unwrap();
+        assert!(rejected(keys.clone()));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

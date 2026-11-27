@@ -432,12 +432,20 @@ impl ControllerModel {
                 }
             }
             ControllerCommand::UpdatePool { pool } => {
-                if self.pools.contains_key(&pool.id) {
-                    self.pools.insert(pool.id.clone(), pool);
-                    true
-                } else {
-                    false
+                if !self.pools.contains_key(&pool.id) {
+                    return false;
                 }
+                // Shrinking a pool must not strand an existing lease outside
+                // its CIDR/range or inside a newly excluded subnet.
+                if self
+                    .leases
+                    .values()
+                    .any(|lease| lease.pool == pool.id && !Self::pool_allows(&pool, lease.ip))
+                {
+                    return false;
+                }
+                self.pools.insert(pool.id.clone(), pool);
+                true
             }
             ControllerCommand::DeletePool { id, force, now } => {
                 if !self.pools.contains_key(&id) {
@@ -617,6 +625,14 @@ impl ControllerModel {
         for command in commands {
             self.apply(command);
         }
+    }
+
+    pub fn pool_allows(pool: &AddressPool, ip: IpAddr) -> bool {
+        pool.cidr.contains(&ip)
+            && pool
+                .range
+                .is_none_or(|(start, end)| ip >= start && ip <= end)
+            && !pool.exclude.iter().any(|prefix| prefix.contains(&ip))
     }
 
     pub fn pool_of(&self, ip: IpAddr) -> Option<&AddressPool> {
@@ -1571,5 +1587,54 @@ mod tests {
             zone: None,
             now: 120,
         }));
+    }
+    #[test]
+    fn update_pool_rejects_stranding_existing_leases() {
+        let mut model = ControllerModel::new(stellaris_types::NetworkId::new(), 1);
+        let mut pool = AddressPool {
+            id: "p".into(),
+            cidr: "10.0.0.0/24".parse().unwrap(),
+            range: None,
+            exclude: Vec::new(),
+            lease_secs: 600,
+            quarantine_secs: 0,
+            strategy: stellaris_types::AllocStrategy::LowestFree,
+            zone: None,
+            description: None,
+        };
+        assert!(model.apply(ControllerCommand::CreatePool { pool: pool.clone() }));
+        let node = NodeId::new([1u8; 32]);
+        assert!(model.apply(ControllerCommand::ApproveAdmission {
+            node,
+            member: MemberRecord {
+                overlay_ip: Some("10.0.0.5".parse().unwrap()),
+                prefixes: Vec::new(),
+                capabilities: vec!["member".into()],
+            },
+            auto: false,
+            pool: None,
+            zone: None,
+            now: 1,
+        }));
+        assert!(model.leases.contains_key(&"10.0.0.5".parse().unwrap()));
+
+        let mut outside = pool.clone();
+        outside.cidr = "10.0.1.0/24".parse().unwrap();
+        assert!(!model.apply(ControllerCommand::UpdatePool { pool: outside }));
+        assert_eq!(
+            model.pools.get("p").map(|p| p.cidr),
+            Some("10.0.0.0/24".parse().unwrap())
+        );
+
+        let mut ranged = pool.clone();
+        ranged.range = Some(("10.0.0.10".parse().unwrap(), "10.0.0.20".parse().unwrap()));
+        assert!(!model.apply(ControllerCommand::UpdatePool { pool: ranged }));
+
+        let mut excluded = pool.clone();
+        excluded.exclude = vec!["10.0.0.0/28".parse().unwrap()];
+        assert!(!model.apply(ControllerCommand::UpdatePool { pool: excluded }));
+
+        pool.range = Some(("10.0.0.1".parse().unwrap(), "10.0.0.10".parse().unwrap()));
+        assert!(model.apply(ControllerCommand::UpdatePool { pool }));
     }
 }
