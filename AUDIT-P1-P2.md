@@ -47,7 +47,7 @@
 | P1-20 | FIB 选中失联下一跳，ECMP 槽黑洞 | D-18 | **已修**（P2 顺带） | `FibEntry::select_where` + dataplane 只选 connected peer |
 | P1-21 | `commit_command` 丢弃状态机 apply 结果，多个写端点失败仍 200 | R-4 | **已修** | `CommandResult.changed` + `commit_command` 对 no-op 返回 409；create/update/delete pool、lease、reserve、reassign、approve/deny 等统一生效 |
 | P1-22 | IPAM 校验只在 handler，状态机可绕过（duplicate overlay/越界/exclude） | R-5 | **已修（入口层）** | `validate_overlay` 增加 CIDR/range/exclude/quarantine；enroll、approve、reinstate、grants、reserve 均复用；状态机 `overlay_taken` 仍是最后一道防线 |
-| P1-23 | member 只配 follower URL 时 snapshot/LSA/enroll 永久 503 | R-6 | **开放** | 需要多 controller URL failover 或 leader-hint 重试；当前文档应明确必须指向 leader/LB |
+| P1-23 | member 只配 follower URL 时 snapshot/LSA/enroll 永久 503 | R-6 | **已修** | 新增 `control.failover_urls`；客户端在 503/连接失败时轮换 endpoint；`scripts/test-controller-failover.sh` 真实 3-controller 单机测试 follower→leader 通过 |
 | P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **开放** | 需目录 fsync/原子切换 + kill -9 注入；本轮未改 |
 | P1-25 | LSA 授权在 client_write 前，revoke 与在途 LSA 竞争 | R-8 | **部分** | `ControllerModel::apply(ApplyLsa)` 拒绝已 revoked origin；授权与提交仍非同一原子步骤 |
 | P1-26 | Raft 初始状态来自各副本本地 config/legacy 文件，副本可分歧 | R-9 | **开放** | 架构级：bootstrap 种子应走 leader 提交的复制命令 |
@@ -205,6 +205,7 @@
 | 审批制 LSA 授权 | **通过**（rogue/越权 403，自身 overlay 200；test-controller-approval-auth.sh） |
 | ACK epoch / idle generation | **通过**（正确 epoch 200、陈旧 409、idle gen 3→3；test-controller-ack.sh） |
 | manifest/snapshot 重放 | **单测通过**（floor 持久化、旧 epoch/generation 拒绝） |
+| follower URL failover | **通过**（member 初始指向 follower，轮换到 leader；test-controller-failover.sh） |
 | 撤销后旧凭据/新成员 | **单测通过**（revoked tombstone 对未见节点设 floor+close；reinstate 后恢复） |
 | netns 套件 | **16/16 通过**（route-safety、acl-reject、reassembly、tun、3node、3node-controller、ipv6、nat44、nat66、mdns、discovery、raft-tls、raft-membership、iroh-large、persistence；3node-controller/ipv6 需 12–14s 收敛等待） |
 
@@ -219,7 +220,7 @@
 - 真实 3 机与 netns 回归均通过；本轮新增 9 个单测/回归断言（HTTP LSA 签名、
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
   单边 link SPF、grant expiry、no-op 409、IPAM range/exclude）。
-- 仍开放且建议优先：follower URL failover、Raft 日志 rotate/reset 崩溃一致性、
-  Raft 初始状态副本分歧、control/data endpoint 同 NodeId 复现、单边拨号规则。
-  （`commit_command` changed/409 与 IPAM 入口校验已在本轮补齐。）
+- 仍开放且建议优先：Raft 日志 rotate/reset 崩溃一致性、Raft 初始状态副本分歧、
+  control/data endpoint 同 NodeId 复现、单边拨号规则、IPv6 <1296 端到端。
+  （`commit_command` changed/409、IPAM 入口校验、follower URL failover 已补齐。）
 - 非 Raft 按用户决定标记 deprecated，不再投入 P1 级修复；启动日志会明确告警。

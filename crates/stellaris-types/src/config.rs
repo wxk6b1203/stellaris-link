@@ -206,6 +206,10 @@ pub struct ControlConfig {
     /// Deprecated: active-active fanout was removed. Non-empty is rejected.
     #[serde(default)]
     pub urls: Vec<String>,
+    /// Ordered HTTP failover endpoints (read/write still go to exactly one
+    /// controller). Used when `control.url` points at a Raft follower.
+    #[serde(default)]
+    pub failover_urls: Vec<String>,
     /// Controller listen address (controller role).
     #[serde(default)]
     pub bind: Option<String>,
@@ -338,6 +342,7 @@ impl Default for ControlConfig {
         Self {
             url: None,
             urls: Vec::new(),
+            failover_urls: Vec::new(),
             bind: None,
             secret: None,
             admin_secret: None,
@@ -741,9 +746,13 @@ impl Config {
                     "node.ipam = auto requires network.auth.mode = controller".into(),
                 ));
             }
-            if self.control.url.is_none() && self.control.endpoint_id.is_none() {
+            if self.control.url.is_none()
+                && self.control.endpoint_id.is_none()
+                && self.control.failover_urls.is_empty()
+            {
                 return Err(ConfigError::Invalid(
-                    "node.ipam = auto requires control.url or control.endpoint_id".into(),
+                    "node.ipam = auto requires control.url, control.failover_urls or control.endpoint_id"
+                        .into(),
                 ));
             }
         } else if self.dataplane.enabled && self.node.overlay_ip.is_none() {
@@ -987,9 +996,23 @@ impl Config {
         }
         if !self.control.urls.is_empty() {
             return Err(ConfigError::Invalid(
-                "control.urls (legacy fanout) was removed; use a single control.url in front of Raft"
+                "control.urls (legacy fanout) was removed; use control.url + control.failover_urls"
                     .into(),
             ));
+        }
+        for raw in &self.control.failover_urls {
+            let value = raw.trim();
+            if value.is_empty() || !(value.starts_with("http://") || value.starts_with("https://"))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "control.failover_urls must be http(s) URLs: {raw}"
+                )));
+            }
+            if self.control.url.as_deref() == Some(value) {
+                return Err(ConfigError::Invalid(format!(
+                    "control.failover_urls duplicates control.url: {raw}"
+                )));
+            }
         }
         if self.control.controller_threshold != 1 {
             return Err(ConfigError::Invalid(

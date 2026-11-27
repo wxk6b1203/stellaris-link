@@ -580,8 +580,9 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
     } else {
         (None, None)
     };
-    let control_configured =
-        state.config.control.url.is_some() || state.config.control.endpoint_id.is_some();
+    let control_configured = state.config.control.url.is_some()
+        || state.config.control.endpoint_id.is_some()
+        || !state.config.control.failover_urls.is_empty();
     let want_transport = state.config.dataplane.enabled
         || !state.config.peers.is_empty()
         || control_configured
@@ -608,11 +609,11 @@ pub async fn run(state: AgentState) -> anyhow::Result<()> {
         .await?;
         if state.config.control.url.is_some() || state.config.control.endpoint_id.is_some() {
             let control_state = state.clone();
-            let base = control_state.config.control.url.clone();
+            let bases = control_client::controller_bases(&control_state.config);
             let secret = control_state.config.control.secret.clone();
             let control_transport = transport.clone();
             tokio::spawn(async move {
-                control_client::run(control_state, base, secret, Some(control_transport)).await;
+                control_client::run(control_state, bases, secret, Some(control_transport)).await;
             });
         }
         discovery::start(state.clone(), transport.clone());

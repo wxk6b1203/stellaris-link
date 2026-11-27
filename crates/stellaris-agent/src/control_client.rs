@@ -17,29 +17,67 @@ use crate::control_wire::{CONTROL_ALPN, Request, Response};
 use crate::controller::Snapshot;
 use crate::transport::IrohTransport;
 
+/// Ordered HTTP controller endpoints: `control.url` first, then
+/// `control.failover_urls`, normalized and de-duplicated.
+pub fn controller_bases(config: &stellaris_types::Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in config
+        .control
+        .url
+        .iter()
+        .chain(config.control.failover_urls.iter())
+    {
+        let value = raw.trim().trim_end_matches('/');
+        if value.is_empty() || out.iter().any(|existing| existing == value) {
+            continue;
+        }
+        out.push(value.to_string());
+    }
+    out
+}
+
+fn rotate_controller(bases: &[String], index: &mut usize, base: &mut String) {
+    if bases.len() < 2 {
+        return;
+    }
+    *index = (*index + 1) % bases.len();
+    *base = bases[*index].clone();
+    tracing::warn!(controller = %base, "rotating to the next controller endpoint");
+}
+
 pub async fn run(
     state: AgentState,
-    base: Option<String>,
+    bases: Vec<String>,
     secret: Option<String>,
     transport: Option<std::sync::Arc<IrohTransport>>,
 ) {
     if state.config.control.endpoint_id.is_some() {
         run_iroh(state, secret, transport).await;
-    } else if let Some(base) = base {
-        run_http(state, base, secret, transport).await;
+    } else if !bases.is_empty() {
+        run_http(state, bases, secret, transport).await;
     }
 }
 
 async fn run_http(
     state: AgentState,
-    base: String,
+    bases: Vec<String>,
     secret: Option<String>,
     transport: Option<std::sync::Arc<IrohTransport>>,
 ) {
-    let base = base.trim_end_matches('/').to_string();
-    if base.is_empty() {
-        return;
+    let mut normalized: Vec<String> = Vec::new();
+    for raw in bases {
+        let value = raw.trim().trim_end_matches('/');
+        if value.is_empty() || normalized.iter().any(|existing| existing == value) {
+            continue;
+        }
+        normalized.push(value.to_string());
     }
+    let bases = controller_bases(&state.config);
+    let mut base = match normalized.first().or_else(|| bases.first()) {
+        Some(base) => base.clone(),
+        None => return,
+    };
+    let mut base_index = 0usize;
     let client = match http_client(&state.config) {
         Ok(client) => client,
         Err(e) => {
@@ -54,7 +92,9 @@ async fn run_http(
     loop {
         if credential_needs_renewal(&state) && last_enroll.elapsed() >= Duration::from_secs(5) {
             last_enroll = Instant::now();
-            enroll_http(&client, &base, &state, secret.as_deref()).await;
+            if !enroll_http(&client, &base, &state, secret.as_deref()).await {
+                rotate_controller(&bases, &mut base_index, &mut base);
+            }
         }
         if !state.config.control.controller_keys.is_empty()
             && last_manifest.elapsed() >= Duration::from_secs(10)
@@ -68,6 +108,8 @@ async fn run_http(
             .await
         {
             last_manifest = Instant::now();
+        } else {
+            rotate_controller(&bases, &mut base_index, &mut base);
         }
         if last_lsa.elapsed() >= Duration::from_secs(10) {
             seq = seq.max(now_seq());
@@ -83,7 +125,10 @@ async fn run_http(
                     last_lsa = Instant::now();
                 }
                 Ok(response) => {
-                    tracing::debug!(%base, status = %response.status(), "controller rejected LSA")
+                    tracing::debug!(%base, status = %response.status(), "controller rejected LSA");
+                    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                        rotate_controller(&bases, &mut base_index, &mut base);
+                    }
                 }
                 Err(e) => tracing::debug!(%base, error = ?e, "controller LSA unreachable"),
             }
@@ -106,6 +151,12 @@ async fn run_http(
                     }
                     Err(e) => tracing::warn!(%base, error = %e, "invalid controller snapshot"),
                 }
+            }
+            Ok(response) if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                tracing::warn!(%base, "controller is not the Raft leader; trying the next endpoint");
+                rotate_controller(&bases, &mut base_index, &mut base);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
             }
             Ok(response) => {
                 tracing::warn!(%base, status = %response.status(), "controller snapshot rejected")
@@ -582,7 +633,7 @@ async fn enroll_http(
     base: &str,
     state: &AgentState,
     secret: Option<&str>,
-) {
+) -> bool {
     let auto = state.config.node.ipam == stellaris_types::IpamMode::Auto;
     let overlay = state.config.node.overlay_ip;
     let overlay_text = overlay.map(|ip| ip.to_string());
@@ -623,17 +674,28 @@ async fn enroll_http(
                 }
                 None => tracing::warn!(%base, "controller response carried no credential"),
             }
+            true
         }
         Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
             tracing::info!(%base, "enrollment queued for administrator approval");
+            true
         }
         Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
             tracing::warn!(%base, status = %response.status(), "enrollment denied");
+            true
+        }
+        Ok(response) if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+            tracing::debug!(%base, "enrollment hit a non-leader controller");
+            false
         }
         Ok(response) => {
-            tracing::warn!(%base, status = %response.status(), "enrollment rejected")
+            tracing::warn!(%base, status = %response.status(), "enrollment rejected");
+            true
         }
-        Err(e) => tracing::debug!(%base, error = %e, "controller enrollment unreachable"),
+        Err(e) => {
+            tracing::debug!(%base, error = %e, "controller enrollment unreachable");
+            false
+        }
     }
 }
 

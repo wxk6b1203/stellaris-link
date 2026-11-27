@@ -690,6 +690,9 @@ curl -X POST -H "x-stellaris-secret: admin-secret" \
   撤销前签出的旧凭据因 revision/expiry 被拒绝。
 - 改前缀/能力用 `POST /v1/members/<node>/grants`，不需要重新入网。
 - 过期凭据和 revision 回滚都会被拒绝；撤销前签出的旧凭据无法重放。
+- 若 `control.url` 指向 Raft follower，可配置
+  `control.failover_urls = ["http://other-controller:5801", ...]`；客户端在
+  503/连接失败时轮换 endpoint（写仍只提交给一个 controller，不是 fanout）。
 
 `network.auth.mode = "none"` 仅用于隔离实验室，此时 discovery 还需要显式
 `transport.allow_unauthenticated_discovery = true`。验证见 [TEST-RESULTS.md](TEST-RESULTS.md)
