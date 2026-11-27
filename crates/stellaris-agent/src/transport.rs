@@ -403,8 +403,9 @@ impl IrohTransport {
             path_changes: 0,
         });
         // Only the numerically smaller NodeId dials; the other side accepts.
-        // Both sides dialing would create two connections per role and the
-        // duplicate-role cleanup would tear down the peer's live connection.
+        // Both sides dialing creates duplicate links per role and breaks the
+        // failure/role bookkeeping, so single-sided configurations must rely
+        // on discovery or the smaller side being configured.
         let local = NodeId::new(*self.endpoint.id().as_bytes());
         if local >= node {
             debug!(peer = %node.short(), "peer will dial us");
