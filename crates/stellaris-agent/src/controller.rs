@@ -2463,7 +2463,7 @@ async fn apply_lsa(
     };
     match signature {
         Some(signature) => {
-            if !crate::lsa_auth::verify(&lsa, &signature) {
+            if !crate::lsa_auth::verify(&state.network, &lsa, &signature) {
                 return (StatusCode::FORBIDDEN, "LSA signature required or invalid")
                     .into_response();
             }
@@ -2505,24 +2505,54 @@ struct EnrollRequest {
     #[serde(default)]
     addrs: Vec<SocketAddr>,
     #[serde(default)]
+    issued_at: u64,
+    #[serde(default)]
+    nonce: String,
+    #[serde(default)]
     signature: String,
 }
 
 /// Canonical bytes a node signs for an HTTP enrollment request. The iroh
 /// control channel does not need this: `conn.remote_id()` already proves the
 /// node key.
+#[allow(clippy::too_many_arguments)]
 pub fn enroll_payload_bytes(
     network: &str,
     node: &str,
     overlay: Option<&str>,
     zone: Option<&str>,
+    auto: bool,
+    pool: Option<&str>,
+    addrs: &[SocketAddr],
+    issued_at: u64,
+    nonce: &str,
 ) -> Vec<u8> {
-    format!(
-        "stellaris-enroll-v1|{network}|{node}|{}|{}",
-        overlay.unwrap_or(""),
-        zone.unwrap_or("")
-    )
-    .into_bytes()
+    #[derive(serde::Serialize)]
+    struct Payload<'a> {
+        domain: &'static str,
+        network: &'a str,
+        node: &'a str,
+        overlay_ip: Option<&'a str>,
+        zone: Option<&'a str>,
+        auto: bool,
+        pool: Option<&'a str>,
+        addrs: &'a [SocketAddr],
+        issued_at: u64,
+        nonce: &'a str,
+    }
+    serde_json::to_vec(&Payload {
+        domain: "stellaris-enroll-v2",
+        network,
+        node,
+        overlay_ip: overlay,
+        zone,
+        auto,
+        pool,
+        addrs,
+        issued_at,
+        nonce,
+    })
+    .unwrap_or_default()
 }
 
 pub enum EnrollOutcome {
@@ -2554,11 +2584,34 @@ async fn enroll(
             }
         };
     let overlay_text = overlay.map(|ip| ip.to_string());
+    let now = crate::credential::now_secs();
+    if req.issued_at == 0
+        || req.issued_at.saturating_add(300) < now
+        || req.issued_at > now.saturating_add(60)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "enroll timestamp outside the allowed window",
+        )
+            .into_response();
+    }
+    if req.nonce.trim().is_empty() || req.nonce.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "enroll nonce is required (max 128 bytes)",
+        )
+            .into_response();
+    }
     let payload = enroll_payload_bytes(
         &state.network.to_string(),
         &node.to_string(),
         overlay_text.as_deref(),
         req.zone.as_deref(),
+        req.auto,
+        req.pool.as_deref(),
+        &req.addrs,
+        req.issued_at,
+        &req.nonce,
     );
     if let Err(error) = verify_ed25519(node, &payload, &req.signature) {
         return (
@@ -2567,7 +2620,6 @@ async fn enroll(
         )
             .into_response();
     }
-    let _ = req.addrs;
     match state
         .enroll(node, overlay, req.auto, req.pool.clone(), req.zone.clone())
         .await
@@ -2948,6 +3000,21 @@ struct LearnerRequest {
 #[derive(Debug, Deserialize)]
 struct MembershipRequest {
     voters: Vec<LearnerRequest>,
+    /// Optional compare-and-swap guard: the caller's view of the current
+    /// voter set. A mismatch is rejected instead of silently overwriting a
+    /// concurrent membership change.
+    #[serde(default)]
+    expected_voters: Option<Vec<u64>>,
+}
+
+async fn raft_write_error(state: &ControllerState, error: impl std::fmt::Debug) -> Response {
+    let text = format!("{error:?}");
+    let code = if text.contains("ForwardToLeader") || text.contains("LeaderUnknown") {
+        503
+    } else {
+        409
+    };
+    controller_error(state, code, text).await
 }
 
 async fn raft_add_learner(
@@ -2973,9 +3040,7 @@ async fn raft_add_learner(
         .await
     {
         Ok(_) => Json(json!({"learner": req.id, "addr": req.addr})).into_response(),
-        Err(error) => {
-            (StatusCode::CONFLICT, format!("add_learner failed: {error}")).into_response()
-        }
+        Err(error) => raft_write_error(&state, error).await,
     }
 }
 
@@ -3006,23 +3071,49 @@ async fn raft_change_membership(
     if voters.is_empty() {
         return (StatusCode::BAD_REQUEST, "voters must not be empty").into_response();
     }
-    // Register the addresses first so the membership edit can resolve each
-    // voter to its Raft node, then replace the voter set in one joint step.
+    let (current_voters, current_nodes): (
+        std::collections::BTreeSet<u64>,
+        std::collections::BTreeSet<u64>,
+    ) = {
+        let watch = raft.metrics();
+        let metrics = watch.borrow_watched();
+        let membership = metrics.membership_config.membership();
+        (
+            membership.voter_ids().collect(),
+            membership
+                .voter_ids()
+                .chain(membership.non_write_voter_ids())
+                .collect(),
+        )
+    };
+    if let Some(expected) = &req.expected_voters {
+        let expected: std::collections::BTreeSet<u64> = expected.iter().copied().collect();
+        if expected != current_voters {
+            return controller_error(
+                &state,
+                409,
+                format!("voter set changed: expected {expected:?}, current {current_voters:?}"),
+            )
+            .await;
+        }
+    }
+    // Register the new addresses first so the membership edit can resolve each
+    // voter to its Raft node. Existing learners are promoted by the membership
+    // change; a new learner failure is fatal instead of being silently ignored.
     for voter in &req.voters {
+        if current_nodes.contains(&voter.id) {
+            continue;
+        }
         if let Err(error) = raft
             .add_learner(voter.id, BasicNode::new(voter.addr.clone()), false)
             .await
         {
-            tracing::debug!(%error, id = voter.id, "add_learner before membership change failed");
+            return raft_write_error(&state, error).await;
         }
     }
     match raft.change_membership(voters, false).await {
         Ok(_) => Json(json!({"voters": req.voters.len()})).into_response(),
-        Err(error) => (
-            StatusCode::CONFLICT,
-            format!("change_membership failed: {error}"),
-        )
-            .into_response(),
+        Err(error) => raft_write_error(&state, error).await,
     }
 }
 
@@ -3333,7 +3424,7 @@ async fn dispatch_control(
                     message: "unauthorized".into(),
                 };
             }
-            if !crate::lsa_auth::verify(&lsa, &signature) {
+            if !crate::lsa_auth::verify(&state.network, &lsa, &signature) {
                 return Response::Error {
                     code: 403,
                     message: "LSA signature required or invalid".into(),
@@ -3610,6 +3701,7 @@ secret = "s3cret"
             temp_state_dir()
         );
         let state = ControllerState::from_config(&Config::from_toml(&toml).unwrap()).unwrap();
+        let network = state.network;
         let app = router(state);
         let secret = [7u8; 32];
         let key = ed25519_dalek::SigningKey::from_bytes(&secret);
@@ -3640,7 +3732,7 @@ secret = "s3cret"
             StatusCode::FORBIDDEN
         );
 
-        let signature = crate::lsa_auth::sign(&secret, &lsa);
+        let signature = crate::lsa_auth::sign(&secret, &network, &lsa);
         let signed = serde_json::json!({"lsa": &lsa, "signature": signature});
         assert_eq!(
             post(signed.to_string()).await.unwrap().status(),
@@ -3744,16 +3836,27 @@ credential_ttl_secs = 600
         state.set_raft(Arc::new(node.raft), node.store);
         let app = router(state);
         let member = node_for([10u8; 32]);
+        let issued_at = crate::credential::now_secs();
+        let nonce = "test-nonce-1";
         let payload = enroll_payload_bytes(
             &network.to_string(),
             &member.to_string(),
             Some("10.7.0.10"),
             None,
+            false,
+            None,
+            &[],
+            issued_at,
+            nonce,
         );
         let signature = sign_ed25519(&[10u8; 32], &payload);
         let body = json!({
             "node_id": member.to_string(),
             "overlay_ip": "10.7.0.10",
+            "auto": false,
+            "addrs": [],
+            "issued_at": issued_at,
+            "nonce": nonce,
             "signature": signature,
         });
         let enroll = || {
@@ -4077,11 +4180,18 @@ capabilities = ["member"]
         state.set_signing_key([7u8; 32]);
         let network = state.network;
         let app = router(state);
+        let issued_at = crate::credential::now_secs();
+        let nonce = "test-nonce-2";
         let payload = enroll_payload_bytes(
             &network.to_string(),
             &member.to_string(),
             Some("10.7.0.1"),
             None,
+            false,
+            None,
+            &[],
+            issued_at,
+            nonce,
         );
         let signature = sign_ed25519(&[1u8; 32], &payload);
         let response = app
@@ -4095,6 +4205,10 @@ capabilities = ["member"]
                         json!({
                             "node_id": member.to_string(),
                             "overlay_ip": "10.7.0.1",
+                            "auto": false,
+                            "addrs": [],
+                            "issued_at": issued_at,
+                            "nonce": nonce,
                             "signature": signature,
                         })
                         .to_string(),
@@ -4632,17 +4746,28 @@ credential_ttl_secs = 600
         state.set_raft(Arc::new(node.raft), node.store);
         let app = router(state);
         let member = node_for([10u8; 32]);
+        let issued_at = crate::credential::now_secs();
+        let nonce = "test-nonce-3";
         let payload = enroll_payload_bytes(
             &network.to_string(),
             &member.to_string(),
             Some("10.7.0.10"),
             None,
+            false,
+            None,
+            &[],
+            issued_at,
+            nonce,
         );
         let signature = sign_ed25519(&[10u8; 32], &payload);
         let enroll = |signature: String, secret: &'static str, overlay: &'static str| {
             let body = json!({
                 "node_id": member.to_string(),
                 "overlay_ip": overlay,
+                "auto": false,
+                "addrs": [],
+                "issued_at": issued_at,
+                "nonce": nonce,
                 "signature": signature,
             });
             app.clone().oneshot(
@@ -4721,11 +4846,20 @@ credential_ttl_secs = 600
             &other.to_string(),
             Some("10.7.0.11"),
             None,
+            false,
+            None,
+            &[],
+            issued_at,
+            nonce,
         );
         let other_signature = sign_ed25519(&[11u8; 32], &other_payload);
         let other_body = json!({
             "node_id": other.to_string(),
             "overlay_ip": "10.7.0.11",
+            "auto": false,
+            "addrs": [],
+            "issued_at": issued_at,
+            "nonce": nonce,
             "signature": other_signature,
         });
         let request = |uri: String, body: serde_json::Value| {
@@ -4799,11 +4933,18 @@ overlay_ip = "10.7.0.1"
         state.set_signing_key([7u8; 32]);
         let network = state.network;
         let app = router(state);
+        let issued_at = crate::credential::now_secs();
+        let nonce = "test-nonce-4";
         let payload = enroll_payload_bytes(
             &network.to_string(),
             &member.to_string(),
             Some("10.7.0.1"),
             None,
+            false,
+            None,
+            &[],
+            issued_at,
+            nonce,
         );
         let wrong = sign_ed25519(&[2u8; 32], &payload);
         let response = app
@@ -4817,6 +4958,10 @@ overlay_ip = "10.7.0.1"
                         json!({
                             "node_id": member.to_string(),
                             "overlay_ip": "10.7.0.1",
+                            "auto": false,
+                            "addrs": [],
+                            "issued_at": issued_at,
+                            "nonce": nonce,
                             "signature": wrong,
                         })
                         .to_string(),
@@ -5206,12 +5351,27 @@ admin_secret = "admin-secret"
         overlay: Option<&str>,
     ) -> (StatusCode, serde_json::Value) {
         let node = node_for(secret);
-        let payload = enroll_payload_bytes(&network.to_string(), &node.to_string(), overlay, None);
+        let issued_at = crate::credential::now_secs();
+        let nonce = "test-nonce-helper";
+        let payload = enroll_payload_bytes(
+            &network.to_string(),
+            &node.to_string(),
+            overlay,
+            None,
+            auto,
+            None,
+            &[],
+            issued_at,
+            nonce,
+        );
         let signature = sign_ed25519(&secret, &payload);
         let body = json!({
             "node_id": node.to_string(),
             "overlay_ip": overlay,
             "auto": auto,
+            "addrs": [],
+            "issued_at": issued_at,
+            "nonce": nonce,
             "signature": signature,
         });
         let response = app
@@ -5635,5 +5795,106 @@ node_id = "0101010101010101010101010101010101010101010101010101010101010101""#,
             model["members"][node.to_string()]["overlay_ip"],
             "10.20.0.9"
         );
+    }
+    #[test]
+    fn enroll_payload_binds_all_security_relevant_fields() {
+        let base = enroll_payload_bytes(
+            "net",
+            "node",
+            Some("10.0.0.1"),
+            Some("z"),
+            false,
+            None,
+            &[],
+            100,
+            "nonce",
+        );
+        let auto = enroll_payload_bytes(
+            "net",
+            "node",
+            Some("10.0.0.1"),
+            Some("z"),
+            true,
+            None,
+            &[],
+            100,
+            "nonce",
+        );
+        let pool = enroll_payload_bytes(
+            "net",
+            "node",
+            Some("10.0.0.1"),
+            Some("z"),
+            false,
+            Some("p"),
+            &[],
+            100,
+            "nonce",
+        );
+        let addrs = enroll_payload_bytes(
+            "net",
+            "node",
+            Some("10.0.0.1"),
+            Some("z"),
+            false,
+            None,
+            &["192.0.2.1:5801".parse().unwrap()],
+            100,
+            "nonce",
+        );
+        let issued = enroll_payload_bytes(
+            "net",
+            "node",
+            Some("10.0.0.1"),
+            Some("z"),
+            false,
+            None,
+            &[],
+            101,
+            "nonce",
+        );
+        let nonce = enroll_payload_bytes(
+            "net",
+            "node",
+            Some("10.0.0.1"),
+            Some("z"),
+            false,
+            None,
+            &[],
+            100,
+            "other",
+        );
+        for variant in [auto, pool, addrs, issued, nonce] {
+            assert_ne!(base, variant);
+        }
+    }
+    #[tokio::test]
+    async fn membership_change_rejects_a_stale_voter_cas() {
+        let mut state = state();
+        let model = ControllerModel::new(state.network, state.epoch);
+        let node = crate::controller_raft::start_single(model).await.unwrap();
+        state.set_raft(Arc::new(node.raft), node.store);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/raft/membership")
+                    .header("x-stellaris-secret", "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "voters": [{"id": 1, "addr": "127.0.0.1:5999"}],
+                            "expected_voters": [99]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("voter set changed"), "{text}");
     }
 }

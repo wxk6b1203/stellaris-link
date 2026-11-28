@@ -951,7 +951,9 @@ async fn handle_inbound(
     inbound: InboundPacket,
 ) {
     // Reassemble fragments before ACL/transit decisions so rules see the
-    // complete L4 header.
+    // complete L4 header. Validate the mesh header, peer and source first:
+    // unauthenticated/unknown or spoofed fragments must not occupy reassembly
+    // state at all.
     let framed = {
         let payload = match inbound.packet.get(HEADER_LEN..) {
             Some(payload) => payload,
@@ -960,6 +962,36 @@ async fn handle_inbound(
                 return;
             }
         };
+        let Some(header) = MeshHeader::decode(&inbound.packet) else {
+            crate::stats::Stats::inc(&state.stats.frag_dropped);
+            return;
+        };
+        if header.network_hash != wire::network_hash(state.network)
+            || state.peers.get(&inbound.from).is_none()
+        {
+            crate::stats::Stats::inc(&state.stats.frag_dropped);
+            return;
+        }
+        // Extract the source even for non-first/extension-header fragments
+        // where PacketInfo::parse may not see an L4 header yet.
+        let source =
+            match payload.first().map(|byte| byte >> 4) {
+                Some(4) if payload.len() >= 20 => Some(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15]),
+                )),
+                Some(6) if payload.len() >= 40 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&payload[8..24]);
+                    Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+                }
+                _ => None,
+            };
+        if let Some(src) = source
+            && !crate::membership::inbound_source_allowed(state, inbound.from, src)
+        {
+            crate::stats::Stats::inc(&state.stats.spoof_dropped);
+            return;
+        }
         let outcome = {
             let mut reassembly = state.reassembly.lock().unwrap_or_else(|e| e.into_inner());
             reassembly.process(inbound.from, payload, std::time::Instant::now())

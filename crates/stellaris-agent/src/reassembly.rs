@@ -81,20 +81,29 @@ impl Entry {
         }
         let mut header = self.header.clone()?;
         if self.ipv6 {
-            header[4..6].copy_from_slice(&(total as u16).to_be_bytes());
+            let total_len = header.len() + total;
+            if total_len > usize::from(u16::MAX) {
+                return None;
+            }
+            header[4..6].copy_from_slice(&(total_len as u16).to_be_bytes());
             let mut packet = header;
             packet.extend_from_slice(&payload);
             Some(packet)
         } else {
             let total_len = header.len() + total;
+            if total_len > usize::from(u16::MAX) {
+                return None;
+            }
             header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
             header[6..8].copy_from_slice(&0u16.to_be_bytes()); // clear MF/offset
             // The first fragment carries a valid header checksum; zero it
-            // before recomputing over the reassembled header.
+            // before recomputing over the reassembled header (including
+            // IPv4 options).
             header[10..12].copy_from_slice(&[0, 0]);
+            let header_len = header.len();
             let mut packet = header;
             packet.extend_from_slice(&payload);
-            let checksum = ipv4_checksum(&packet[..20]);
+            let checksum = ipv4_checksum(&packet[..header_len]);
             packet[10..12].copy_from_slice(&checksum.to_be_bytes());
             Some(packet)
         }
@@ -163,12 +172,17 @@ impl Reassembler {
         // Every fragment's IPv4 total-length field describes that fragment,
         // not the original datagram; the full length is inferred from the
         // last fragment's offset + payload.
-        if packet.len() < ihl || total < ihl {
+        if total < ihl || total > packet.len() || ihl > packet.len() {
             return Outcome::Dropped("bad ipv4 length");
         }
-        let payload = &packet[ihl..];
+        // The IP total-length field covers only this fragment; trim Ethernet
+        // padding instead of reassembling it as payload.
+        let payload = &packet[ihl..total];
         if !payload.len().is_multiple_of(8) && more {
             return Outcome::Dropped("unaligned fragment");
+        }
+        if offset.saturating_add(payload.len()) > MAX_REASSEMBLED {
+            return Outcome::Dropped("fragment past end");
         }
         let key = Key {
             from,
@@ -197,45 +211,89 @@ impl Reassembler {
         if packet.len() < 40 {
             return Outcome::Dropped("short ipv6");
         }
-        if packet[6] != 44 {
-            return Outcome::Pass;
+        let mut next_header = packet[6];
+        let mut cursor = 40usize;
+        let mut next_field = 6usize;
+        for _ in 0..8 {
+            match next_header {
+                44 => {
+                    if packet.len() < cursor + 8 {
+                        return Outcome::Dropped("short fragment header");
+                    }
+                    let fragment_next = packet[cursor];
+                    let frag = u16::from_be_bytes([packet[cursor + 2], packet[cursor + 3]]);
+                    let offset = usize::from(frag >> 3) * 8;
+                    let more = frag & 1 != 0;
+                    if !more && offset == 0 {
+                        // Atomic fragment: no reassembly required and the
+                        // kernel can consume it as-is.
+                        return Outcome::Pass;
+                    }
+                    let payload = &packet[cursor + 8..];
+                    if more && !payload.len().is_multiple_of(8) {
+                        return Outcome::Dropped("unaligned ipv6 fragment");
+                    }
+                    if offset.saturating_add(payload.len()) > MAX_REASSEMBLED {
+                        return Outcome::Dropped("fragment past end");
+                    }
+                    let mut header = packet[..cursor].to_vec();
+                    header[next_field] = fragment_next; // drop fragment header
+                    let key = Key {
+                        from,
+                        src: IpAddr::V6(Ipv6Addr::from(
+                            <[u8; 16]>::try_from(&packet[8..24]).unwrap(),
+                        )),
+                        dst: IpAddr::V6(Ipv6Addr::from(
+                            <[u8; 16]>::try_from(&packet[24..40]).unwrap(),
+                        )),
+                        protocol: fragment_next,
+                        id: u32::from_be_bytes([
+                            packet[cursor + 4],
+                            packet[cursor + 5],
+                            packet[cursor + 6],
+                            packet[cursor + 7],
+                        ]),
+                    };
+                    // RFC 8200: overlapping fragments are invalid. Reject any
+                    // overlap, not just an identical start offset.
+                    let end = offset + payload.len();
+                    if let Some(entry) = self.entries.get(&key) {
+                        for (start, data) in &entry.fragments {
+                            if offset < start + data.len() && *start < end {
+                                return Outcome::Dropped("overlapping ipv6 fragment");
+                            }
+                        }
+                    }
+                    return self.insert(key, payload, offset, more, None, header, true, now);
+                }
+                0 | 43 | 60 => {
+                    if packet.len() < cursor + 2 {
+                        return Outcome::Dropped("short ipv6 extension header");
+                    }
+                    let length = (usize::from(packet[cursor + 1]) + 1) * 8;
+                    if length == 0 || cursor + length > packet.len() {
+                        return Outcome::Dropped("bad ipv6 extension length");
+                    }
+                    next_field = cursor;
+                    next_header = packet[cursor];
+                    cursor += length;
+                }
+                51 => {
+                    if packet.len() < cursor + 2 {
+                        return Outcome::Dropped("short ipv6 ah header");
+                    }
+                    let length = (usize::from(packet[cursor + 1]) + 2) * 4;
+                    if cursor + length > packet.len() {
+                        return Outcome::Dropped("bad ipv6 ah length");
+                    }
+                    next_field = cursor;
+                    next_header = packet[cursor];
+                    cursor += length;
+                }
+                _ => return Outcome::Pass,
+            }
         }
-        if packet.len() < 48 {
-            return Outcome::Dropped("short fragment header");
-        }
-        let next_header = packet[40];
-        let frag = u16::from_be_bytes([packet[42], packet[43]]);
-        let offset = usize::from(frag >> 3) * 8;
-        let more = frag & 1 != 0;
-        if !more && offset == 0 {
-            return Outcome::Pass;
-        }
-        let id = u32::from_be_bytes([packet[44], packet[45], packet[46], packet[47]]);
-        let payload = &packet[48..];
-        let mut header = packet[..40].to_vec();
-        header[6] = next_header; // drop the fragment header in the reassembled packet
-        let key = Key {
-            from,
-            src: IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&packet[8..24]).unwrap(),
-            )),
-            dst: IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&packet[24..40]).unwrap(),
-            )),
-            protocol: next_header,
-            id,
-        };
-        // IPv6 must not allow overlapping fragments; reject an overlapping
-        // duplicate outright instead of silently merging.
-        if offset > 0
-            && self
-                .entries
-                .get(&key)
-                .is_some_and(|e| e.fragments.contains_key(&offset))
-        {
-            return Outcome::Dropped("overlapping ipv6 fragment");
-        }
-        self.insert(key, payload, offset, more, None, header, true, now)
+        Outcome::Dropped("too many ipv6 extension headers")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -344,7 +402,8 @@ mod tests {
     fn v4_fragment(id: u16, offset: usize, more: bool, payload: &[u8], total: usize) -> Vec<u8> {
         let mut p = vec![0u8; 20];
         p[0] = 0x45;
-        let total_len = 20 + total;
+        let _ = total;
+        let total_len = 20 + payload.len();
         p[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
         p[4..6].copy_from_slice(&id.to_be_bytes());
         let mut flags = (offset / 8) as u16;
@@ -490,5 +549,120 @@ mod tests {
         );
         // A different peer is unaffected by the first peer's quota.
         assert_eq!(r.process(b, &over, now), Outcome::Buffered);
+    }
+    #[test]
+    fn ipv4_total_length_trims_link_padding() {
+        let now = Instant::now();
+        let mut r = Reassembler::default();
+        let mut first = v4_fragment(11, 0, true, &[1u8; 8], 16);
+        first.extend_from_slice(&[0xaa; 4]); // Ethernet padding beyond total_length
+        assert_eq!(r.process(node(), &first, now), Outcome::Buffered);
+        let last = v4_fragment(11, 8, false, &[2u8; 8], 16);
+        match r.process(node(), &last, now) {
+            Outcome::Complete(packet) => {
+                assert_eq!(packet.len(), 20 + 16);
+                assert_eq!(&packet[20..28], &[1u8; 8]);
+                assert_eq!(&packet[28..36], &[2u8; 8]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv4_options_are_included_in_the_reassembled_checksum() {
+        let now = Instant::now();
+        let mut r = Reassembler::default();
+        let fragment = |offset: usize, more: bool, payload: &[u8]| {
+            let mut p = vec![0u8; 24];
+            p[0] = 0x46; // IHL = 6 (24 bytes)
+            let total = 24 + payload.len();
+            p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            p[4..6].copy_from_slice(&77u16.to_be_bytes());
+            let mut flags = (offset / 8) as u16;
+            if more {
+                flags |= 0x2000;
+            }
+            p[6..8].copy_from_slice(&flags.to_be_bytes());
+            p[8] = 64;
+            p[9] = 17;
+            p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+            p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+            p[20..24].copy_from_slice(&[1, 1, 1, 0]); // options
+            p.extend_from_slice(payload);
+            p
+        };
+        assert_eq!(
+            r.process(node(), &fragment(0, true, &[3u8; 8]), now),
+            Outcome::Buffered
+        );
+        match r.process(node(), &fragment(8, false, &[4u8; 8]), now) {
+            Outcome::Complete(packet) => {
+                assert_eq!(packet.len(), 24 + 16);
+                assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), 40);
+                assert_eq!(ipv4_checksum(&packet[..24]), 0);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv6_fragment_after_an_extension_header_is_reassembled() {
+        let now = Instant::now();
+        let mut r = Reassembler::default();
+        let fragment = |offset: usize, more: bool, payload: &[u8]| {
+            let ext = [44u8, 0, 0, 0, 0, 0, 0, 0]; // Hop-by-Hop -> Fragment
+            let mut p = vec![0u8; 40 + ext.len() + 8 + payload.len()];
+            p[0] = 0x60;
+            let payload_len = ext.len() + 8 + payload.len();
+            p[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+            p[6] = 0; // Hop-by-Hop
+            p[7] = 64;
+            p[8..24].copy_from_slice(&"fd00::1".parse::<Ipv6Addr>().unwrap().octets());
+            p[24..40].copy_from_slice(&"fd00::2".parse::<Ipv6Addr>().unwrap().octets());
+            p[40..48].copy_from_slice(&ext);
+            let frag = 48;
+            p[frag] = 17; // UDP after the fragment header
+            let mut field = ((offset / 8) as u16) << 3;
+            if more {
+                field |= 1;
+            }
+            p[frag + 2..frag + 4].copy_from_slice(&field.to_be_bytes());
+            p[frag + 4..frag + 8].copy_from_slice(&0x1234u32.to_be_bytes());
+            p[56..].copy_from_slice(payload);
+            p
+        };
+        assert_eq!(
+            r.process(node(), &fragment(0, true, &[7u8; 8]), now),
+            Outcome::Buffered
+        );
+        match r.process(node(), &fragment(8, false, &[8u8; 8]), now) {
+            Outcome::Complete(packet) => {
+                assert_eq!(packet.len(), 40 + 8 + 16);
+                assert_eq!(packet[6], 0);
+                assert_eq!(packet[40], 17);
+                assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 48 + 16);
+                assert_eq!(&packet[48..56], &[7u8; 8]);
+                assert_eq!(&packet[56..64], &[8u8; 8]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv6_partial_overlap_and_unaligned_fragments_are_rejected() {
+        let now = Instant::now();
+        let mut r = Reassembler::default();
+        assert_eq!(
+            r.process(node(), &v6_fragment(5, 0, true, &[1u8; 16]), now),
+            Outcome::Buffered
+        );
+        assert_eq!(
+            r.process(node(), &v6_fragment(5, 8, true, &[2u8; 16]), now),
+            Outcome::Dropped("overlapping ipv6 fragment")
+        );
+        assert_eq!(
+            r.process(node(), &v6_fragment(6, 0, true, &[0u8; 7]), now),
+            Outcome::Dropped("unaligned ipv6 fragment")
+        );
     }
 }

@@ -522,15 +522,27 @@ impl AgentState {
     }
 
     /// Record a peer's verified credential as its dataplane grant.
+    ///
+    /// Two links can finish authenticated handshakes concurrently. Only a
+    /// strictly newer revision may replace an installed grant; an equal
+    /// revision keeps whichever grant was installed first (snapshot grants are
+    /// authoritative), and an older one is ignored.
     pub fn install_grant(&self, credential: &credential::VerifiedCredential) {
-        self.observe_revision(credential.node, credential.revision);
-        self.grants
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                credential.node,
-                membership::Grant::from_verified(credential),
-            );
+        let current = self.revision(credential.node);
+        if credential.revision < current {
+            return;
+        }
+        if credential.revision > current {
+            self.observe_revision(credential.node, credential.revision);
+        }
+        let mut grants = self.grants.write().unwrap_or_else(|e| e.into_inner());
+        if credential.revision == current && grants.contains_key(&credential.node) {
+            return;
+        }
+        grants.insert(
+            credential.node,
+            membership::Grant::from_verified(credential),
+        );
     }
 
     /// Drop handshake grants whose credential deadline has passed. Returns the
@@ -1033,6 +1045,50 @@ mode = "controller"
         .unwrap();
         assert!(rejected(keys.clone()));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn install_grant_does_not_let_an_equal_or_older_link_overwrite() {
+        let dir =
+            std::env::temp_dir().join(format!("stellaris-grant-revision-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            r#"
+[node]
+name = "g"
+state_dir = "{}"
+overlay_ip = "10.7.0.1"
+[network]
+name = "grant-rev"
+cidr = "10.7.0.0/16"
+[dataplane]
+enabled = false
+"#,
+            dir.display()
+        );
+        let state = AgentState::build(Config::from_toml(&toml).unwrap()).unwrap();
+        let node = NodeId::new([4u8; 32]);
+        let grant = |revision: u64, overlay: &str| credential::VerifiedCredential {
+            node,
+            overlay_ip: Some(overlay.parse().unwrap()),
+            prefixes: vec![],
+            capabilities: vec!["member".into()],
+            revision,
+            not_after: 4_000_000_000,
+        };
+        state.install_grant(&grant(2, "10.7.0.4"));
+        let installed = |state: &AgentState| {
+            state.grants.read().unwrap()[&node]
+                .overlay_ip
+                .map(|ip| ip.to_string())
+        };
+        assert_eq!(installed(&state).as_deref(), Some("10.7.0.4"));
+        state.install_grant(&grant(2, "10.7.0.9"));
+        assert_eq!(installed(&state).as_deref(), Some("10.7.0.4"));
+        state.install_grant(&grant(1, "10.7.0.8"));
+        assert_eq!(installed(&state).as_deref(), Some("10.7.0.4"));
+        state.install_grant(&grant(3, "10.7.0.5"));
+        assert_eq!(installed(&state).as_deref(), Some("10.7.0.5"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

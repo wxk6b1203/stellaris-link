@@ -71,9 +71,9 @@
 | P2-06 | 撤销后本地 LSA DB 不清理，旧路由最多残留 30s | S-6 | 开放 |
 | P2-07 | 被撤销节点无法重新审批（reinstate 已补） | S-7 | 已修（P1-09） |
 | P2-08 | HMAC 快照共享 secret 即签发权 + 非恒时比较 | S-8 | 开放（legacy 模式） |
-| P2-09 | enroll 签名不覆盖 auto/pool/addrs，无 nonce/时间戳 | S-9 | 开放 |
+| P2-09 | enroll 签名不覆盖 auto/pool/addrs，无 nonce/时间戳 | S-9 | **已修**：Ed25519 payload 改为覆盖 network/node/overlay/zone/auto/pool/addrs/issued_at/nonce 的 JSON；server 拒绝 ±5min 外时间戳和空/超长 nonce（nonce 未做重放缓存） |
 | P2-10 | CLI 离线签发临时文件非 O_EXCL/O_NOFOLLOW | S-10 | 开放 |
-| P2-11 | LSA 签名载荷未绑定 network_id | S 附注 | 开放 |
+| P2-11 | LSA 签名载荷未绑定 network_id | S 附注 | **已修**：sign/verify 增加 network 参数，跨网络签名测试拒绝 |
 | P2-12 | discovery UDP/mDNS 无认证/无上限/无淘汰 | T-12 | 开放 |
 | P2-13 | 共享 secret 下 admin/member 权限未真正分离 | S-4/R | 开放 |
 
@@ -87,7 +87,7 @@
 | P2-17 | `AllocStrategy` 是死配置；IPv6 探测可能 4096 次失败 | R-4/D-24 | 开放 |
 | P2-18 | snapshot transfer 只按 total+checksum 去重、先删后验、512MB 预分配、阻塞 IO | R-5 | **已修（关键）**：不再按 total 预分配；去重同时比较 vote/meta；先校验 size/checksum 再删除 transfer；chunk 持久化仍是同步 IO（P3） |
 | P2-19 | `install_snapshot` 先改内存后写盘，失败不回滚 | R-6 | **已修**：先原子写 state 文件，成功后才替换内存；WAL 截断失败只告警，重启按 last_applied 跳过旧条目 |
-| P2-20 | 动态 membership 吞 add_learner 错误、无 CAS、无 leader hint | R-7 | 开放 |
+| P2-20 | 动态 membership 吞 add_learner 错误、无 CAS、无 leader hint | R-7 | **已修**：新增 `expected_voters` CAS；新 learner 失败直接返回；follower ForwardToLeader 返回 503 + `x-stellaris-raft-leader` |
 | P2-21 | `/v1/status.routes` 不含 controller 路由；读端点不 linearize；member 可见 admin 元数据 | R-8 | 开放 |
 | P2-22 | 非 Raft command log 半行粘连、members/lsas/acks 无 fsync | R-9 | 弃用 |
 | P2-23 | 只配 raft client cert 时静默退回 HTTP Raft；raft_bind 临时端口；pending admission 无上限 | R-10 | 开放 |
@@ -100,13 +100,13 @@
 |---|---|---|---|
 | P2-26 | LSA 签名缓存按 origin 无条件覆盖，旧 seq 签名可污染 | T-1 | **已修**：只有被 DB 接受的 LSA 才替换缓存；旧 seq 重放不再覆盖 |
 | P2-27 | LSA 无时间戳/过期字段，30s 后可重放复活 | T-2 | **已修（seq floor）**：controller model 与 member link-state 都保留每 origin 最高 seq，过期后旧 seq 不再复活；未新增时间戳字段 |
-| P2-28 | 全量 LSA snapshot 先写后 spawn reader，可能流控死锁 | T-3 | 开放 |
-| P2-29 | link-state reader 出错静默，坏帧后单向失联 | T-4 | 开放 |
+| P2-28 | 全量 LSA snapshot 先写后 spawn reader，可能流控死锁 | T-3 | **已修**：先启动 reader，再逐帧写 snapshot |
+| P2-29 | link-state reader 出错静默，坏帧后单向失联 | T-4 | **已修**：read/accept/pong 错误记录并 close_link/on_down |
 | P2-30 | 双 relay 快速清理依赖 `routing.link_state=true` | T-5 | 开放 |
 | P2-31 | send 不尝试更大 MTU 的 standby link | T-6 | 开放 |
-| P2-32 | accept loop 串行握手/认证，可被慢连接 HOL 阻塞 | T-9 | 开放 |
+| P2-32 | accept loop 串行握手/认证，可被慢连接 HOL 阻塞 | T-9 | **已修**：每个 inbound 握手/认证独立 task，accept loop 不再等待 |
 | P2-33 | blocked 检查 TOCTOU（认证后/insert 前不复检） | T-10 | 部分（连接锁清理已加） |
-| P2-34 | `install_grant` 无 revision 单调，双 link 并发旧凭据可覆盖 | T-11 | 开放 |
+| P2-34 | `install_grant` 无 revision 单调，双 link 并发旧凭据可覆盖 | T-11 | **已修**：只接受更高 revision；同 revision 保留已安装 grant；旧 revision 忽略 |
 | P2-35 | 动态 peer 无上限/无 TTL/无原子 add_peer | T-12 | 开放 |
 | P2-36 | inbound peer 未写入 registry，LSA/API 不显示单向连接 | T-13 | 开放 |
 | P2-37 | 快照过滤未连接下一跳后不再补装（已改为 FIB 过滤，保路由） | T-15 | 已修（P1-20 顺带） |
@@ -119,11 +119,11 @@
 | ID | 问题 | 来源 | 状态 |
 |---|---|---|---|
 | P2-41 | 重组表全局 256 条，无 per-peer/字节配额，单成员可占满 | D-1 | **已修**：per-peer 32 条 + 全局 8MiB 缓存上限；单测 `per_peer_reassembly_quota_is_enforced` |
-| P2-42 | 分片在 peer/anti-spoof 校验前进入重组表 | D-2 | **部分**：配额限制了占用，但重组仍在完整包 anti-spoof 前发生 |
-| P2-43 | IPv4 重组校验和只算 20 字节，带 options 重组包被内核丢 | D-3 | 开放 |
-| P2-44 | IPv4 重组 total_length 截断/越界载荷 | D-4 | 开放 |
-| P2-45 | IPv6 只拒绝同 offset，不拒绝部分重叠/非 8 字节对齐 | D-5 | 开放 |
-| P2-46 | IPv6 扩展头在 Fragment 前时绕过应用层重组 | D-6 | 开放 |
+| P2-42 | 分片在 peer/anti-spoof 校验前进入重组表 | D-2 | **已修**：进入重组前校验 mesh network、peer 存在、IP 源地址 grant；非首片/扩展头也按 IP 头提取源 |
+| P2-43 | IPv4 重组校验和只算 20 字节，带 options 重组包被内核丢 | D-3 | **已修**：按 IHL 全头重算 checksum；单测带 options |
+| P2-44 | IPv4 重组 total_length 截断/越界载荷 | D-4 | **已修**：payload 按 total_length 截断，total>packet/小于 IHL 丢弃；单测 padding |
+| P2-45 | IPv6 只拒绝同 offset，不拒绝部分重叠/非 8 字节对齐 | D-5 | **已修**：任意区间重叠拒绝；more 片段 payload 必须 8 字节对齐 |
+| P2-46 | IPv6 扩展头在 Fragment 前时绕过应用层重组 | D-6 | **已修**：解析 Hop-by-Hop/Routing/Dest/AH 链定位 Fragment，重组后保留扩展头并修正 Next Header/总长 |
 | P2-47 | ACL reject 引用最后一个分片而非重组报文，ICMP 无法关联 | D-7 | 开放 |
 | P2-48 | fragment_cache 无 TTL，满 4096 整表清空 | D-8 | **已修**：ACL fragment cache 30s TTL，过期条目在查找/插入时淘汰 |
 | P2-49 | MTU monitor 初值/60s 低通窗口/无 datagram_too_large 指标 | D-9/D-10 | 开放 |
@@ -196,7 +196,7 @@
 
 | 测试 | 结果 |
 |---|---|
-| `cargo test --workspace` | 228 passed / 0 failed / 2 ignored（Linux 构建机，P2 批次后） |
+| `cargo test --workspace` | 235 passed / 0 failed / 2 ignored（Linux 构建机） |
 | 3 机 controller HA + mTLS + failover | **通过**（leader 1→2，snapshot/failover 正常；test-real-3host-ha.sh） |
 | 3 机 IPv4 TUN overlay | **通过**（3/3、1000B/2000B 各 3/3，0% loss） |
 | 3 机 IPv6 TUN overlay | **通过**（1200B 3/3，0% loss） |
@@ -220,6 +220,10 @@
 | P2-26/27 LSA replay | **通过（单测）**：controller seq floor 过期后拒绝旧 seq；签名缓存只随被接受的 LSA 更新 |
 | P2-41/48 reassembly | **通过**：netns reassembly + `per_peer_reassembly_quota_is_enforced`；fragment cache 30s TTL |
 | P2-84 legacy WAL | **删除**：只支持全新部署，不再有 legacy `raft-log.json` 迁移路径 |
+| P2-09/11/34 安全 | **通过**：enroll payload 字段绑定单测、LSA 跨 network 拒绝、grant revision 单测；IPAM/HA 真机走新 enroll/LSA |
+| P2-20 membership CAS | **通过**：`test-controller-membership-cas.sh` leader stale CAS 409，follower 503 + leader header |
+| P2-28/29/32 传输 | **通过**：3host overlay/static/roaming、17MiB iroh snapshot、link-state reader 正常 |
+| P2-42..46 重组 | **通过**：netns reassembly + IPv4 options/padding、IPv6 overlap/对齐/扩展头单测 |
 | 3 机静态 mesh + 单边 rogue | **通过**（6 方向 connected/ping；较大 NodeId 侧 5s 后补拨号，rogue 被 allowlist 拒绝） |
 | 撤销后旧凭据/新成员 | **单测通过**（revoked tombstone 对未见节点设 floor+close；reinstate 后恢复） |
 | netns 套件 | **16/16 通过**（route-safety、acl-reject、reassembly、tun、3node、3node-controller、ipv6、nat44、nat66、mdns、discovery、raft-tls、raft-membership、iroh-large、persistence；3node-controller/ipv6 需 12–14s 收敛等待） |

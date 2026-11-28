@@ -146,6 +146,111 @@ async fn build_endpoint(
     builder.bind().await.context("bind iroh endpoint")
 }
 
+async fn handle_incoming(
+    transport: Arc<IrohTransport>,
+    incoming: iroh::endpoint::Incoming,
+    auth_mode: AuthMode,
+    accept_tx: mpsc::Sender<InboundPacket>,
+    control_tx: Option<mpsc::Sender<ControlEvent>>,
+) {
+    let accepting = match incoming.accept() {
+        Ok(a) => a,
+        Err(e) => {
+            debug!(error = %e, "incoming accept setup failed");
+            return;
+        }
+    };
+    let conn = match accepting.await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "incoming handshake failed");
+            return;
+        }
+    };
+    if conn.alpn() != DATA_ALPN {
+        debug!(alpn = ?conn.alpn(), "ignoring non-data inbound connection");
+        conn.close(4u8.into(), b"wrong alpn");
+        return;
+    }
+    let remote = conn.remote_id();
+    let node = NodeId::new(*remote.as_bytes());
+    if transport.is_blocked(node) {
+        debug!(peer = %node.short(), "rejecting blocked inbound connection");
+        conn.close(3u8.into(), b"revoked");
+        return;
+    }
+    if auth_mode == AuthMode::Static && !transport.static_keys.contains(&node) {
+        warn!(peer = %node.short(), "peer key is not in the static allowlist");
+        conn.close(2u8.into(), b"not allowlisted");
+        return;
+    }
+    if auth_mode == AuthMode::Controller {
+        let credential = transport.state.credential();
+        let auth = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::membership::authenticate_server(
+                &conn,
+                &transport.network,
+                &transport.controller_keys,
+                credential.as_ref(),
+                |peer| transport.state.revision(peer),
+            ),
+        )
+        .await;
+        match auth {
+            Ok(Ok(verified)) => transport.state.install_grant(&verified),
+            Ok(Err(error)) => {
+                warn!(peer = %node.short(), error = %error, "membership authentication failed");
+                conn.close(2u8.into(), b"auth failed");
+                return;
+            }
+            Err(_) => {
+                warn!(peer = %node.short(), "membership authentication timed out");
+                conn.close(2u8.into(), b"auth timeout");
+                return;
+            }
+        }
+    }
+    let Some(role) = transport.next_inbound_role(node) else {
+        debug!(peer = %node.short(), "duplicate inbound link; closing");
+        conn.close(5u8.into(), b"duplicate link");
+        return;
+    };
+    let relay = selected_relay(&conn);
+    if !transport.insert_conn(node, conn.clone(), role, relay.clone()) {
+        debug!(peer = %node.short(), "link role already filled; closing");
+        conn.close(5u8.into(), b"duplicate link");
+        return;
+    }
+    info!(peer = %node.short(), ?role, ?relay, "inbound iroh connection");
+    spawn_path_watch(conn.clone(), node, conn.stable_id(), transport.clone());
+    if let Some(tx) = &control_tx {
+        let _ = tx
+            .send(ControlEvent::Up {
+                node,
+                conn: conn.clone(),
+                stable_id: conn.stable_id(),
+            })
+            .await;
+    }
+    let (path, rtt, mtu, addr, path_count) = path_status(&conn);
+    transport
+        .peers
+        .mark(&node, true, path, rtt, mtu, addr, path_count);
+    let tx = accept_tx;
+    let network_hash = network_hash(transport.network);
+    let down_tx = control_tx.clone();
+    let transport_for_close = transport.clone();
+    let stable_id = conn.stable_id();
+    tokio::spawn(async move {
+        read_loop(conn, node, network_hash, tx).await;
+        let _ = transport_for_close.remove_conn(node, stable_id);
+        if let Some(tx) = &down_tx {
+            let _ = tx.send(ControlEvent::Down { node, stable_id }).await;
+        }
+    });
+}
+
 impl IrohTransport {
     pub async fn start(
         state: crate::AgentState,
@@ -252,103 +357,13 @@ impl IrohTransport {
                     let Some(incoming) = accept_endpoint.accept().await else {
                         break;
                     };
-                    let accepting = match incoming.accept() {
-                        Ok(a) => a,
-                        Err(e) => {
-                            debug!(error = %e, "incoming accept setup failed");
-                            continue;
-                        }
-                    };
-                    let conn = match accepting.await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            debug!(error = %e, "incoming handshake failed");
-                            continue;
-                        }
-                    };
-                    if conn.alpn() != DATA_ALPN {
-                        debug!(alpn = ?conn.alpn(), "ignoring non-data inbound connection");
-                        conn.close(4u8.into(), b"wrong alpn");
-                        continue;
-                    }
-                    let remote = conn.remote_id();
-                    let node = NodeId::new(*remote.as_bytes());
-                    if transport.is_blocked(node) {
-                        debug!(peer = %node.short(), "rejecting blocked inbound connection");
-                        conn.close(3u8.into(), b"revoked");
-                        continue;
-                    }
-                    if accept_config.network.auth.mode == AuthMode::Static
-                        && !transport.static_keys.contains(&node)
-                    {
-                        warn!(peer = %node.short(), "peer key is not in the static allowlist");
-                        conn.close(2u8.into(), b"not allowlisted");
-                        continue;
-                    }
-                    if accept_config.network.auth.mode == AuthMode::Controller {
-                        let credential = transport.state.credential();
-                        let auth = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            crate::membership::authenticate_server(
-                                &conn,
-                                &transport.network,
-                                &transport.controller_keys,
-                                credential.as_ref(),
-                                |peer| transport.state.revision(peer),
-                            ),
-                        )
-                        .await;
-                        match auth {
-                            Ok(Ok(verified)) => transport.state.install_grant(&verified),
-                            Ok(Err(error)) => {
-                                warn!(peer = %node.short(), error = %error, "membership authentication failed");
-                                conn.close(2u8.into(), b"auth failed");
-                                continue;
-                            }
-                            Err(_) => {
-                                warn!(peer = %node.short(), "membership authentication timed out");
-                                conn.close(2u8.into(), b"auth timeout");
-                                continue;
-                            }
-                        }
-                    }
-                    let Some(role) = transport.next_inbound_role(node) else {
-                        debug!(peer = %node.short(), "duplicate inbound link; closing");
-                        conn.close(5u8.into(), b"duplicate link");
-                        continue;
-                    };
-                    let relay = selected_relay(&conn);
-                    if !transport.insert_conn(node, conn.clone(), role, relay.clone()) {
-                        debug!(peer = %node.short(), "link role already filled; closing");
-                        conn.close(5u8.into(), b"duplicate link");
-                        continue;
-                    }
-                    info!(peer = %node.short(), ?role, ?relay, "inbound iroh connection");
-                    spawn_path_watch(conn.clone(), node, conn.stable_id(), transport.clone());
-                    if let Some(tx) = &control_tx {
-                        let _ = tx
-                            .send(ControlEvent::Up {
-                                node,
-                                conn: conn.clone(),
-                                stable_id: conn.stable_id(),
-                            })
-                            .await;
-                    }
-                    let (path, rtt, mtu, addr, path_count) = path_status(&conn);
-                    transport
-                        .peers
-                        .mark(&node, true, path, rtt, mtu, addr, path_count);
-                    let tx = accept_tx.clone();
-                    let network_hash = network_hash(transport.network);
-                    let down_tx = control_tx.clone();
-                    let transport_for_close = transport.clone();
-                    let stable_id = conn.stable_id();
+                    let transport = transport.clone();
+                    let accept_tx = accept_tx.clone();
+                    let control_tx = control_tx.clone();
+                    let auth_mode = accept_config.network.auth.mode;
                     tokio::spawn(async move {
-                        read_loop(conn, node, network_hash, tx).await;
-                        let _ = transport_for_close.remove_conn(node, stable_id);
-                        if let Some(tx) = &down_tx {
-                            let _ = tx.send(ControlEvent::Down { node, stable_id }).await;
-                        }
+                        handle_incoming(transport, incoming, auth_mode, accept_tx, control_tx)
+                            .await;
                     });
                 }
             });

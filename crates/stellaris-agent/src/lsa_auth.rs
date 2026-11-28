@@ -8,26 +8,30 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use stellaris_linkstate::Lsa;
+use stellaris_types::NetworkId;
 
 const DOMAIN: &[u8] = b"stellaris-lsa-v1|";
 
 /// Canonical bytes covered by an LSA signature.
-pub fn signing_payload(lsa: &Lsa) -> Vec<u8> {
+pub fn signing_payload(network: &NetworkId, lsa: &Lsa) -> Vec<u8> {
     let body = serde_json::to_vec(lsa).unwrap_or_default();
-    let mut out = Vec::with_capacity(DOMAIN.len() + body.len());
+    let network = network.to_string();
+    let mut out = Vec::with_capacity(DOMAIN.len() + network.len() + 1 + body.len());
     out.extend_from_slice(DOMAIN);
+    out.extend_from_slice(network.as_bytes());
+    out.push(b'|');
     out.extend_from_slice(&body);
     out
 }
 
 /// Sign an LSA with the node's Ed25519 identity key.
-pub fn sign(secret: &[u8; 32], lsa: &Lsa) -> String {
+pub fn sign(secret: &[u8; 32], network: &NetworkId, lsa: &Lsa) -> String {
     let key = SigningKey::from_bytes(secret);
-    hex::encode(key.sign(&signing_payload(lsa)).to_bytes())
+    hex::encode(key.sign(&signing_payload(network, lsa)).to_bytes())
 }
 
 /// Verify a hex signature against `lsa.origin`.
-pub fn verify(lsa: &Lsa, signature_hex: &str) -> bool {
+pub fn verify(network: &NetworkId, lsa: &Lsa, signature_hex: &str) -> bool {
     let Ok(bytes) = hex::decode(signature_hex.trim()) else {
         return false;
     };
@@ -37,8 +41,11 @@ pub fn verify(lsa: &Lsa, signature_hex: &str) -> bool {
     let Ok(key) = VerifyingKey::from_bytes(lsa.origin.as_bytes()) else {
         return false;
     };
-    key.verify_strict(&signing_payload(lsa), &Signature::from_bytes(&bytes))
-        .is_ok()
+    key.verify_strict(
+        &signing_payload(network, lsa),
+        &Signature::from_bytes(&bytes),
+    )
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -77,20 +84,24 @@ mod tests {
     fn signature_roundtrips() {
         let (secret, origin) = node(3);
         let lsa = lsa(origin, 42);
-        let signature = sign(&secret, &lsa);
-        assert!(verify(&lsa, &signature));
+        let network = NetworkId::new();
+        let signature = sign(&secret, &network, &lsa);
+        assert!(verify(&network, &lsa, &signature));
     }
 
     #[test]
     fn tampered_fields_are_rejected() {
         let (secret, origin) = node(3);
         let mut lsa = lsa(origin, 42);
-        let signature = sign(&secret, &lsa);
+        let network = NetworkId::new();
+        let signature = sign(&secret, &network, &lsa);
         lsa.seq += 1;
-        assert!(!verify(&lsa, &signature));
+        assert!(!verify(&network, &lsa, &signature));
         lsa.seq -= 1;
         lsa.prefixes[0].prefix = "10.7.1.0/24".parse().unwrap();
-        assert!(!verify(&lsa, &signature));
+        assert!(!verify(&network, &lsa, &signature));
+        let other = NetworkId::new();
+        assert!(!verify(&other, &lsa, &signature));
     }
 
     #[test]
@@ -98,16 +109,18 @@ mod tests {
         let (_, origin) = node(3);
         let (other_secret, _) = node(4);
         let lsa = lsa(origin, 1);
-        let forged = sign(&other_secret, &lsa);
-        assert!(!verify(&lsa, &forged));
+        let network = NetworkId::new();
+        let forged = sign(&other_secret, &network, &lsa);
+        assert!(!verify(&network, &lsa, &forged));
     }
 
     #[test]
     fn malformed_signatures_are_rejected() {
         let (_, origin) = node(3);
         let lsa = lsa(origin, 1);
-        assert!(!verify(&lsa, ""));
-        assert!(!verify(&lsa, "zz"));
-        assert!(!verify(&lsa, &"00".repeat(63)));
+        let network = NetworkId::new();
+        assert!(!verify(&network, &lsa, ""));
+        assert!(!verify(&network, &lsa, "zz"));
+        assert!(!verify(&network, &lsa, &"00".repeat(63)));
     }
 }

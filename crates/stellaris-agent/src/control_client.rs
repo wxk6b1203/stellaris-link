@@ -114,7 +114,7 @@ async fn run_http(
         if last_lsa.elapsed() >= Duration::from_secs(10) {
             seq = seq.max(now_seq());
             let lsa = local_lsa(&state, seq);
-            let signature = crate::lsa_auth::sign(&state.identity_secret, &lsa);
+            let signature = crate::lsa_auth::sign(&state.identity_secret, &state.network, &lsa);
             let body = serde_json::json!({"lsa": &lsa, "signature": signature});
             let mut request = client.post(format!("{base}/v1/lsa"));
             if let Some(secret) = &secret {
@@ -303,7 +303,7 @@ async fn run_iroh(
             if last_lsa.elapsed() >= Duration::from_secs(10) {
                 seq = seq.max(now_seq());
                 let lsa = local_lsa(&state, seq);
-                let signature = crate::lsa_auth::sign(&state.identity_secret, &lsa);
+                let signature = crate::lsa_auth::sign(&state.identity_secret, &state.network, &lsa);
                 let req = Request::Lsa {
                     lsa,
                     signature,
@@ -666,11 +666,18 @@ async fn enroll_http(
     let auto = state.config.node.ipam == stellaris_types::IpamMode::Auto;
     let overlay = state.config.node.overlay_ip;
     let overlay_text = overlay.map(|ip| ip.to_string());
+    let issued_at = crate::credential::now_secs();
+    let nonce = uuid::Uuid::now_v7().to_string();
     let payload = crate::controller::enroll_payload_bytes(
         &state.network.to_string(),
         &state.node_id.to_string(),
         overlay_text.as_deref(),
         state.config.node.zone.as_deref(),
+        auto,
+        None,
+        &state.config.transport.advertise,
+        issued_at,
+        &nonce,
     );
     let signature = crate::controller::sign_ed25519(&state.identity_secret, &payload);
     let mut request = client
@@ -681,6 +688,8 @@ async fn enroll_http(
             "auto": auto,
             "zone": state.config.node.zone,
             "addrs": state.config.transport.advertise,
+            "issued_at": issued_at,
+            "nonce": nonce,
             "signature": signature,
         }));
     if let Some(secret) = secret {

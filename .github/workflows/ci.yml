@@ -43,6 +43,8 @@ jobs:
         run: BIN="$PWD/target/release/stellaris-controller" ./scripts/test-controller-bootstrap-divergence.sh
       - name: Controller quorum readiness
         run: BIN="$PWD/target/release/stellaris-controller" ./scripts/test-controller-quorum-ready.sh
+      - name: Controller membership CAS/leader hint
+        run: BIN="$PWD/target/release/stellaris-controller" ./scripts/test-controller-membership-cas.sh
       - name: Docker mDNS discovery
         run: BIN="$PWD/target/release/stellaris-agent" ./scripts/test-docker-mdns.sh
       - name: netns TUN overlay

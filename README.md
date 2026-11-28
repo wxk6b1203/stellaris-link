@@ -25,6 +25,10 @@
 > LSA 保留每 origin 最高 seq（过期后旧 seq 不再复活），签名缓存只随被接受的 LSA 更新；
 > 重组表增加 per-peer/字节配额，ACL fragment cache 加 30s TTL。**只支持全新部署**：
 > 不再读取/迁移 legacy `raft-log.json`，旧 WAL 需先清空 `raft_dir` 再启动。
+> 同一批还加了：LSA 签名绑定 network_id；enroll 签名覆盖 auto/pool/addrs 并带
+> `issued_at/nonce`（±5min）；`install_grant` revision 单调；Raft membership 支持
+> `expected_voters` CAS 和 follower leader hint；inbound 握手/认证并发；LSA snapshot
+> 先启动 reader；IPv4 options/total_length、IPv6 扩展头/重叠/对齐等重组修复。
 >
 > **2026-11-25 入网收敛为单一凭据**：删除 PSK、join token、`admission` 的 legacy/allowlist；controller 签发带 `revision` 和过期时间的 `MembershipCredential`，peer 在 iroh 握手时用 `control.controller_keys` 验签；撤销 ≤10s 内断连并丢弃 grant/LSA；新增 `POST /v1/enroll` 与 `POST /v1/members/{node}/grants`。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。

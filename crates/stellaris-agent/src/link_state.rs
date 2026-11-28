@@ -140,12 +140,13 @@ impl Service {
             .collect();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let lsa = local_lsa(&self.state, seq, &connected);
-        let signature = crate::lsa_auth::sign(&self.state.identity_secret, &lsa);
+        let signature =
+            crate::lsa_auth::sign(&self.state.identity_secret, &self.state.network, &lsa);
         self.publish(lsa, signature);
     }
 
     fn publish(&self, lsa: Lsa, signature: String) {
-        if !crate::lsa_auth::verify(&lsa, &signature) {
+        if !crate::lsa_auth::verify(&self.state.network, &lsa, &signature) {
             warn!(origin = %lsa.origin.short(), "LSA signature invalid, dropped");
             return;
         }
@@ -303,10 +304,7 @@ async fn peer_task(
     let stable_id = conn.stable_id();
     info!(peer = %node.short(), "link-state control connection");
     let mut events = service.tx.subscribe();
-    let (mut send, _recv) = conn.open_bi().await.context("open LSA stream")?;
-    for (lsa, signature) in service.snapshot() {
-        write_frame(&mut send, &ControlFrame::Lsa { lsa, signature }).await?;
-    }
+    let (send, _recv) = conn.open_bi().await.context("open LSA stream")?;
     let send = Arc::new(Mutex::new(send));
     let last_pong = Arc::new(Mutex::new(Instant::now()));
     let reader = {
@@ -316,15 +314,36 @@ async fn peer_task(
         let last_pong = last_pong.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((_send, mut recv)) = conn.accept_bi().await else {
-                    break;
+                let (_send, mut recv) = match conn.accept_bi().await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::debug!(peer = %node.short(), %error, "link-state accept_bi ended");
+                        break;
+                    }
                 };
-                while let Some(frame) = read_frame(&mut recv).await? {
+                loop {
+                    let frame = match read_frame(&mut recv).await {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break,
+                        Err(error) => {
+                            warn!(peer = %node.short(), %error, "link-state read failed");
+                            service.transport.close_link(node, stable_id);
+                            service.on_down(node, stable_id);
+                            return Err(error);
+                        }
+                    };
                     match frame {
                         ControlFrame::Lsa { lsa, signature } => service.publish(lsa, signature),
                         ControlFrame::Ping { seq } => {
                             let mut guard = send.lock().await;
-                            write_frame(&mut guard, &ControlFrame::Pong { seq }).await?;
+                            if let Err(error) =
+                                write_frame(&mut guard, &ControlFrame::Pong { seq }).await
+                            {
+                                warn!(peer = %node.short(), %error, "link-state pong failed");
+                                service.transport.close_link(node, stable_id);
+                                service.on_down(node, stable_id);
+                                return Err(error);
+                            }
                         }
                         ControlFrame::Pong { .. } => {
                             *last_pong.lock().await = Instant::now();
@@ -335,6 +354,18 @@ async fn peer_task(
             Ok::<_, anyhow::Error>(())
         })
     };
+    // Feed the snapshot only after the reader task is alive. Otherwise a peer
+    // that sends its own stream/heartbeat while the snapshot is in flight can
+    // fill QUIC flow-control windows in both directions and deadlock.
+    for (lsa, signature) in service.snapshot() {
+        let mut guard = send.lock().await;
+        if let Err(error) = write_frame(&mut guard, &ControlFrame::Lsa { lsa, signature }).await {
+            warn!(peer = %node.short(), %error, "link-state snapshot write failed");
+            service.transport.close_link(node, stable_id);
+            service.on_down(node, stable_id);
+            return Err(error);
+        }
+    }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
