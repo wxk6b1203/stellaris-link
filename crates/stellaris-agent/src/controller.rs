@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::controller_raft::{StateMachineStore, TypeConfig};
 use openraft::async_runtime::WatchReceiver;
-use openraft::{BasicNode, Raft, ReadPolicy};
+use openraft::{BasicNode, Instant as _, Raft, ReadPolicy};
 
 use crate::controller_model::{ControllerCommand, ControllerModel, MemberRecord};
 
@@ -2279,7 +2279,28 @@ async fn readyz(State(state): State<ControllerState>) -> Response {
         .map(|raft| {
             let watch = raft.metrics();
             let metrics = watch.borrow_watched();
-            metrics.running_state.is_ok() && metrics.current_leader.is_some()
+            if metrics.running_state.is_err() || metrics.current_leader.is_none() {
+                return false;
+            }
+            if metrics.current_leader != Some(metrics.id) {
+                // Followers are ready to forward; they do not need a lease.
+                return true;
+            }
+            if metrics.membership_config.nodes().count() <= 1 {
+                // Single-node clusters have no remote quorum to wait for.
+                return true;
+            }
+            let max = state
+                .raft_timing
+                .as_ref()
+                .map(|timing| timing.election_timeout_max_ms)
+                .unwrap_or(2_000)
+                .saturating_mul(2)
+                .max(2_000);
+            metrics
+                .last_quorum_acked
+                .as_ref()
+                .is_some_and(|acked| acked.elapsed() <= std::time::Duration::from_millis(max))
         })
         .unwrap_or(true);
     if ready {

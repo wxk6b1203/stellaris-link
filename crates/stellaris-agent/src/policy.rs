@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use stellaris_types::{AclAction, AclConfig, AclDirection, NodeId, QosConfig, RouteAttributes};
@@ -84,6 +84,8 @@ struct FragmentKey {
     direction: AclDirection,
 }
 
+const FRAGMENT_CACHE_TTL: Duration = Duration::from_secs(30);
+
 pub struct Policy {
     file: PolicyFile,
     acl_order: Vec<usize>,
@@ -91,7 +93,7 @@ pub struct Policy {
     buckets: Vec<Mutex<Bucket>>,
     byte_buckets: Vec<Mutex<Bucket>>,
     acl_hits: Vec<AtomicU64>,
-    fragment_cache: Mutex<HashMap<FragmentKey, AclVerdict>>,
+    fragment_cache: Mutex<HashMap<FragmentKey, (AclVerdict, Instant)>>,
 }
 
 impl Policy {
@@ -199,13 +201,20 @@ impl Policy {
                 id: frag.id,
                 direction,
             };
-            return self
+            let mut cache = self
                 .fragment_cache
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| AclVerdict::Deny("fragment without first".into()));
+                .unwrap_or_else(|e| e.into_inner());
+            match cache.get(&key) {
+                Some((verdict, seen)) if seen.elapsed() <= FRAGMENT_CACHE_TTL => {
+                    return verdict.clone();
+                }
+                Some(_) => {
+                    cache.remove(&key);
+                }
+                None => {}
+            }
+            return AclVerdict::Deny("fragment without first".into());
         }
         let verdict = self.check_rules(direction, info, peer, zone);
         if let Some(frag) = fragment
@@ -222,10 +231,11 @@ impl Policy {
                 .fragment_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            cache.retain(|_, (_, seen)| seen.elapsed() <= FRAGMENT_CACHE_TTL);
             if cache.len() >= 4096 {
                 cache.clear();
             }
-            cache.insert(key, verdict.clone());
+            cache.insert(key, (verdict.clone(), Instant::now()));
         }
         verdict
     }

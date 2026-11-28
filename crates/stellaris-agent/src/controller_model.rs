@@ -185,6 +185,10 @@ pub struct ControllerModel {
     #[serde(default)]
     pub bootstrap_seeded: bool,
     pub lsas: BTreeMap<NodeId, Lsa>,
+    /// Highest accepted LSA sequence per origin; survives LSA expiry so an
+    /// old signed advertisement cannot be replayed.
+    #[serde(default)]
+    pub lsa_seq_floor: BTreeMap<NodeId, u64>,
     pub members: BTreeMap<NodeId, MemberRecord>,
     pub acks: BTreeMap<NodeId, AckRecord>,
     /// Monotonic per-node credential revision. Bumped on every authorization
@@ -223,6 +227,7 @@ impl ControllerModel {
             generation: 1,
             bootstrap_seeded: false,
             lsas: BTreeMap::new(),
+            lsa_seq_floor: BTreeMap::new(),
             members: BTreeMap::new(),
             acks: BTreeMap::new(),
             member_revisions: BTreeMap::new(),
@@ -267,14 +272,14 @@ impl ControllerModel {
                     // resurrect a tombstoned origin in the replicated model.
                     false
                 } else {
-                    let newer = self
-                        .lsas
-                        .get(&lsa.origin)
-                        .is_none_or(|current| lsa.seq > current.seq);
-                    if newer {
+                    let floor = self.lsa_seq_floor.get(&lsa.origin).copied().unwrap_or(0);
+                    if lsa.seq <= floor {
+                        false
+                    } else {
+                        self.lsa_seq_floor.insert(lsa.origin, lsa.seq);
                         self.lsas.insert(lsa.origin, lsa);
+                        true
                     }
-                    newer
                 }
             }
             ControllerCommand::ExpireLsas { entries } => {
@@ -341,7 +346,11 @@ impl ControllerModel {
                 epoch,
             } => {
                 let record = AckRecord { generation, epoch };
-                let changed = self.acks.get(&node) != Some(&record);
+                // ACKs are observations; an older snapshot's delayed ACK must
+                // not roll the recorded frontier backwards.
+                let changed = self.acks.get(&node).is_none_or(|current| {
+                    (epoch, generation) > (current.epoch, current.generation)
+                });
                 if changed {
                     self.acks.insert(node, record);
                 }
@@ -417,10 +426,14 @@ impl ControllerModel {
                 true
             }
             ControllerCommand::DenyAdmission { node, now } => {
-                let changed = self.pending_admissions.remove(&node).is_some();
-                self.release_lease(node, now);
-                self.revoked.insert(node);
-                self.bump_revision(node);
+                let had_pending = self.pending_admissions.remove(&node).is_some();
+                let had_member = self.members.remove(&node).is_some();
+                let newly_revoked = self.revoked.insert(node);
+                let changed = had_pending || had_member || newly_revoked;
+                if changed {
+                    self.release_lease(node, now);
+                    self.bump_revision(node);
+                }
                 changed
             }
             ControllerCommand::CreatePool { pool } => {
@@ -963,6 +976,7 @@ impl ControllerModel {
             acks: Vec<(&'a NodeId, &'a AckRecord)>,
             member_revisions: Vec<(&'a NodeId, &'a u64)>,
             revoked: Vec<&'a NodeId>,
+            lsa_seq_floor: Vec<(&'a NodeId, &'a u64)>,
             pools: Vec<(&'a String, &'a AddressPool)>,
             leases: Vec<(&'a IpAddr, &'a Lease)>,
             node_leases: Vec<(&'a NodeId, &'a IpAddr)>,
@@ -981,6 +995,7 @@ impl ControllerModel {
             acks: self.acks.iter().collect(),
             member_revisions: self.member_revisions.iter().collect(),
             revoked: self.revoked.iter().collect(),
+            lsa_seq_floor: self.lsa_seq_floor.iter().collect(),
             pools: self.pools.iter().collect(),
             leases: self.leases.iter().collect(),
             node_leases: self.node_leases.iter().collect(),
@@ -1123,6 +1138,64 @@ mod tests {
     }
 
     #[test]
+    fn ack_never_rolls_back_a_newer_generation_or_epoch() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        let node = NodeId::new([1u8; 32]);
+        assert!(model.apply(ControllerCommand::Ack {
+            node,
+            generation: 5,
+            epoch: 3,
+        }));
+        assert!(!model.apply(ControllerCommand::Ack {
+            node,
+            generation: 4,
+            epoch: 3,
+        }));
+        assert!(!model.apply(ControllerCommand::Ack {
+            node,
+            generation: 99,
+            epoch: 2,
+        }));
+        assert_eq!(model.acks[&node].generation, 5);
+        assert_eq!(model.acks[&node].epoch, 3);
+        // A newer epoch wins even with a smaller generation.
+        assert!(model.apply(ControllerCommand::Ack {
+            node,
+            generation: 1,
+            epoch: 4,
+        }));
+        assert_eq!(model.acks[&node].generation, 1);
+        assert_eq!(model.acks[&node].epoch, 4);
+    }
+
+    #[test]
+    fn deny_existing_member_revokes_and_bumps_generation() {
+        let mut model = ControllerModel::new(NetworkId::new(), 1);
+        let node = NodeId::new([9u8; 32]);
+        assert!(model.apply(ControllerCommand::ApproveAdmission {
+            node,
+            member: MemberRecord {
+                overlay_ip: Some("10.7.0.9".parse().unwrap()),
+                prefixes: Vec::new(),
+                capabilities: vec!["member".into()],
+            },
+            auto: false,
+            pool: None,
+            zone: None,
+            now: 0,
+        }));
+        let generation = model.generation;
+        let revision = model.member_revisions[&node];
+        assert!(model.apply(ControllerCommand::DenyAdmission { node, now: 0 }));
+        assert!(!model.members.contains_key(&node));
+        assert!(model.revoked.contains(&node));
+        assert!(model.generation > generation);
+        assert!(model.member_revisions[&node] > revision);
+        // Repeating the deny is a no-op.
+        assert!(!model.apply(ControllerCommand::DenyAdmission { node, now: 0 }));
+    }
+
+    #[test]
     fn stale_lsa_and_lower_epoch_are_ignored() {
         let mut model = ControllerModel::new(NetworkId::new(), 5);
         model.apply(ControllerCommand::SetEpoch { epoch: 4 });
@@ -1151,6 +1224,14 @@ mod tests {
             entries: vec![(a, 5), (b, 8)],
         }));
         assert!(!model.lsas.contains_key(&a));
+        // A replay after expiry must not resurrect the old sequence.
+        assert!(!model.apply(ControllerCommand::ApplyLsa {
+            lsa: lsa(1, 4, "10.0.0.9/32"),
+        }));
+        assert!(!model.lsas.contains_key(&a));
+        assert!(model.apply(ControllerCommand::ApplyLsa {
+            lsa: lsa(1, 6, "10.0.0.1/32"),
+        }));
         // b's LSA is newer than the requested sequence and must survive.
         assert!(model.lsas.contains_key(&b));
     }

@@ -46,6 +46,9 @@ pub struct Service {
     db: RwLock<LinkStateDb>,
     /// Last accepted signature per origin, kept so peers can be re-synced.
     signatures: RwLock<HashMap<NodeId, String>>,
+    /// Highest sequence accepted per origin, retained after expiry so a
+    /// replayed signed LSA cannot resurrect an expired route.
+    seq_floor: RwLock<HashMap<NodeId, u64>>,
     tx: broadcast::Sender<(Lsa, String)>,
     connections: RwLock<HashMap<NodeId, HashSet<usize>>>,
     seq: AtomicU64,
@@ -62,6 +65,7 @@ pub async fn run(
         transport,
         db: RwLock::new(LinkStateDb::new()),
         signatures: RwLock::new(HashMap::new()),
+        seq_floor: RwLock::new(HashMap::new()),
         tx,
         connections: RwLock::new(HashMap::new()),
         seq: AtomicU64::new(now_seq()),
@@ -150,18 +154,52 @@ impl Service {
             tracing::debug!(origin = %lsa.origin.short(), "unauthorized LSA dropped");
             return;
         }
+        if lsa.origin != self.state.node_id {
+            let floor = self
+                .seq_floor
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&lsa.origin)
+                .copied()
+                .unwrap_or(0);
+            if lsa.seq <= floor {
+                tracing::debug!(origin = %lsa.origin.short(), seq = lsa.seq, "stale LSA replay dropped");
+                return;
+            }
+        }
         self.discover(&lsa);
         let changed = {
             let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
             db.apply(lsa.clone())
         };
+        if !changed {
+            // A duplicate of the current LSA may fill a missing cache entry,
+            // but an older rejected sequence must never overwrite the
+            // signature peers rely on for re-sync.
+            let current = {
+                let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+                db.get(&lsa.origin).is_some_and(|current| current == &lsa)
+            };
+            if current {
+                self.signatures
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(lsa.origin)
+                    .or_insert(signature);
+                let mut floor = self.seq_floor.write().unwrap_or_else(|e| e.into_inner());
+                let entry = floor.entry(lsa.origin).or_insert(0);
+                *entry = (*entry).max(lsa.seq);
+            }
+            return;
+        }
         self.signatures
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(lsa.origin, signature.clone());
-        if !changed {
-            return;
-        }
+        self.seq_floor
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lsa.origin, lsa.seq);
         self.recompute();
         let _ = self.tx.send((lsa, signature));
     }

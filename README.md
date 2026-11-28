@@ -19,6 +19,13 @@
 > 种子**通过 Raft 复制（`MarkSeeded`），各副本不再用本地 config 直接构造状态；副本间
 > 配置不一致时以 leader 为准。
 >
+> **2026-11-28 P2 批次**：`/readyz` 的 leader 现在要求 quorum lease 新鲜（失去 quorum
+> 返回 503）；cached `credential.json` 启动先验签/过期；snapshot 安装先原子写 state
+> 再替换内存，transfer 先校验 checksum 再删除；ACK 只能前进，Deny 会撤销已批准成员；
+> LSA 保留每 origin 最高 seq（过期后旧 seq 不再复活），签名缓存只随被接受的 LSA 更新；
+> 重组表增加 per-peer/字节配额，ACL fragment cache 加 30s TTL。**只支持全新部署**：
+> 不再读取/迁移 legacy `raft-log.json`，旧 WAL 需先清空 `raft_dir` 再启动。
+>
 > **2026-11-25 入网收敛为单一凭据**：删除 PSK、join token、`admission` 的 legacy/allowlist；controller 签发带 `revision` 和过期时间的 `MembershipCredential`，peer 在 iroh 握手时用 `control.controller_keys` 验签；撤销 ≤10s 内断连并丢弃 grant/LSA；新增 `POST /v1/enroll` 与 `POST /v1/members/{node}/grants`。
 > 设计基线：[ARCHITECTURE.md](ARCHITECTURE.md)、[PROTOCOL.md](PROTOCOL.md)、[PLAN.md](PLAN.md)。
 

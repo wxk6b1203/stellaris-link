@@ -83,14 +83,6 @@ fn http_client(tls: Option<&RaftTlsConfig>) -> anyhow::Result<reqwest::Client> {
     Ok(builder.build()?)
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct PersistedLog {
-    log: BTreeMap<u64, String>,
-    vote: Option<VoteOf<TypeConfig>>,
-    last_purged: Option<LogIdOf<TypeConfig>>,
-    committed: Option<LogIdOf<TypeConfig>>,
-}
-
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -365,8 +357,8 @@ impl Default for LogStore {
 }
 
 impl LogStore {
-    /// `path` is the legacy `raft-log.json` path; segments live in the sibling
-    /// directory without the extension.
+    /// Segments live in the sibling directory of the legacy `path` value;
+    /// only fresh-format state is supported.
     pub fn new(path: Option<PathBuf>) -> Self {
         let mut entries: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         let mut meta = PersistedLogMeta::default();
@@ -374,85 +366,37 @@ impl LogStore {
         let mut files = LogFiles::default();
         if let Some(path) = &path {
             let dir = log_dir(path);
-            let legacy = path.is_file();
-            if !dir.exists() && legacy {
-                match std::fs::read(path).map_err(invalid_data).and_then(|bytes| {
-                    serde_json::from_slice::<PersistedLog>(&bytes).map_err(invalid_data)
-                }) {
-                    Ok(persisted) => {
-                        entries = persisted
-                            .log
-                            .into_iter()
-                            .map(|(index, bytes)| (index, bytes.into_bytes()))
-                            .collect();
-                        meta = PersistedLogMeta {
-                            vote: persisted.vote,
-                            last_purged: persisted.last_purged,
-                            committed: persisted.committed,
-                        };
-                        match LogFiles::open(dir.clone()).and_then(|mut files| {
-                            let batch: Vec<(u64, Vec<u8>)> = entries
-                                .iter()
-                                .map(|(index, bytes)| (*index, bytes.clone()))
-                                .collect();
-                            files.reset(&batch)?;
-                            Ok(files)
-                        }) {
-                            Ok(opened) => {
-                                let meta_bytes = serde_json::to_vec(&meta).map_err(invalid_data);
-                                match meta_bytes
-                                    .and_then(|bytes| atomic_write(&dir.join("meta.json"), &bytes))
-                                {
-                                    Ok(()) => {
-                                        let _ = std::fs::rename(
-                                            path,
-                                            path.with_extension("json.legacy"),
-                                        );
-                                        files = opened;
-                                    }
-                                    Err(e) => init_error = Some(e.to_string()),
+            match LogFiles::open(dir.clone()) {
+                Ok(opened) => {
+                    for (_, _, segment) in &opened.segments {
+                        match read_log_segment(segment) {
+                            Ok(segment_entries) => {
+                                for (index, bytes) in segment_entries {
+                                    entries.insert(index, bytes);
                                 }
                             }
+                            Err(e) => {
+                                init_error = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    if init_error.is_none() {
+                        match std::fs::read(dir.join("meta.json")) {
+                            Ok(bytes) => match serde_json::from_slice::<PersistedLogMeta>(&bytes) {
+                                Ok(parsed) => meta = parsed,
+                                Err(e) => init_error = Some(invalid_data(e).to_string()),
+                            },
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                             Err(e) => init_error = Some(e.to_string()),
                         }
                     }
-                    Err(e) => init_error = Some(e.to_string()),
-                }
-            } else {
-                match LogFiles::open(dir.clone()) {
-                    Ok(opened) => {
-                        for (_, _, segment) in &opened.segments {
-                            match read_log_segment(segment) {
-                                Ok(segment_entries) => {
-                                    for (index, bytes) in segment_entries {
-                                        entries.insert(index, bytes);
-                                    }
-                                }
-                                Err(e) => {
-                                    init_error = Some(e.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        if init_error.is_none() {
-                            match std::fs::read(dir.join("meta.json")) {
-                                Ok(bytes) => {
-                                    match serde_json::from_slice::<PersistedLogMeta>(&bytes) {
-                                        Ok(parsed) => meta = parsed,
-                                        Err(e) => init_error = Some(invalid_data(e).to_string()),
-                                    }
-                                }
-                                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                                Err(e) => init_error = Some(e.to_string()),
-                            }
-                        }
-                        files = opened;
-                        if init_error.is_some() {
-                            files = LogFiles::default();
-                        }
+                    files = opened;
+                    if init_error.is_some() {
+                        files = LogFiles::default();
                     }
-                    Err(e) => init_error = Some(e.to_string()),
                 }
+                Err(e) => init_error = Some(e.to_string()),
             }
         }
         Self {
@@ -927,21 +871,29 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         self.check_init()?;
         let model: ControllerModel =
             serde_json::from_slice(snapshot.get_ref()).map_err(invalid_data)?;
-        let mut inner = self.inner.write().await;
-        inner.model = model;
-        inner.last_applied = meta.last_log_id;
-        inner.last_membership = meta.last_membership.clone();
+        let new_data = StateMachineData {
+            model,
+            last_applied: meta.last_log_id,
+            last_membership: meta.last_membership.clone(),
+        };
         if let Some(path) = &self.path {
-            let bytes = serde_json::to_vec(&*inner).map_err(invalid_data)?;
+            // Persist the new state before publishing it to readers. If this
+            // write fails, the in-memory model stays on the previous snapshot.
+            let bytes = serde_json::to_vec(&new_data).map_err(invalid_data)?;
             atomic_write(path, &bytes)?;
             let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(wal) = files.wal.as_mut() {
-                wal.set_len(0)?;
-                wal.seek(SeekFrom::Start(0))?;
+            if let Some(wal) = files.wal.as_mut()
+                && let Err(error) = wal
+                    .set_len(0)
+                    .and_then(|()| wal.seek(SeekFrom::Start(0)).map(|_| ()))
+            {
+                // The state file is already the durable commit point; stale
+                // WAL entries are skipped by last_applied on restart.
+                tracing::warn!(%error, "truncate raft WAL after snapshot install");
             }
             files.applied_since_snapshot = 0;
         }
-        drop(inner);
+        *self.inner.write().await = new_data;
         *self.snapshot.write().await = Some((meta.clone(), snapshot.into_inner()));
         Ok(())
     }
@@ -1320,7 +1272,12 @@ async fn raft_snapshot_begin(
         });
         if let Some((existing_id, received)) = assemblies
             .iter()
-            .find(|(_, pending)| pending.total == req.total && pending.checksum == req.checksum)
+            .find(|(_, pending)| {
+                pending.total == req.total
+                    && pending.checksum == req.checksum
+                    && pending.vote == req.vote
+                    && pending.meta == req.meta
+            })
             .map(|(id, pending)| (id.clone(), pending.data.len()))
         {
             return Ok(Json(serde_json::json!({
@@ -1349,7 +1306,7 @@ async fn raft_snapshot_begin(
                 meta: req.meta,
                 total: req.total,
                 checksum: req.checksum,
-                data: Vec::with_capacity(req.total),
+                data: Vec::new(),
                 transfer_dir,
             },
         );
@@ -1498,19 +1455,22 @@ async fn raft_snapshot_finish(
     else {
         return Err((axum::http::StatusCode::NOT_FOUND, "unknown transfer".into()));
     };
-    remove_transfer(&pending);
     if pending.data.len() != pending.total {
+        remove_transfer(&pending);
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "snapshot size mismatch".into(),
         ));
     }
     if hex::encode(Sha256::digest(&pending.data)) != pending.checksum {
+        remove_transfer(&pending);
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "snapshot checksum mismatch".into(),
         ));
     }
+    // Size/checksum are validated before the persisted transfer is removed.
+    remove_transfer(&pending);
     let snapshot = SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
         meta: pending.meta,
         snapshot: Cursor::new(pending.data),
@@ -2950,23 +2910,34 @@ mod tests {
 
         let node_id = NodeId::new([12u8; 32]);
         for seq in 1..=10 {
-            leader
-                .client_write(ControllerCommand::ApplyLsa {
-                    lsa: stellaris_linkstate::Lsa {
-                        origin: node_id,
-                        seq,
-                        zone: None,
-                        links: vec![],
-                        prefixes: vec![stellaris_linkstate::Prefix {
-                            prefix: "192.168.102.0/24".parse().unwrap(),
-                            metric: 0,
-                        }],
-                        overlay_ip: Some("10.7.0.12".parse().unwrap()),
-                        addrs: vec![],
-                    },
-                })
-                .await
-                .unwrap();
+            let command = ControllerCommand::ApplyLsa {
+                lsa: stellaris_linkstate::Lsa {
+                    origin: node_id,
+                    seq,
+                    zone: None,
+                    links: vec![],
+                    prefixes: vec![stellaris_linkstate::Prefix {
+                        prefix: "192.168.102.0/24".parse().unwrap(),
+                        metric: 0,
+                    }],
+                    overlay_ip: Some("10.7.0.12".parse().unwrap()),
+                    addrs: vec![],
+                },
+            };
+            let mut written = false;
+            for _ in 0..100 {
+                match leader.client_write(command.clone()).await {
+                    Ok(_) => {
+                        written = true;
+                        break;
+                    }
+                    Err(error) if format!("{error:?}").contains("ForwardToLeader") => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("client_write failed: {error:?}"),
+                }
+            }
+            assert!(written, "leader never accepted seq {seq}");
         }
         leader.trigger().snapshot().await.unwrap();
 
@@ -3429,31 +3400,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_json_log_and_state_are_migrated() {
-        let dir =
-            std::env::temp_dir().join(format!("stellaris-raft-legacy-{}", uuid::Uuid::now_v7()));
+    async fn state_machine_store_loads_persisted_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "stellaris-raft-state-reload-{}",
+            uuid::Uuid::now_v7()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
-        let log_path = dir.join("raft-log.json");
-        let entry = EntryOf::<TypeConfig>::new(
-            test_log_id(1),
-            EntryPayload::Normal(ControllerCommand::SetEpoch { epoch: 7 }),
-        );
-        let legacy = PersistedLog {
-            log: [(1u64, serde_json::to_string(&entry).unwrap())]
-                .into_iter()
-                .collect(),
-            vote: None,
-            last_purged: None,
-            committed: None,
-        };
-        std::fs::write(&log_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let store = Arc::new(LogStore::new(Some(log_path.clone())));
-        let mut reader = store.clone();
-        let entries = reader.try_get_log_entries(..).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].index(), 1);
-        assert!(log_path.with_extension("json.legacy").exists());
-
         let state_path = dir.join("raft-state.json");
         let mut model = ControllerModel::new(NetworkId::new(), 1);
         model.apply(ControllerCommand::SetEpoch { epoch: 9 });

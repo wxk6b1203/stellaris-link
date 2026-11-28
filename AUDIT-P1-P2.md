@@ -48,7 +48,7 @@
 | P1-21 | `commit_command` 丢弃状态机 apply 结果，多个写端点失败仍 200 | R-4 | **已修** | `CommandResult.changed` + `commit_command` 对 no-op 返回 409；create/update/delete pool、lease、reserve、reassign、approve/deny 等统一生效 |
 | P1-22 | IPAM 校验只在 handler，状态机可绕过（duplicate overlay/越界/exclude） | R-5 | **已修（入口层）** | `validate_overlay` 增加 CIDR/range/exclude/quarantine；enroll、approve、reinstate、grants、reserve 均复用；状态机 `overlay_taken` 仍是最后一道防线 |
 | P1-23 | member 只配 follower URL 时 snapshot/LSA/enroll 永久 503 | R-6 | **已修** | 新增 `control.failover_urls`；客户端在 503/连接失败时轮换 endpoint；`scripts/test-controller-failover.sh` 真实 3-controller 单机测试 follower→leader 通过 |
-| P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **已修（reset）/迁移 P2** | rotate/reset 目录 fsync；reset 先写 `reset.pending` 日志，崩溃后 `LogFiles::open` 自动重放；单测 `log_files_complete_an_interrupted_reset`。legacy `raft-log.json` 迁移 marker 归入 P2-84 |
+| P1-24 | Raft 日志 rotate/reset/legacy 迁移崩溃窗口 | R-7 | **已修（reset）；legacy 迁移删除** | rotate/reset 目录 fsync；reset 先写 `reset.pending` 日志，崩溃后 `LogFiles::open` 自动重放；单测 `log_files_complete_an_interrupted_reset`。legacy `raft-log.json` 迁移已删除（只支持全新部署） |
 | P1-25 | LSA 授权在 client_write 前，revoke 与在途 LSA 竞争 | R-8 | **已修** | `ApplyLsa` 在状态机里拒绝 revoked origin；若 LSA 先提交，`RevokeMember` 会删除该 origin 的 LSA。两种提交顺序最终都不会留下已撤销 LSA |
 | P1-26 | Raft 初始状态来自各副本本地 config/legacy 文件，副本可分歧 | R-9 | **已修** | Raft 副本从空 model 启动；leader 通过 `CreatePool/ApproveAdmission/MarkSeeded` 复制自己的 bootstrap 种子；旧状态有 members/pools/revoked 时视为已 seed。`test-controller-bootstrap-divergence.sh` 用 3 个不同本地 seed 验证三副本收敛到 leader |
 | P1-27 | control endpoint 与 data endpoint 同 NodeId/同 relay，relay 可能把一路置 inactive | T-3 | **已修（设计）** | 数据 endpoint 同时注册 DATA/CONTROL ALPN；`control.endpoint_id` 在有 transport 时直接复用该 endpoint，不再创建同 NodeId 的第二 endpoint；accept 侧按 ALPN 过滤；`test-real-iroh-raft.sh` 通过。relay-only 真实链路仍建议补一条专项测试 |
@@ -81,25 +81,25 @@
 
 | ID | 问题 | 来源 | 状态 |
 |---|---|---|---|
-| P2-14 | `Ack` 可回退；DenyAdmission 对已有成员无效且 generation 不变 | R-1 | 开放 |
+| P2-14 | `Ack` 可回退；DenyAdmission 对已有成员无效且 generation 不变 | R-1 | **已修**：ACK 只接受更大的 `(epoch,generation)`；Deny 也移除已批准成员、释放租约、bump revision/generation |
 | P2-15 | 非 Raft LSA TTL 忽略配置、legacy members 自授权前缀、无 leader fence | R-2 | 弃用 |
 | P2-16 | release/reserve/delete_pool 破坏 member↔lease 不变量 | R-3 | 部分（lease 校验已加） |
 | P2-17 | `AllocStrategy` 是死配置；IPv6 探测可能 4096 次失败 | R-4/D-24 | 开放 |
-| P2-18 | snapshot transfer 只按 total+checksum 去重、先删后验、512MB 预分配、阻塞 IO | R-5 | 开放 |
-| P2-19 | `install_snapshot` 先改内存后写盘，失败不回滚 | R-6 | 开放 |
+| P2-18 | snapshot transfer 只按 total+checksum 去重、先删后验、512MB 预分配、阻塞 IO | R-5 | **已修（关键）**：不再按 total 预分配；去重同时比较 vote/meta；先校验 size/checksum 再删除 transfer；chunk 持久化仍是同步 IO（P3） |
+| P2-19 | `install_snapshot` 先改内存后写盘，失败不回滚 | R-6 | **已修**：先原子写 state 文件，成功后才替换内存；WAL 截断失败只告警，重启按 last_applied 跳过旧条目 |
 | P2-20 | 动态 membership 吞 add_learner 错误、无 CAS、无 leader hint | R-7 | 开放 |
 | P2-21 | `/v1/status.routes` 不含 controller 路由；读端点不 linearize；member 可见 admin 元数据 | R-8 | 开放 |
 | P2-22 | 非 Raft command log 半行粘连、members/lsas/acks 无 fsync | R-9 | 弃用 |
 | P2-23 | 只配 raft client cert 时静默退回 HTTP Raft；raft_bind 临时端口；pending admission 无上限 | R-10 | 开放 |
-| P2-24 | `/readyz` 对失去 quorum 的旧 leader 仍返回 ready | R-11 | 开放 |
+| P2-24 | `/readyz` 对失去 quorum 的旧 leader 仍返回 ready | R-11 | **已修**：leader 必须持有 `last_quorum_acked` 且在 `2×election_timeout_max` 内；单节点/ follower 不受影响 |
 | P2-25 | 非 Raft controller 无 quorum/durable generation | S-2 | 弃用（启动告警） |
 
 ### 2.3 传输 / 链路状态
 
 | ID | 问题 | 来源 | 状态 |
 |---|---|---|---|
-| P2-26 | LSA 签名缓存按 origin 无条件覆盖，旧 seq 签名可污染 | T-1 | 开放 |
-| P2-27 | LSA 无时间戳/过期字段，30s 后可重放复活 | T-2 | 开放 |
+| P2-26 | LSA 签名缓存按 origin 无条件覆盖，旧 seq 签名可污染 | T-1 | **已修**：只有被 DB 接受的 LSA 才替换缓存；旧 seq 重放不再覆盖 |
+| P2-27 | LSA 无时间戳/过期字段，30s 后可重放复活 | T-2 | **已修（seq floor）**：controller model 与 member link-state 都保留每 origin 最高 seq，过期后旧 seq 不再复活；未新增时间戳字段 |
 | P2-28 | 全量 LSA snapshot 先写后 spawn reader，可能流控死锁 | T-3 | 开放 |
 | P2-29 | link-state reader 出错静默，坏帧后单向失联 | T-4 | 开放 |
 | P2-30 | 双 relay 快速清理依赖 `routing.link_state=true` | T-5 | 开放 |
@@ -118,14 +118,14 @@
 
 | ID | 问题 | 来源 | 状态 |
 |---|---|---|---|
-| P2-41 | 重组表全局 256 条，无 per-peer/字节配额，单成员可占满 | D-1 | 开放 |
-| P2-42 | 分片在 peer/anti-spoof 校验前进入重组表 | D-2 | 开放 |
+| P2-41 | 重组表全局 256 条，无 per-peer/字节配额，单成员可占满 | D-1 | **已修**：per-peer 32 条 + 全局 8MiB 缓存上限；单测 `per_peer_reassembly_quota_is_enforced` |
+| P2-42 | 分片在 peer/anti-spoof 校验前进入重组表 | D-2 | **部分**：配额限制了占用，但重组仍在完整包 anti-spoof 前发生 |
 | P2-43 | IPv4 重组校验和只算 20 字节，带 options 重组包被内核丢 | D-3 | 开放 |
 | P2-44 | IPv4 重组 total_length 截断/越界载荷 | D-4 | 开放 |
 | P2-45 | IPv6 只拒绝同 offset，不拒绝部分重叠/非 8 字节对齐 | D-5 | 开放 |
 | P2-46 | IPv6 扩展头在 Fragment 前时绕过应用层重组 | D-6 | 开放 |
 | P2-47 | ACL reject 引用最后一个分片而非重组报文，ICMP 无法关联 | D-7 | 开放 |
-| P2-48 | fragment_cache 无 TTL，满 4096 整表清空 | D-8 | 开放 |
+| P2-48 | fragment_cache 无 TTL，满 4096 整表清空 | D-8 | **已修**：ACL fragment cache 30s TTL，过期条目在查找/插入时淘汰 |
 | P2-49 | MTU monitor 初值/60s 低通窗口/无 datagram_too_large 指标 | D-9/D-10 | 开放 |
 | P2-50 | peer MTU 语义混用（max_datagram vs path MTU） | D-11 | 开放 |
 | P2-51 | ICMP PTB 对全部 ICMP 不回，`is_icmp_error` 固定偏移 | D-12 | 开放 |
@@ -166,7 +166,7 @@
 | P2-81 | PMTUD 三个脚本拓扑不可复现/`-M dont` 语义误读 | E-A/E-C | 开放（`-M dont` 已复核为“不置 DF”，不是 bug） |
 | P2-82 | 脚本端口/目录冲突（5801/5900/47001/opt 路径） | E-C | 开放 |
 | P2-83 | 3host overlay/IPv6 不做 loss/path/connected 断言 | E-B | 开放 |
-| P2-84 | legacy `raft-log.json` 迁移无 marker：崩溃后可能只读新目录、丢失 vote/committed | R-7 | 开放（仅升级窗口，P1-24 的 reset 已修） |
+| P2-84 | legacy `raft-log.json` 迁移无 marker：崩溃后可能只读新目录、丢失 vote/committed | R-7 | **不适用（已删除）**：只支持全新部署；移除 legacy `raft-log.json` 迁移代码及测试，新 state_dir 直接使用分段日志 |
 
 > 说明：`-M dont` 在 iputils 里是“不设置 DF”，因此原脚本的 2000B ping 确实会
 > 本地分片，evidence-review 的“DF 假绿”判断是误报；本轮已实测 0% loss。
@@ -196,7 +196,7 @@
 
 | 测试 | 结果 |
 |---|---|
-| `cargo test --workspace` | 225 passed / 0 failed / 2 ignored（Linux 构建机，P2 批次后） |
+| `cargo test --workspace` | 228 passed / 0 failed / 2 ignored（Linux 构建机，P2 批次后） |
 | 3 机 controller HA + mTLS + failover | **通过**（leader 1→2，snapshot/failover 正常；test-real-3host-ha.sh） |
 | 3 机 IPv4 TUN overlay | **通过**（3/3、1000B/2000B 各 3/3，0% loss） |
 | 3 机 IPv6 TUN overlay | **通过**（1200B 3/3，0% loss） |
@@ -214,6 +214,12 @@
 | P2-38 真实进程 | **通过**：假 controller 接受连接后挂起，agent 10s 内报 `TimedOut` 并重试 |
 | P2-64 真实 API | **通过**：pool 缩到不含现有 lease 返回 409；合法 range 更新 200 |
 | 新 3 机回归 | **通过**：HA、IPAM、静态 mesh、3host overlay、roaming（direct→relay）、netns TUN/IPv6/1280B/3node/exit-NAT/ACL |
+| P2-14 ACK/Deny | **通过**：`test-controller-ack.sh`；单测 stale ACK 不回退、Deny 已批准成员会 bump |
+| P2-18/19 snapshot | **通过**：`test-controller-raft-3node.sh` snapshot/failover/crash-recovery + 现有 chunk/checksum/install 单测 |
+| P2-24 quorum readyz | **通过**：`test-controller-quorum-ready.sh` 停 2 个 follower 后 leader 503，恢复后 200 |
+| P2-26/27 LSA replay | **通过（单测）**：controller seq floor 过期后拒绝旧 seq；签名缓存只随被接受的 LSA 更新 |
+| P2-41/48 reassembly | **通过**：netns reassembly + `per_peer_reassembly_quota_is_enforced`；fragment cache 30s TTL |
+| P2-84 legacy WAL | **删除**：只支持全新部署，不再有 legacy `raft-log.json` 迁移路径 |
 | 3 机静态 mesh + 单边 rogue | **通过**（6 方向 connected/ping；较大 NodeId 侧 5s 后补拨号，rogue 被 allowlist 拒绝） |
 | 撤销后旧凭据/新成员 | **单测通过**（revoked tombstone 对未见节点设 floor+close；reinstate 后恢复） |
 | netns 套件 | **16/16 通过**（route-safety、acl-reject、reassembly、tun、3node、3node-controller、ipv6、nat44、nat66、mdns、discovery、raft-tls、raft-membership、iroh-large、persistence；3node-controller/ipv6 需 12–14s 收敛等待） |
@@ -229,6 +235,6 @@
 - 真实 3 机与 netns 回归均通过；本轮新增 9 个单测/回归断言（HTTP LSA 签名、
   撤销 tombstone、control floor 持久化、reinstate、transit PTB、IPv6 path MTU、
   单边 link SPF、grant expiry、no-op 409、IPAM range/exclude）。
-- **P1 清单已全部闭环**；剩余 P2-84（legacy raft-log.json 迁移 marker，仅升级窗口）。
+- **P1 清单已全部闭环**；本轮 P2 批次目标项均已处理，legacy WAL 迁移明确不支持。
   （`commit_command` changed/409、IPAM 入口校验、follower URL failover 已补齐。）
 - 非 Raft 按用户决定标记 deprecated，不再投入 P1 级修复；启动日志会明确告警。

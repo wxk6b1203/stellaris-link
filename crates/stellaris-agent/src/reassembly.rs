@@ -13,6 +13,8 @@ use stellaris_types::NodeId;
 /// Fragments older than this are discarded.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ENTRIES: usize = 256;
+const MAX_ENTRIES_PER_PEER: usize = 32;
+const MAX_BUFFERED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FRAGMENTS: usize = 128;
 const MAX_REASSEMBLED: usize = 65_535;
 
@@ -251,8 +253,29 @@ impl Reassembler {
         if payload.is_empty() && !more {
             return Outcome::Dropped("empty fragment");
         }
-        if self.entries.len() >= MAX_ENTRIES && !self.entries.contains_key(&key) {
-            return Outcome::Dropped("reassembly table full");
+        let existing = self.entries.contains_key(&key);
+        if !existing {
+            if self.entries.len() >= MAX_ENTRIES {
+                return Outcome::Dropped("reassembly table full");
+            }
+            if self
+                .entries
+                .keys()
+                .filter(|candidate| candidate.from == key.from)
+                .count()
+                >= MAX_ENTRIES_PER_PEER
+            {
+                return Outcome::Dropped("too many reassembly entries for peer");
+            }
+        }
+        let buffered: usize = self
+            .entries
+            .values()
+            .flat_map(|entry| entry.fragments.values())
+            .map(Vec::len)
+            .sum();
+        if buffered.saturating_add(payload.len()) > MAX_BUFFERED_BYTES {
+            return Outcome::Dropped("reassembly byte limit reached");
         }
         let entry = self.entries.entry(key.clone()).or_insert_with(|| Entry {
             fragments: BTreeMap::new(),
@@ -449,5 +472,23 @@ mod tests {
             r.process(node(), &[0x70], now),
             Outcome::Dropped("bad ip version")
         );
+    }
+    #[test]
+    fn per_peer_reassembly_quota_is_enforced() {
+        let now = Instant::now();
+        let mut r = Reassembler::default();
+        let a = node();
+        let b = NodeId::new([2u8; 32]);
+        for id in 0..MAX_ENTRIES_PER_PEER as u32 {
+            let frag = v4_fragment(id as u16, 0, true, &[0u8; 8], 16);
+            assert_eq!(r.process(a, &frag, now), Outcome::Buffered);
+        }
+        let over = v4_fragment(999, 0, true, &[0u8; 8], 16);
+        assert_eq!(
+            r.process(a, &over, now),
+            Outcome::Dropped("too many reassembly entries for peer")
+        );
+        // A different peer is unaffected by the first peer's quota.
+        assert_eq!(r.process(b, &over, now), Outcome::Buffered);
     }
 }
